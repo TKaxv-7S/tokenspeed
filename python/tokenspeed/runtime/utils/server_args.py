@@ -236,6 +236,7 @@ class ServerArgs:
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
+    enable_symk_allreduce: bool = False
     disable_custom_all_reduce: bool = False
     disable_overlap_schedule: bool = False
     disable_tf32: bool = False
@@ -1512,6 +1513,13 @@ class ServerArgs:
             "--enable-symm-mem",
             action="store_true",
             help="Enable NCCL symmetric memory for fast collectives.",
+        )
+        parser.add_argument(
+            "--enable-symk-allreduce",
+            action="store_true",
+            help="Enable the NCCL symmetric-memory (symk) all-reduce kernel for "
+            "the prefill phase on NVLink/NVSwitch (GB200/NVL72, NCCL>=2.27). "
+            "Forces NCCL_CUMEM_ENABLE=1.",
         )
         parser.add_argument(
             "--disable-custom-all-reduce",

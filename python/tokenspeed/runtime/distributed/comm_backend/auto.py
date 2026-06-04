@@ -33,6 +33,9 @@ from tokenspeed.runtime.distributed.comm_backend.custom_allreduce import (
     CustomAllReduceBackend,
 )
 from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+from tokenspeed.runtime.distributed.comm_backend.symk_allreduce import (
+    SymkAllReduceBackend,
+)
 from tokenspeed.runtime.distributed.comm_backend.triton_allreduce import (
     TritonAllReduceBackend,
 )
@@ -50,6 +53,7 @@ class AutoBackend(CommBackend):
         self._custom_ar = CustomAllReduceBackend(fallback=self._nccl)
         self._trtllm_ar = TrtllmAllReduceBackend(fallback=self._nccl)
         self._triton_ar = TritonAllReduceBackend(fallback=self._nccl)
+        self._symk_ar = SymkAllReduceBackend(fallback=self._nccl)
         self._rsag = TritonRSAGBackend(fallback=self._nccl)
 
     @property
@@ -63,6 +67,10 @@ class AutoBackend(CommBackend):
     @property
     def trtllm_ar(self) -> TrtllmAllReduceBackend:
         return self._trtllm_ar
+
+    @property
+    def symk_ar(self) -> SymkAllReduceBackend:
+        return self._symk_ar
 
     def configure(
         self, use_pynccl: bool = False, use_custom_allreduce: bool = False
@@ -97,6 +105,8 @@ class AutoBackend(CommBackend):
             return self._trtllm_ar.all_reduce(tensor, group, op=op)
         if self._triton_ar.can_run(tensor, group, op=op):
             return self._triton_ar.all_reduce(tensor, group, op=op)
+        if self._symk_ar.should_handle(group):
+            return self._symk_ar.all_reduce(tensor, group, op=op)
         return self._nccl.all_reduce(tensor, group, op=op)
 
     def all_gather(

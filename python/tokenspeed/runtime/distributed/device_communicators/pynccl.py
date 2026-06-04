@@ -25,12 +25,14 @@
 # SOFTWARE.
 
 
+import ctypes
 from contextlib import contextmanager
 
 # ===================== import region =====================
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.nccl import (
+    NCCL_WIN_COLL_SYMMETRIC,
     NCCLLibrary,
     buffer_type,
     cudaStream_t,
@@ -38,6 +40,7 @@ from tokenspeed_kernel.ops.communication.nccl import (
     ncclDataTypeEnum,
     ncclRedOpTypeEnum,
     ncclUniqueId,
+    ncclWindow_t,
 )
 from torch.distributed import ProcessGroup, ReduceOp
 
@@ -85,6 +88,7 @@ class PyNcclCommunicator:
             self.available = False
             self.disabled = True
             self.stream = None
+            self.supports_symk = False
             return
         try:
             self.nccl = NCCLLibrary(library_path)
@@ -94,12 +98,16 @@ class PyNcclCommunicator:
             self.available = False
             self.disabled = True
             self.stream = None
+            self.supports_symk = False
             return
 
         self.available = True
         self.disabled = False
 
+        version_str = self.nccl.ncclGetVersion()
         logger.info("Epsilon is using nccl==%s", self.nccl.ncclGetVersion())
+        # Whether this NCCL build supports symmetric-memory (symk) kernels.
+        self.supports_symk = self._parse_supports_symk(version_str)
 
         if self.rank == 0:
             # get the unique id from NCCL
@@ -280,6 +288,71 @@ class PyNcclCommunicator:
             src,
             self.comm,
             cudaStream_t(stream.cuda_stream),
+        )
+
+    # ===================== symmetric-memory (symk) APIs =====================
+    # These power the NCCL >= 2.27 symmetric-memory all-reduce kernel
+    # (`ncclSymkDevKernel_AllReduce_RSxLDMC_AGxSTMC`) used in the prefill phase
+    # on NVLink/NVSwitch (GB200 / NVL72). They are intentionally independent of
+    # the default-disabled `all_reduce` path above.
+
+    @staticmethod
+    def _parse_supports_symk(version_str: str) -> bool:
+        """Return True if the NCCL version string (e.g. "2.27.3") is >= 2.27."""
+        try:
+            parts = version_str.split(".")
+            major = int(parts[0])
+            minor = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+        except (ValueError, IndexError):
+            return False
+        return (major, minor) >= (2, 27)
+
+    def ensure_symk(self) -> bool:
+        """Lazily bind symk C APIs. Returns False on NCCL<2.27 / non-GPU env."""
+        return (
+            getattr(self, "available", False)
+            and self.supports_symk
+            and self.nccl.ensure_symk_funcs()
+        )
+
+    def mem_alloc(self, nbytes: int) -> int:
+        """Allocate a symmetric-memory buffer; returns the raw device pointer."""
+        ptr = self.nccl.ncclMemAlloc(nbytes)
+        return ptr.value
+
+    def mem_free(self, addr: int) -> None:
+        self.nccl.ncclMemFree(ctypes.c_void_p(addr))
+
+    def register_symmetric_window(self, addr: int, nbytes: int):
+        """Collectively register a symmetric window over [addr, addr+nbytes).
+
+        Must be called by every rank in the group with identical size/order,
+        otherwise NCCL will hang.
+        """
+        return self.nccl.ncclCommWindowRegister(
+            self.comm, buffer_type(addr), nbytes, NCCL_WIN_COLL_SYMMETRIC
+        )
+
+    def deregister_symmetric_window(self, win: ncclWindow_t) -> None:
+        self.nccl.ncclCommWindowDeregister(self.comm, win)
+
+    def symk_all_reduce(
+        self, addr: int, count: int, dtype: torch.dtype, stream, op: ReduceOp = ReduceOp.SUM
+    ) -> None:
+        """In-place all-reduce on a registered symmetric buffer.
+
+        Deliberately ignores ``self.disabled`` (the prefill phase keeps the
+        default communicator disabled) and runs on the caller-provided CUDA
+        stream so it can stay on the main compute stream.
+        """
+        self.nccl.ncclAllReduce(
+            buffer_type(addr),
+            buffer_type(addr),
+            count,
+            ncclDataTypeEnum.from_torch(dtype),
+            ncclRedOpTypeEnum.from_torch(op),
+            self.comm,
+            cudaStream_t(stream),
         )
 
     @contextmanager

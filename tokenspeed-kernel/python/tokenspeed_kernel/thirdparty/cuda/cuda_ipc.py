@@ -112,6 +112,18 @@ class CudaRTLibrary:
             cudaError_t,
             [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, cudaMemcpyKind],
         ),
+        # ​cudaError_t cudaMemcpyAsync ( void* dst, const void* src, size_t count, cudaMemcpyKind kind, cudaStream_t stream ) # noqa
+        Function(
+            "cudaMemcpyAsync",
+            cudaError_t,
+            [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                cudaMemcpyKind,
+                ctypes.c_void_p,
+            ],
+        ),
         # cudaError_t cudaIpcGetMemHandle ( cudaIpcMemHandle_t* handle, void* devPtr ) # noqa
         Function(
             "cudaIpcGetMemHandle",
@@ -187,6 +199,22 @@ class CudaRTLibrary:
         cudaMemcpyDefault = 4
         kind = cudaMemcpyDefault
         self.CUDART_CHECK(self.funcs["cudaMemcpy"](dst, src, count, kind))
+
+    def cudaMemcpyAsync(
+        self,
+        dst: ctypes.c_void_p,
+        src: ctypes.c_void_p,
+        count: int,
+        stream: ctypes.c_void_p,
+    ) -> None:
+        # Device-to-device async copy on the given stream. cudaMemcpyDefault (4)
+        # infers the direction from the pointer attributes, which is fine for
+        # the symmetric-workspace copy-in / copy-out path.
+        cudaMemcpyDefault = 4
+        kind = cudaMemcpyDefault
+        self.CUDART_CHECK(
+            self.funcs["cudaMemcpyAsync"](dst, src, count, kind, stream)
+        )
 
     def cudaIpcGetMemHandle(self, devPtr: ctypes.c_void_p) -> cudaIpcMemHandle_t:
         handle = cudaIpcMemHandle_t()

@@ -435,6 +435,20 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
     if not server_args.enable_symm_mem:
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
+    # The symk (symmetric-memory) all-reduce kernel runs on NVLink/NVSwitch
+    # multicast (LDMC/STMC). It requires BOTH cuMem-backed allocations
+    # registered as symmetric windows (NCCL_CUMEM_ENABLE=1) AND NVLS multicast
+    # (NCCL_NVLS_ENABLE=1); without NVLS, NCCL silently falls back to RING_LL
+    # and symk never triggers. These are forced here (overriding the
+    # enable_symm_mem/enable_nccl_nvls branch above) and the runtime knobs read
+    # by SymkAllReduceBackend are propagated.
+    if server_args.enable_symk_allreduce:
+        os.environ["NCCL_CUMEM_ENABLE"] = "1"
+        os.environ["NCCL_NVLS_ENABLE"] = "1"
+        os.environ["TOKENSPEED_ENABLE_SYMK_ALLREDUCE"] = "1"
+        os.environ.setdefault(
+            "TOKENSPEED_SYMK_MAX_TOKENS", str(server_args.max_prefill_tokens)
+        )
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"

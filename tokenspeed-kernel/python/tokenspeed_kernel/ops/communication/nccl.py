@@ -89,6 +89,13 @@ def find_nccl_library() -> str:
 
 ncclResult_t = ctypes.c_int
 ncclComm_t = ctypes.c_void_p
+# struct ncclWindow* -- opaque handle returned by ncclCommWindowRegister
+ncclWindow_t = ctypes.c_void_p
+
+# winFlags for ncclCommWindowRegister (NCCL >= 2.27). Registering an allreduce
+# buffer with this flag makes NCCL select the symmetric-memory device kernels
+# (ncclSymkDevKernel_*) backed by NVLink Multicast / NVLS.
+NCCL_WIN_COLL_SYMMETRIC = 0x1
 
 
 class ncclUniqueId(ctypes.Structure):
@@ -301,6 +308,42 @@ class NCCLLibrary:
         Function("ncclCommDestroy", ncclResult_t, [ncclComm_t]),
     ]
 
+    # Optional NCCL >= 2.27 symmetric-memory APIs. These symbols may be absent
+    # on older NCCL, so they are bound lazily on first use (see
+    # `ensure_symk_funcs`) instead of being part of `exported_functions`, which
+    # is eagerly bound for every NCCLLibrary instance and would otherwise crash
+    # initialization on older NCCL.
+    symk_functions = [
+        # ncclResult_t ncclMemAlloc(void** ptr, size_t size);
+        Function(
+            "ncclMemAlloc",
+            ncclResult_t,
+            [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t],
+        ),
+        # ncclResult_t ncclMemFree(void* ptr);
+        Function("ncclMemFree", ncclResult_t, [ctypes.c_void_p]),
+        # ncclResult_t ncclCommWindowRegister(
+        #   ncclComm_t comm, void* buff, size_t size,
+        #   ncclWindow_t* win, int winFlags);
+        Function(
+            "ncclCommWindowRegister",
+            ncclResult_t,
+            [
+                ncclComm_t,
+                buffer_type,
+                ctypes.c_size_t,
+                ctypes.POINTER(ncclWindow_t),
+                ctypes.c_int,
+            ],
+        ),
+        # ncclResult_t ncclCommWindowDeregister(ncclComm_t comm, ncclWindow_t win);
+        Function(
+            "ncclCommWindowDeregister",
+            ncclResult_t,
+            [ncclComm_t, ncclWindow_t],
+        ),
+    ]
+
     # class attribute to store the mapping from the path to the library
     # to avoid loading the same library multiple times
     path_to_library_cache: Dict[str, Any] = {}
@@ -482,6 +525,58 @@ class NCCLLibrary:
     def ncclCommDestroy(self, comm: ncclComm_t) -> None:
         self.NCCL_CHECK(self._funcs["ncclCommDestroy"](comm))
 
+    # ------------------------------------------------------------------
+    # Optional symmetric-memory APIs (NCCL >= 2.27), bound lazily.
+    # ------------------------------------------------------------------
+
+    def ensure_symk_funcs(self) -> bool:
+        """Lazily bind the symmetric-memory NCCL APIs.
+
+        Returns False if any symbol is unavailable (e.g. NCCL < 2.27),
+        in which case the caller should fall back to the regular path.
+        """
+        for func in self.symk_functions:
+            if func.name in self._funcs:
+                continue
+            try:
+                f = getattr(self.lib, func.name)
+            except AttributeError:
+                return False
+            f.restype = func.restype
+            f.argtypes = func.argtypes
+            self._funcs[func.name] = f
+        return True
+
+    def ncclMemAlloc(self, size: int) -> ctypes.c_void_p:
+        ptr = ctypes.c_void_p()
+        self.NCCL_CHECK(self._funcs["ncclMemAlloc"](ctypes.byref(ptr), size))
+        return ptr
+
+    def ncclMemFree(self, ptr: ctypes.c_void_p) -> None:
+        self.NCCL_CHECK(self._funcs["ncclMemFree"](ptr))
+
+    def ncclCommWindowRegister(
+        self,
+        comm: ncclComm_t,
+        buff: buffer_type,
+        size: int,
+        win_flags: int,
+    ) -> ncclWindow_t:
+        win = ncclWindow_t()
+        self.NCCL_CHECK(
+            self._funcs["ncclCommWindowRegister"](
+                comm, buff, size, ctypes.byref(win), win_flags
+            )
+        )
+        return win
+
+    def ncclCommWindowDeregister(
+        self, comm: ncclComm_t, win: ncclWindow_t
+    ) -> None:
+        self.NCCL_CHECK(
+            self._funcs["ncclCommWindowDeregister"](comm, win)
+        )
+
 
 __all__ = [
     "NCCLLibrary",
@@ -489,6 +584,8 @@ __all__ = [
     "ncclRedOpTypeEnum",
     "ncclUniqueId",
     "ncclComm_t",
+    "ncclWindow_t",
     "cudaStream_t",
     "buffer_type",
+    "NCCL_WIN_COLL_SYMMETRIC",
 ]
