@@ -237,6 +237,7 @@ class ServerArgs:
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
     enable_symk_allreduce: bool = False
+    symk_min_bytes: int = -1
     disable_custom_all_reduce: bool = False
     disable_overlap_schedule: bool = False
     disable_tf32: bool = False
@@ -1520,6 +1521,18 @@ class ServerArgs:
             help="Enable the NCCL symmetric-memory (symk) all-reduce kernel for "
             "the prefill phase on NVLink/NVSwitch (GB200/NVL72, NCCL>=2.27). "
             "Forces NCCL_CUMEM_ENABLE=1.",
+        )
+        parser.add_argument(
+            "--symk-min-bytes",
+            type=int,
+            default=ServerArgs.symk_min_bytes,
+            help="Minimum all-reduce input size (in bytes) routed through the "
+            "symk symmetric-memory pool; smaller messages stay on RING_LL. "
+            "-1 (default) uses TRT-LLM's nRanks-adaptive threshold "
+            "max(0, a*nRanks+b). Set >=0 to override with an absolute byte "
+            "bound: 0 pushes every eligible message onto symk, larger values "
+            "keep small messages on ring (sweep to find the symk/ring "
+            "crossover). Only used with --enable-symk-allreduce.",
         )
         parser.add_argument(
             "--disable-custom-all-reduce",

@@ -449,6 +449,13 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ.setdefault(
             "TOKENSPEED_SYMK_MAX_TOKENS", str(server_args.max_prefill_tokens)
         )
+        # symk_min_bytes < 0 means "use the nRanks-adaptive threshold" -- leave
+        # TS_SYMK_MIN_BYTES unset so SymkAllReduceBackend falls back to the
+        # TRT-LLM fit. Only a >= 0 value is an explicit absolute-byte override.
+        if server_args.symk_min_bytes >= 0:
+            os.environ.setdefault(
+                "TS_SYMK_MIN_BYTES", str(server_args.symk_min_bytes)
+            )
     os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"

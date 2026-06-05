@@ -18,48 +18,68 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""NCCL symmetric-memory (symk) all-reduce backend.
+"""NCCL symmetric-memory (symk) *zero-copy* all-reduce backend.
 
 Targets the prefill phase on NVLink/NVSwitch fabrics (GB200 / NVL72) where
 NCCL >= 2.27 can dispatch the symmetric-memory kernel
 ``ncclSymkDevKernel_AllReduce_RSxLDMC_AGxSTMC`` (LDMC/STMC + in-network
 NVSwitch reduction) instead of the default ``RING_LL`` kernel.
 
-Design (copy-based symmetric workspace, MVP):
-  * Each TP group gets one fixed-size symmetric workspace, allocated via
-    ``ncclMemAlloc`` and registered as a symmetric window via
-    ``ncclCommWindowRegister`` (a collective call done once).
-  * On every accelerated ``all_reduce`` the activation is copied into the
-    workspace (``cudaMemcpyAsync``), reduced in place (NCCL detects the
-    symmetric window and selects the symk kernel), then copied back -- all on
-    the caller's current compute stream.
+Zero-copy design (replaces the earlier copy-based MVP)
+-----------------------------------------------------
+The earlier MVP built a *private* PyNccl communicator, allocated a symmetric
+workspace via ``ncclMemAlloc`` + ``ncclCommWindowRegister``, and copied the
+activation in/out with ``cudaMemcpyAsync`` on every all-reduce. That double
+memcpy cancels symk's "almost no SM" advantage and never beat RING_LL at small
+scale; worse, a bare ``ncclCommWindowRegister`` on a private comm does not
+reliably make NCCL pick the symk kernel.
 
-Group configuration is *lazy*: the backend is created without model info, so
-the workspace is sized and registered on the first ``all_reduce`` for a group
-using ``tensor.shape[-1]`` as ``hidden_dim``. Because tensor parallelism is
-SPMD, every rank reaches the first all-reduce together with an identical
-hidden size, making the collective registration safe.
+This backend instead makes the all-reduce input land *directly* in a registered
+symmetric window, so the reduction is a plain in-place
+``torch.distributed.all_reduce`` with **no copy**:
 
-Any gating failure (non-NVIDIA, NCCL < 2.27, ``NCCL_CUMEM_ENABLE`` /
-``NCCL_NVLS_ENABLE`` unset, world_size == 1, capacity exceeded, or any
-exception) silently delegates to the provided fallback backend, preserving the
-default behavior.
+  * Each TP group owns one ``torch.cuda.MemPool`` backed by the NCCL allocator
+    (``ProcessGroupNCCL.mem_allocator`` -> ``ncclMemAlloc``).
+  * On first use the pool is collectively registered as a symmetric window via
+    ``ProcessGroupNCCL.register_mem_pool(pool, symm=True)``
+    (-> ``ncclCommWindowRegister(NCCL_WIN_COLL_SYMMETRIC)``). The ``symm=True``
+    flag is what actually triggers the symk kernel; the default ``symm=False``
+    only does a plain ``ncclCommRegister`` (UB) and stays on RING/LL.
+  * Callers (``RowParallelLinear.forward``) wrap the GEMM in :meth:`pool_context`
+    so its output is allocated inside that pool. The subsequent
+    ``all_reduce`` then runs over a window-resident buffer and NCCL selects the
+    symk kernel automatically.
+
+:meth:`all_reduce` itself therefore does **not** do anything special -- it just
+delegates to the NCCL fallback. Zero-copy symk happens transparently for
+pool-resident tensors; everything else runs RING_LL.
+
+Adaptive threshold (TRT-LLM nRanks fit, overridable via ``TS_SYMK_MIN_BYTES``)
+-----------------------------------------------------------------------------
+Only outputs at least as large as a threshold are allocated in the symk pool
+(and thus use the symk kernel); smaller ones use the normal caching allocator
+and run RING_LL. By default the threshold follows TRT-LLM's empirical
+nRanks-adaptive fit ``max(0, a * nRanks + b)`` elements (see
+:data:`_SYMK_THRESHOLD_FIT_A`): small domains (e.g. TP4) keep small messages on
+ring, while large domains (e.g. NVL72) clamp the threshold to 0 so every
+message uses symk. ``TS_SYMK_MIN_BYTES`` overrides this with an absolute byte
+lower bound (cf. TRT-LLM ``TLLM_NCCL_MIN_REGISTRATION``) -- the experiment knob:
+  * set it very large  -> effectively all-ring baseline,
+  * set it to 0        -> push every eligible message onto symk,
+  * sweep it           -> find the size where symk starts to win over RING_LL.
 
 SPMD consistency contract
 -------------------------
-The symk path runs on a *private* NCCL communicator while the fallback runs on
-the default ``torch.distributed`` communicator. If, for a single logical
-all-reduce, some ranks took the symk branch and others the fallback branch,
-the two communicators would deadlock. To prevent this, every branch decision
-is based only on quantities that are identical across ranks under tensor-
-parallel SPMD execution (feature flag, platform, ``NCCL_*`` env, world size,
-reduce op, dtype, and ``numel*itemsize`` vs capacity). Per-rank layout details
-(e.g. contiguity) are intentionally NOT used for branching -- a non-contiguous
-input is densified inside the symk path instead of falling back.
+``register_mem_pool`` is collective and would hang if only some ranks reached
+it. Every branch decision here (enable flag, platform, ``NCCL_*`` env, world
+size, dtype, byte size vs threshold/capacity) depends only on quantities that
+are identical across ranks under tensor-parallel SPMD execution, so all ranks
+enter :meth:`pool_context`, register, and all-reduce together. Per-rank layout
+(e.g. contiguity) is never used for branching.
 """
 
-import ctypes
 import os
+from contextlib import contextmanager
 
 import torch
 import torch.distributed
@@ -67,6 +87,9 @@ import torch.distributed
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
+from tokenspeed.runtime.utils import get_colorful_logger
+
+logger = get_colorful_logger(__name__)
 
 
 def _env_enabled() -> bool:
@@ -80,210 +103,276 @@ def _env_max_tokens() -> int:
         return 8192
 
 
-class SymkAllReduceBackend(CommBackend):
-    """Backend using NCCL symmetric-memory all-reduce for the prefill phase.
+def _env_min_bytes() -> int | None:
+    """Explicit byte-threshold override for routing an all-reduce through symk.
 
-    Keyed per-group: each group owns a private ``PyNcclCommunicator`` plus a
-    registered symmetric workspace. Only ``all_reduce`` (SUM) is accelerated;
-    every other op delegates to *fallback*.
+    Returns ``None`` when ``TS_SYMK_MIN_BYTES`` is unset -- the backend then
+    falls back to TRT-LLM's nRanks-adaptive threshold (see
+    :func:`SymkAllReduceBackend._threshold_bytes`). When set, the value is an
+    absolute lower bound in bytes that overrides the adaptive formula,
+    mirroring TRT-LLM's ``TLLM_NCCL_MIN_REGISTRATION`` escape hatch. Outputs
+    below the resulting threshold stay on the normal allocator -> RING_LL.
+    """
+    raw = os.environ.get("TS_SYMK_MIN_BYTES")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+# TRT-LLM's empirical linear fit (GB200, reverse-engineered from
+# allreduceOp.cpp runNCCLAllReduceSymmetric) for the symmetric-memory
+# registration threshold: messages smaller than ``max(0, a * nRanks + b)``
+# elements are not worth routing through symk -- at small scale the
+# window-registration overhead outweighs the in-network (NVLS multicast)
+# reduction benefit, so they stay on RING_LL. The fit decreases with nRanks:
+# more ranks -> lower threshold -> symk kicks in earlier; at large domains
+# (e.g. NVL72) it clamps to 0 so every message uses symk. Override the whole
+# formula with TS_SYMK_MIN_BYTES.
+_SYMK_THRESHOLD_FIT_A = -4986.43478503
+_SYMK_THRESHOLD_FIT_B = 156716.52177552
+
+
+class SymkAllReduceBackend(CommBackend):
+    """Zero-copy NCCL symmetric-memory all-reduce backend for the prefill phase.
+
+    Keyed per-group: each group owns a registered NCCL-allocator ``MemPool``.
+    The backend does not perform the all-reduce itself -- it exposes
+    :meth:`pool_context` so the upstream GEMM output lands in the symmetric
+    window, and :meth:`all_reduce` simply delegates to *fallback* (plain NCCL,
+    which auto-selects the symk kernel for window-resident buffers).
     """
 
     def __init__(self, fallback: CommBackend):
         self._fallback = fallback
-        # group_tuple -> {pynccl, ws_ptr, win, capacity, hidden_dim, dtype, world_size}
+        # group_tuple -> {pool, nccl_backend, device_group, registered,
+        #                 dtype, hidden_dim, capacity}
         self._resources: dict = {}
-        # groups that failed gating/configure -- never retried (avoids
-        # repeated collective attempts that could diverge across ranks).
+        # groups that failed gating/setup -- never retried (avoids repeated
+        # collective attempts that could diverge across ranks).
         self._failed: set = set()
         self._enabled = _env_enabled()
         self._max_token_num = _env_max_tokens()
-
-    def _load_comm(self) -> bool:
-        return current_platform().is_nvidia
-
-    # ------------------------------------------------------------------
-    # Group configuration (lazy)
-    # ------------------------------------------------------------------
-
-    def configure_group(
-        self,
-        rank: int,
-        group: Group,
-        hidden_dim: int,
-        dtype: torch.dtype,
-    ) -> bool:
-        """Allocate + register the symmetric workspace for *group*.
-
-        Returns True on success. Idempotent per group. All gating failures are
-        recorded so the (collective) setup is attempted exactly once per group.
-        """
-        if group in self._resources:
-            return True
-        if group in self._failed:
-            return False
-
-        # ---- gating ----
-        # Every condition here is identical across ranks under SPMD, so all
-        # ranks make the same configure / no-configure decision together (the
-        # registration below is collective and would hang otherwise).
-        if (
-            not self._enabled
-            or not self._load_comm()
-            or len(group) == 1
-            or os.environ.get("NCCL_CUMEM_ENABLE") != "1"
-            or os.environ.get("NCCL_NVLS_ENABLE") != "1"
-        ):
-            self._failed.add(group)
-            return False
-
-        pynccl = None
-        ws_ptr = None
-        try:
-            from tokenspeed.runtime.distributed.device_communicators.pynccl import (
-                PyNcclCommunicator,
+        self._min_bytes_override = _env_min_bytes()
+        if self._enabled:
+            logger.info(
+                "SymkAllReduceBackend (zero-copy) enabled: max_token_num=%d, "
+                "min_bytes_override=%s (None=nRanks-adaptive), "
+                "NCCL_CUMEM_ENABLE=%s, NCCL_NVLS_ENABLE=%s",
+                self._max_token_num,
+                self._min_bytes_override,
+                os.environ.get("NCCL_CUMEM_ENABLE"),
+                os.environ.get("NCCL_NVLS_ENABLE"),
             )
+
+    # ------------------------------------------------------------------
+    # Gating (all conditions are rank-consistent under SPMD)
+    # ------------------------------------------------------------------
+
+    def _gating_reasons(self, group: Group) -> list[str]:
+        reasons = []
+        if not self._enabled:
+            reasons.append("feature disabled (TOKENSPEED_ENABLE_SYMK_ALLREDUCE != 1)")
+        if not current_platform().is_nvidia:
+            reasons.append("non-NVIDIA platform")
+        if len(group) == 1:
+            reasons.append("world_size == 1")
+        if os.environ.get("NCCL_CUMEM_ENABLE") != "1":
+            reasons.append(
+                "NCCL_CUMEM_ENABLE=%r (need '1')" % os.environ.get("NCCL_CUMEM_ENABLE")
+            )
+        if os.environ.get("NCCL_NVLS_ENABLE") != "1":
+            reasons.append(
+                "NCCL_NVLS_ENABLE=%r (need '1')" % os.environ.get("NCCL_NVLS_ENABLE")
+            )
+        return reasons
+
+    def should_handle(self, group: Group) -> bool:
+        """Whether AutoBackend should route ``all_reduce`` of *group* here.
+
+        True when the feature is enabled and the group has not permanently
+        failed gating. (Routing here vs. NCCL is cosmetic for the zero-copy
+        path -- both run a plain NCCL all-reduce -- but it keeps the public
+        backend surface consistent with the previous implementation.)
+        """
+        return self._enabled and group not in self._failed
+
+    def has_symk(self, group: Group) -> bool:
+        res = self._resources.get(group)
+        return res is not None and res["registered"]
+
+    def _threshold_bytes(self, group: Group, dtype: torch.dtype) -> int:
+        """Minimum all-reduce input size (bytes) worth routing through symk.
+
+        An explicit ``TS_SYMK_MIN_BYTES`` override wins; otherwise use TRT-LLM's
+        nRanks-adaptive linear fit ``max(0, a * nRanks + b)`` (in elements,
+        scaled by ``dtype`` itemsize). ``nRanks`` is the group's world size,
+        which is identical across ranks, so the threshold is SPMD-consistent.
+        """
+        if self._min_bytes_override is not None:
+            return self._min_bytes_override
+        n_ranks = len(group)
+        elems = _SYMK_THRESHOLD_FIT_A * n_ranks + _SYMK_THRESHOLD_FIT_B
+        if elems < 0:
+            elems = 0.0
+        return int(elems * dtype.itemsize)
+
+    # ------------------------------------------------------------------
+    # Pool lifecycle (lazy)
+    # ------------------------------------------------------------------
+
+    def _ensure_pool(
+        self, group: Group, dtype: torch.dtype, hidden_dim: int
+    ) -> dict | None:
+        """Lazily create the (not-yet-registered) NCCL-allocator MemPool.
+
+        Returns the resource dict, or None when symk is gated off / setup
+        fails (the group is then marked failed so we never retry the
+        collective registration with a diverging decision across ranks).
+        """
+        res = self._resources.get(group)
+        if res is not None:
+            return res
+        if group in self._failed:
+            return None
+
+        reasons = self._gating_reasons(group)
+        if reasons:
+            logger.warning(
+                "symk all-reduce disabled for group %s: %s", group, "; ".join(reasons)
+            )
+            self._failed.add(group)
+            return None
+
+        try:
             from tokenspeed.runtime.distributed.process_group_manager import (
                 process_group_manager as pg_manager,
             )
 
-            gloo_group = pg_manager.get_process_group("gloo", group)
-            pynccl = PyNcclCommunicator(
-                group=gloo_group,
-                device=torch.device(f"cuda:{torch.cuda.current_device()}"),
-            )
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+            pg = pg_manager.get_process_group("nccl", group)
 
-            if not pynccl.ensure_symk():
-                self._failed.add(group)
-                return False
+            # Obtain the ProcessGroupNCCL backend and its NCCL allocator.
+            nccl_backend = pg._get_backend(device)
+            mem_allocator = getattr(nccl_backend, "mem_allocator", None)
+            if mem_allocator is None or not hasattr(nccl_backend, "register_mem_pool"):
+                raise RuntimeError(
+                    "ProcessGroupNCCL lacks mem_allocator/register_mem_pool "
+                    "(need PyTorch >= 2.6 with NCCL symmetric-memory support)"
+                )
+            nccl_alloc = mem_allocator() if callable(mem_allocator) else mem_allocator
 
+            pool = torch.cuda.MemPool(nccl_alloc)
             capacity = self._max_token_num * hidden_dim * dtype.itemsize
-            ws_ptr = pynccl.mem_alloc(capacity)
-            win = pynccl.register_symmetric_window(ws_ptr, capacity)
 
-            self._resources[group] = {
-                "pynccl": pynccl,
-                "ws_ptr": ws_ptr,
-                "win": win,
-                "capacity": capacity,
-                "hidden_dim": hidden_dim,
+            res = {
+                "pool": pool,
+                "nccl_backend": nccl_backend,
+                "device_group": pg,
+                "registered": False,
                 "dtype": dtype,
-                "world_size": len(group),
+                "hidden_dim": hidden_dim,
+                "capacity": capacity,
             }
-            return True
-        except Exception:
-            # Best-effort cleanup of a partially-created workspace.
-            try:
-                if pynccl is not None and ws_ptr is not None:
-                    pynccl.mem_free(ws_ptr)
-            except Exception:
-                pass
+            self._resources[group] = res
+            return res
+        except Exception as exc:
+            logger.warning(
+                "symk pool setup failed for group %s: %r -- falling back to "
+                "default NCCL (RING_LL) all-reduce",
+                group,
+                exc,
+            )
             self._failed.add(group)
-            return False
+            return None
 
-    def has_symk(self, group: Group) -> bool:
-        return group in self._resources
+    @contextmanager
+    def pool_context(
+        self, group: Group, nbytes: int, dtype: torch.dtype, hidden_dim: int
+    ):
+        """Allocate tensors created in this context inside the registered symk pool.
 
-    def should_handle(self, group: Group) -> bool:
-        """Whether AutoBackend should route all_reduce of *group* here.
+        Wrap the GEMM that produces an all-reduce input with this context so the
+        output lands in the symmetric window (-> zero-copy symk all-reduce).
 
-        True when the feature is enabled and the group has not permanently
-        failed gating. Returns True on the very first call (before lazy
-        configuration) so the workspace can be set up; once a group is marked
-        failed, returns False so AutoBackend goes straight to NCCL.
+        Yields a no-op (normal allocator -> RING_LL) when symk is disabled,
+        gated off, the message is below ``TS_SYMK_MIN_BYTES``, exceeds the
+        symmetric workspace capacity, or any setup step fails. All of these
+        conditions are rank-consistent under SPMD.
         """
-        return self._enabled and group not in self._failed
+        # Fast no-op paths -- all rank-consistent.
+        if not self._enabled or group in self._failed:
+            yield
+            return
+        if nbytes < self._threshold_bytes(group, dtype):
+            yield
+            return
+
+        res = self._ensure_pool(group, dtype, hidden_dim)
+        if res is None or dtype != res["dtype"] or nbytes > res["capacity"]:
+            yield
+            return
+
+        pool = res["pool"]
+        try:
+            with torch.cuda.use_mem_pool(pool):
+                if not res["registered"]:
+                    # Grow the pool to full capacity once so every later
+                    # (smaller) shape is carved from the registered segment,
+                    # then the window covers the max prefill all-reduce size.
+                    pad = torch.empty(
+                        res["capacity"], dtype=torch.uint8, device=pool_device(res)
+                    )
+                    del pad
+                yield
+        except Exception as exc:
+            logger.warning(
+                "symk pool_context failed for group %s: %r -- using RING_LL",
+                group,
+                exc,
+            )
+            self._failed.add(group)
+            return
+
+        # Register the window once, after the first allocation, outside the
+        # use_mem_pool block (collective: every rank reaches this together).
+        if not res["registered"]:
+            try:
+                res["nccl_backend"].register_mem_pool(pool, symm=True)
+                res["registered"] = True
+                logger.info(
+                    "symk pool registered (symm=True) for group %s: "
+                    "hidden_dim=%d, dtype=%s, capacity=%d bytes (max_token_num=%d)",
+                    group,
+                    res["hidden_dim"],
+                    res["dtype"],
+                    res["capacity"],
+                    self._max_token_num,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "symk register_mem_pool(symm=True) failed for group %s: %r "
+                    "-- using RING_LL",
+                    group,
+                    exc,
+                )
+                self._failed.add(group)
 
     # ------------------------------------------------------------------
     # CommBackend interface
     # ------------------------------------------------------------------
 
     def all_reduce(self, tensor: torch.Tensor, group: Group, op=None) -> torch.Tensor:
-        if op is None:
-            op = torch.distributed.ReduceOp.SUM
+        """Plain in-place NCCL all-reduce.
 
-        res = self._resources.get(group)
-
-        # Lazy first-touch configuration: size the workspace from the very
-        # first tensor's hidden dim. Safe because TP all-reduce is SPMD.
-        if (
-            res is None
-            and self._enabled
-            and group not in self._failed
-            and tensor.dim() >= 1
-            and op == torch.distributed.ReduceOp.SUM
-        ):
-            local_rank = group.index(torch.distributed.get_rank())
-            self.configure_group(
-                rank=local_rank,
-                group=group,
-                hidden_dim=tensor.shape[-1],
-                dtype=tensor.dtype,
-            )
-            res = self._resources.get(group)
-
-        # Branch only on rank-consistent quantities (op, dtype, byte size vs
-        # capacity). Contiguity is deliberately excluded -- a non-contiguous
-        # tensor is densified inside ``_symk_allreduce`` so every rank stays on
-        # the symk communicator (see the SPMD consistency contract above).
-        if (
-            res is not None
-            and op == torch.distributed.ReduceOp.SUM
-            and tensor.dtype == res["dtype"]
-        ):
-            nbytes = tensor.numel() * tensor.element_size()
-            if nbytes <= res["capacity"]:
-                result = self._symk_allreduce(tensor, res, nbytes)
-                if result is not None:
-                    return result
-
+        Zero-copy symk happens transparently when ``tensor`` was allocated in
+        the registered pool via :meth:`pool_context`; NCCL selects the symk
+        kernel for window-resident buffers and RING_LL otherwise. No copy and
+        no private communicator are involved.
+        """
         return self._fallback.all_reduce(tensor, group, op=op)
-
-    def _symk_allreduce(
-        self, tensor: torch.Tensor, res: dict, nbytes: int
-    ) -> torch.Tensor | None:
-        """Copy-in -> in-place symk all-reduce -> copy-out. None on failure."""
-        try:
-            from tokenspeed_kernel.thirdparty.cuda.cuda_ipc import cudart
-
-            pynccl = res["pynccl"]
-            ws_ptr = res["ws_ptr"]
-            stream = torch.cuda.current_stream().cuda_stream
-
-            # cudaMemcpy needs a dense source. Densify per-rank if necessary --
-            # done unconditionally (not as a fallback) so a non-contiguous
-            # input never diverts this rank off the symk communicator.
-            src = tensor if tensor.is_contiguous() else tensor.contiguous()
-
-            # copy activation into the registered symmetric workspace
-            cudart.cudaMemcpyAsync(
-                ctypes.c_void_p(ws_ptr),
-                ctypes.c_void_p(src.data_ptr()),
-                nbytes,
-                ctypes.c_void_p(stream),
-            )
-            # in-place all-reduce on the symmetric buffer (selects symk kernel)
-            pynccl.symk_all_reduce(ws_ptr, src.numel(), src.dtype, stream)
-            # copy the reduced result back
-            if src is tensor:
-                cudart.cudaMemcpyAsync(
-                    ctypes.c_void_p(tensor.data_ptr()),
-                    ctypes.c_void_p(ws_ptr),
-                    nbytes,
-                    ctypes.c_void_p(stream),
-                )
-            else:
-                # restore the reduced data into the dense temporary, then write
-                # back through a layout-aware copy on the same stream.
-                cudart.cudaMemcpyAsync(
-                    ctypes.c_void_p(src.data_ptr()),
-                    ctypes.c_void_p(ws_ptr),
-                    nbytes,
-                    ctypes.c_void_p(stream),
-                )
-                tensor.copy_(src)
-            return tensor
-        except Exception:
-            return None
 
     # ---- Delegate everything else to fallback ----
 
@@ -321,17 +410,14 @@ class SymkAllReduceBackend(CommBackend):
     # ------------------------------------------------------------------
 
     def shutdown(self) -> None:
-        """Deregister windows and free workspaces (best-effort, on exit)."""
-        for res in self._resources.values():
-            pynccl = res.get("pynccl")
-            try:
-                if pynccl is not None and res.get("win") is not None:
-                    pynccl.deregister_symmetric_window(res["win"])
-            except Exception:
-                pass
-            try:
-                if pynccl is not None and res.get("ws_ptr") is not None:
-                    pynccl.mem_free(res["ws_ptr"])
-            except Exception:
-                pass
+        """Drop pool references (best-effort, on exit).
+
+        ``register_mem_pool`` windows are torn down with the communicator at
+        process shutdown; we just release our references here.
+        """
         self._resources.clear()
+
+
+def pool_device(res: dict) -> torch.device:
+    """Device of the group's symk pool (current CUDA device)."""
+    return torch.device(f"cuda:{torch.cuda.current_device()}")

@@ -24,6 +24,7 @@ All ops require explicit group (tuple of ranks) and rank parameters.
 Groups are looked up from pg_manager internally via comm_backend.
 """
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
 
@@ -119,6 +120,30 @@ def all_reduce(
     if backend is None:
         backend = get_global_backend()
     return backend.all_reduce(tensor, group, op=op)
+
+
+def maybe_symk_pool_context(
+    group: Group,
+    nbytes: int,
+    dtype: torch.dtype,
+    hidden_dim: int,
+    backend: CommBackend | None = None,
+):
+    """Context manager that routes an all-reduce input through the symk pool.
+
+    Wrap the GEMM (or other producer) of an all-reduce input with this so its
+    output lands in the registered NCCL symmetric window -> the following
+    ``all_reduce`` runs the zero-copy symk kernel. Returns a no-op context
+    when the active backend has no symk support, or when the symk backend
+    itself decides to skip (disabled / gated off / below ``TS_SYMK_MIN_BYTES``
+    / above capacity). All of those decisions are rank-consistent under SPMD.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    symk = getattr(backend, "symk_ar", None)
+    if symk is None:
+        return nullcontext()
+    return symk.pool_context(group, nbytes, dtype, hidden_dim)
 
 
 def all_gather(

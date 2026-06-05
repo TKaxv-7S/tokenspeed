@@ -25,10 +25,16 @@
 # SOFTWARE.
 
 
+from contextlib import nullcontext
+
 import torch
 from torch.nn.parameter import Parameter
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather, all_reduce
+from tokenspeed.runtime.distributed.comm_ops import (
+    all_gather,
+    all_reduce,
+    maybe_symk_pool_context,
+)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -1235,12 +1241,33 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
 
-        if scale is not None:
-            output_parallel = self.quant_method.apply(
-                self, input_parallel, bias_, scale, torch.bfloat16
+        # Allocate the GEMM output inside the NCCL symmetric-memory pool
+        # whenever this layer runs under TP, so the all-reduce that consumes it
+        # -- whether done here (reduce_results=True) or deferred/external
+        # (reduce_results=False, e.g. the fused norm+all_reduce at the
+        # decoder-layer boundary) -- can run the zero-copy symk kernel. The
+        # activation all-reduce dtype is bfloat16. maybe_symk_pool_context is a
+        # no-op unless symk is enabled+eligible.
+        if self.tp_size > 1:
+            out_dtype = torch.bfloat16
+            num_tokens = input_parallel.numel() // input_parallel.shape[-1]
+            nbytes = num_tokens * self.output_size * out_dtype.itemsize
+            pool_ctx = maybe_symk_pool_context(
+                self.tp_group, nbytes, out_dtype, self.output_size
             )
         else:
-            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+            pool_ctx = nullcontext()
+
+        with pool_ctx:
+            if scale is not None:
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, bias_, scale, torch.bfloat16
+                )
+            else:
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, bias=bias_
+                )
+
         if self.reduce_results and self.tp_size > 1:
             output = all_reduce(output_parallel, self.tp_group)
         else:
