@@ -306,6 +306,16 @@ class SymkAllReduceBackend(CommBackend):
         if not self._enabled or group in self._failed:
             yield
             return
+        # Never touch the symk pool while a CUDA graph is being captured:
+        # register_mem_pool is a NCCL collective + window registration that
+        # invalidates stream capture (cudaErrorStreamCaptureInvalidated), and
+        # decode (which runs under CUDA graphs) uses the fused all-reduce path
+        # anyway -- only the eager prefill all-reduce needs symk.
+        # is_current_stream_capturing() is SPMD-consistent (all ranks capture
+        # the same graphs), so every rank takes this no-op branch together.
+        if torch.cuda.is_current_stream_capturing():
+            yield
+            return
         if nbytes < self._threshold_bytes(group, dtype):
             yield
             return
@@ -316,25 +326,43 @@ class SymkAllReduceBackend(CommBackend):
             return
 
         pool = res["pool"]
+        # Enter the pool allocator and grow it to capacity. Only *setup* errors
+        # fall back to RING_LL; the caller's GEMM (run at ``yield``) must NOT
+        # have its errors swallowed, otherwise the caller would read an
+        # unassigned output (UnboundLocalError).
+        pool_cm = None
         try:
-            with torch.cuda.use_mem_pool(pool):
-                if not res["registered"]:
-                    # Grow the pool to full capacity once so every later
-                    # (smaller) shape is carved from the registered segment,
-                    # then the window covers the max prefill all-reduce size.
-                    pad = torch.empty(
-                        res["capacity"], dtype=torch.uint8, device=pool_device(res)
-                    )
-                    del pad
-                yield
+            pool_cm = torch.cuda.use_mem_pool(pool)
+            pool_cm.__enter__()
+            if not res["registered"]:
+                # Grow the pool to full capacity once so every later (smaller)
+                # shape is carved from the registered segment; the window then
+                # covers the max prefill all-reduce size.
+                pad = torch.empty(
+                    res["capacity"], dtype=torch.uint8, device=pool_device(res)
+                )
+                del pad
         except Exception as exc:
+            if pool_cm is not None:
+                try:
+                    pool_cm.__exit__(None, None, None)
+                except Exception:
+                    pass
             logger.warning(
-                "symk pool_context failed for group %s: %r -- using RING_LL",
+                "symk pool setup failed for group %s: %r -- using RING_LL",
                 group,
                 exc,
             )
             self._failed.add(group)
+            yield
             return
+
+        # Setup OK: run the caller's GEMM inside the pool. Body errors propagate
+        # (the finally still restores the default allocator).
+        try:
+            yield
+        finally:
+            pool_cm.__exit__(None, None, None)
 
         # Register the window once, after the first allocation, outside the
         # use_mem_pool block (collective: every rank reaches this together).

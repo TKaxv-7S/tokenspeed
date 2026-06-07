@@ -446,8 +446,20 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ["NCCL_CUMEM_ENABLE"] = "1"
         os.environ["NCCL_NVLS_ENABLE"] = "1"
         os.environ["TOKENSPEED_ENABLE_SYMK_ALLREDUCE"] = "1"
+        # The symk pool capacity must cover the largest single-iteration
+        # all-reduce, whose token count is bounded by the chunked-prefill budget
+        # (tokens the scheduler may issue per iteration), NOT by
+        # max_prefill_tokens (a per-request prefill cap). Using the latter
+        # massively over-allocates the symmetric window for long-context runs
+        # (large max_prefill_tokens) while the actual per-step message stays
+        # <= chunked_prefill_size. Fall back to max_prefill_tokens only when
+        # chunked prefill is disabled (chunked_prefill_size <= 0 / None).
+        if server_args.chunked_prefill_size and server_args.chunked_prefill_size > 0:
+            symk_max_tokens = server_args.chunked_prefill_size
+        else:
+            symk_max_tokens = server_args.max_prefill_tokens
         os.environ.setdefault(
-            "TOKENSPEED_SYMK_MAX_TOKENS", str(server_args.max_prefill_tokens)
+            "TOKENSPEED_SYMK_MAX_TOKENS", str(symk_max_tokens)
         )
         # symk_min_bytes < 0 means "use the nRanks-adaptive threshold" -- leave
         # TS_SYMK_MIN_BYTES unset so SymkAllReduceBackend falls back to the
