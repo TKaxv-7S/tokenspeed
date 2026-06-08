@@ -23,12 +23,16 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 from tokenspeed_kernel.ops.activation.triton import fused_gate_sigmoid_mul_add
+from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_5_text_base_config import Qwen3_5BaseTextConfig
 from tokenspeed.runtime.distributed.comm_manager import CommManager
+from tokenspeed.runtime.distributed.comm_ops import maybe_symk_pool_context
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
@@ -49,6 +53,7 @@ from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfi
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 def _is_moe_layer(layer_id: int, config) -> bool:
@@ -253,6 +258,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         router_logits = self.comm_manager.pre_mlp_comm(router_logits, ctx)
 
         shared_output = None
+        deferred = self.experts.supports_deferred_finalize
         with self.stream_fork.scope(
             enable=(
                 self.shared_expert is not None
@@ -277,7 +283,31 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                 topk_output=topk_output,
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                do_finalize=not deferred,
             )
+
+        pool_ctx = (
+            maybe_symk_pool_context(
+                self.mapping.moe.tp_ep_group,
+                hidden_states.shape[0] * hidden_dim * torch.bfloat16.itemsize,
+                torch.bfloat16,
+                hidden_dim,
+            )
+            if self.comm_manager.use_all_reduce(is_moe=True)
+            else nullcontext()
+        )
+
+        if deferred and isinstance(final_hidden_states, (tuple, list)):
+            gemm2_out, expert_weights, expanded_idx = final_hidden_states
+            with pool_ctx:
+                final_hidden_states = moe_finalize_fuse_shared(
+                    gemm2_out,
+                    expanded_idx,
+                    expert_weights,
+                    None,
+                    top_k=self.topk.topk_config.top_k,
+                    enable_pdl=pdl_enabled(),
+                )
 
         if shared_output is not None:
             if self.shared_expert_gate is not None and hidden_states.shape[0] > 0:
