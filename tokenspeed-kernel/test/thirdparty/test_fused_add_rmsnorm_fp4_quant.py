@@ -107,6 +107,65 @@ def _rmsnorm_ref_fp32(
     return normed_fp32.to(out_dtype), pre_norm_fp32.to(out_dtype)
 
 
+def _unswizzle_sf_ref(
+    sf_swizzled_u8: torch.Tensor,
+    m: int,
+    n: int,
+    scaling_vector_size: int = 16,
+) -> torch.Tensor:
+    """Pure-PyTorch inverse of TRT-LLM's 128x4 SF swizzle (no custom op).
+
+    The fused kernel stores the block scale-factors in TRT-LLM's SWIZZLED
+    layout. ``flashinfer.fused_moe.utils.unswizzle_sf`` could reverse it, but it
+    dispatches to ``torch.ops.trtllm.block_scale_interleave_reverse`` which is
+    only registered when TRT-LLM is installed. To keep the test self-contained
+    we re-implement the index map from TRT-LLM's ``computeSFIndex`` (see
+    ``cpp/tensorrt_llm/thop/fp8Op.h``) and gather every logical ``(row, col)``
+    SF byte out of the swizzled 1-D buffer.
+
+    For an unswizzled position ``(row, col)`` the swizzled 1-D offset is::
+
+        col_in_g0 = col % 4
+        col_group = col // 4
+        row_in_g0 = row % 32
+        row_in_g1 = (row % 128) // 32
+        row_group = row // 128
+        offset = col_in_g0
+               + col_group * 512                # columnGroupStride (4 * 128)
+               + row_in_g0  * 128               # rowGroup0Stride   (4 * 32)
+               + row_in_g1  * 4                 # rowGroup1Stride   (4)
+               + row_group  * (128 * padded_col)
+
+    where ``padded_col = round_up(n // scaling_vector_size, 4)``.
+
+    Returns:
+        ``[m, n // scaling_vector_size]`` ``uint8`` unswizzled SF.
+    """
+    device = sf_swizzled_u8.device
+    total_col = n // scaling_vector_size
+    padded_col = (total_col + 3) // 4 * 4
+
+    row = torch.arange(m, device=device).view(-1, 1)
+    col = torch.arange(total_col, device=device).view(1, -1)
+
+    col_in_g0 = col % 4
+    col_group = col // 4
+    row_in_g0 = row % 32
+    row_in_g1 = (row % 128) // 32
+    row_group = row // 128
+
+    offset = (
+        col_in_g0
+        + col_group * 512
+        + row_in_g0 * 128
+        + row_in_g1 * 4
+        + row_group * (128 * padded_col)
+    )  # [m, total_col]
+
+    flat = sf_swizzled_u8.reshape(-1)
+    return flat[offset.reshape(-1)].reshape(m, total_col)
+
+
 def _dequant_nvfp4(
     fp4_u8: torch.Tensor,
     sf_swizzled_u8: torch.Tensor,
@@ -126,8 +185,6 @@ def _dequant_nvfp4(
         ``[M, N]`` ``float32`` reconstruction
         ``= e2m1(fp4) * fp8_e4m3(sf) / sf_scale``.
     """
-    from flashinfer.fused_moe.utils import unswizzle_sf
-
     device = fp4_u8.device
 
     # ---- Decode E2M1 nibbles -> fp32 values ([M, N]) ------------------------
@@ -143,12 +200,9 @@ def _dequant_nvfp4(
     e2m1[:, 1::2] = vals_hi
 
     # ---- Unswizzle SF -> [M, N // 16] e4m3 codes -> fp32 SFValue -----------
-    # ``unswizzle_sf`` expects the swizzled buffer to be sized to the swizzled
-    # padding (round_up(M,128) * round_up(N//16, 4)); the kernel allocates that
-    # exactly. The reverse op returns ``[padded_rows, sf_cols]`` so we slice.
-    sf_cols = n // 16
-    sf_unswizzled = unswizzle_sf(sf_swizzled_u8, m, n, scaling_vector_size=16)
-    sf_unswizzled = sf_unswizzled.reshape(-1, sf_cols)[:m, :sf_cols]
+    # ``_unswizzle_sf_ref`` is a pure-PyTorch reverse of the 128x4 swizzle so
+    # the test stays self-contained (no ``torch.ops.trtllm`` custom op needed).
+    sf_unswizzled = _unswizzle_sf_ref(sf_swizzled_u8, m, n, scaling_vector_size=16)
     sf_fp32 = sf_unswizzled.contiguous().view(torch.float8_e4m3fn).float()
 
     # ---- Combine: each [M, k*16:(k+1)*16] block scales by sf_fp32[M, k] ----
