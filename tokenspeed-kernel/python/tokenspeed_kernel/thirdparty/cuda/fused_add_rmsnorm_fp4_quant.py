@@ -62,6 +62,9 @@ def fused_add_rmsnorm_fp4_quant(
     *,
     eps: float,
     output_hp_norm: bool,
+    out_buffers: Optional[
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
+    ] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Run residual-add + RMSNorm + NVFP4 block-scale quant in a single kernel.
 
@@ -77,6 +80,15 @@ def fused_add_rmsnorm_fp4_quant(
         eps: RMSNorm epsilon.
         output_hp_norm: when True, also return the high-precision normed
             tensor (used by the MoE gate / shared expert path).
+        out_buffers: optional pre-allocated output buffers in m_padded layout,
+            packed as ``(normed_fp4_padded_i32, residual_out_padded,
+            sf_out_padded, hp_norm_padded)`` where the last entry is
+            ``None`` iff ``output_hp_norm`` is False. When provided, the
+            wrapper skips the four ``torch.empty`` calls per invocation and
+            reuses caller-managed memory; the buffer shapes / dtypes must
+            match exactly (no validation is performed on the hot path, so
+            callers must size them with ``m_padded = (M + 31) // 32 * 32``).
+            Defaults to ``None`` (per-call allocation, original behaviour).
 
     Returns:
         ``(fp4_packed_uint8, residual_out, sf_uint8, hp_norm)``:
@@ -121,18 +133,28 @@ def fused_add_rmsnorm_fp4_quant(
     device = hidden_states.device
     m_padded = (m + _M_PADDING - 1) // _M_PADDING * _M_PADDING
 
-    normed_fp4_padded_i32 = torch.empty(
-        (m_padded, n // 8), dtype=torch.int32, device=device
-    )
-    residual_out_padded = torch.empty((m_padded, n), dtype=dtype, device=device)
+    if out_buffers is None:
+        normed_fp4_padded_i32 = torch.empty(
+            (m_padded, n // 8), dtype=torch.int32, device=device
+        )
+        residual_out_padded = torch.empty((m_padded, n), dtype=dtype, device=device)
 
-    sf_out_padded = torch.empty(
-        (m_padded, n // _FP4_BLOCK_SIZE), dtype=torch.uint8, device=device
-    )
+        sf_out_padded = torch.empty(
+            (m_padded, n // _FP4_BLOCK_SIZE), dtype=torch.uint8, device=device
+        )
 
-    hp_norm_padded: Optional[torch.Tensor] = None
-    if output_hp_norm:
-        hp_norm_padded = torch.empty((m_padded, n), dtype=dtype, device=device)
+        hp_norm_padded: Optional[torch.Tensor] = None
+        if output_hp_norm:
+            hp_norm_padded = torch.empty((m_padded, n), dtype=dtype, device=device)
+    else:
+        # Trust caller-supplied buffers on the hot path; the binding still
+        # validates shapes/dtypes inside its TVM_FFI checks.
+        (
+            normed_fp4_padded_i32,
+            residual_out_padded,
+            sf_out_padded,
+            hp_norm_padded,
+        ) = out_buffers
 
     if sf_scale is not None:
         if sf_scale.dtype != torch.float32 or sf_scale.numel() != 1:

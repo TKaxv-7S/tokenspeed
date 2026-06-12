@@ -332,6 +332,67 @@ class CommManager:
             self._sm_major_cache = sm_major
         return sm_major >= 9
 
+    def _acquire_fused_quant_buffers(
+        self,
+        m: int,
+        n: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        output_hp_norm: bool,
+    ):
+        """Return reusable m_padded output buffers for fused_add_rmsnorm_fp4_quant.
+
+        A single max-capacity buffer set is cached per
+        ``(hidden_size, dtype, output_hp_norm)`` on this per-layer CommManager
+        and sliced down for smaller m, so prefill's varying token counts only
+        ever grow the allocation instead of churning the caching allocator on
+        every layer / step.
+
+        Reuse is safe because:
+          1. This path is mutually exclusive with symk fusion
+             (``can_fuse_post_attn_quant`` rejects when ``should_fuse``), so
+             there is no symk window pointer-stability dependency.
+          2. Each decoder layer owns its own CommManager, so layer N+1 never
+             overwrites layer N's ``residual_out`` (which lives across the MLP
+             block as the next layer's residual input).
+          3. Same-stream FIFO ordering guarantees the previous step's consumers
+             (MoE GEMM / gate / shared expert) finish before the buffers are
+             rewritten on the next step.
+        """
+        m_padded = (m + 31) // 32 * 32  # ws_layernorm vectorized store needs m % 32
+        pool = getattr(self, "_fused_quant_pool", None)
+        if pool is None:
+            pool = {}
+            self._fused_quant_pool = pool
+
+        key = (n, dtype, output_hp_norm)
+        entry = pool.get(key)
+        if entry is None or entry[0] < m_padded:
+            cap = m_padded
+            normed_fp4 = torch.empty((cap, n // 8), dtype=torch.int32, device=device)
+            residual_out = torch.empty((cap, n), dtype=dtype, device=device)
+            sf_out = torch.empty((cap, n // 16), dtype=torch.uint8, device=device)
+            hp_norm = (
+                torch.empty((cap, n), dtype=dtype, device=device)
+                if output_hp_norm
+                else None
+            )
+            entry = (cap, normed_fp4, residual_out, sf_out, hp_norm)
+            pool[key] = entry
+
+        cap, normed_fp4, residual_out, sf_out, hp_norm = entry
+        if cap == m_padded:
+            return normed_fp4, residual_out, sf_out, hp_norm
+        # Narrow the cached max-capacity buffers to the requested m_padded; the
+        # row-major contiguous prefix keeps data_ptr / strides valid for the
+        # binding's exact-shape checks.
+        return (
+            normed_fp4[:m_padded],
+            residual_out[:m_padded],
+            sf_out[:m_padded],
+            hp_norm[:m_padded] if hp_norm is not None else None,
+        )
+
     def post_attn_reduce_norm_quant(
         self,
         hidden_states: torch.Tensor,
@@ -362,6 +423,10 @@ class CommManager:
         norm_weight = getattr(
             self.post_attn_layernorm, "gemma_weight", self.post_attn_layernorm.weight
         )
+        m, n = hidden_states.shape
+        out_buffers = self._acquire_fused_quant_buffers(
+            m, n, hidden_states.dtype, hidden_states.device, output_hp_norm=True
+        )
         fp4, residual_out, sf_out, hp_norm = fused_add_rmsnorm_fp4_quant(
             hidden_states,
             residual,
@@ -369,6 +434,7 @@ class CommManager:
             sf_scale,
             eps=self.post_attn_layernorm.variance_epsilon,
             output_hp_norm=True,
+            out_buffers=out_buffers,
         )
         return hp_norm, residual_out, fp4, sf_out
 
