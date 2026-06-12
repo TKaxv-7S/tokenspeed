@@ -142,16 +142,29 @@ void fused_add_rmsnorm_fp4_quant(TensorView input, TensorView residual, TensorVi
     sf_scale_ptr = static_cast<float*>(sf_scale.value().data_ptr());
   }
 
-  // SM90+ kernel; surface a clear error early if running on Ampere or older.
+  // SM90+ kernel; cache per-device sm_major so we avoid the slow driver call
+  // (cudaGetDeviceProperties) on every invocation. cudaSetDevice is also
+  // dropped because PyTorch already manages the active device for us, so
+  // re-issuing it per call only burns CPU on the hot path.
   int const device_id = input.device().device_id;
-  cudaSetDevice(device_id);
-  cudaDeviceProp props;
-  cudaError_t prop_err = cudaGetDeviceProperties(&props, device_id);
-  TVM_FFI_ICHECK(prop_err == cudaSuccess)
-      << "cudaGetDeviceProperties failed: " << cudaGetErrorString(prop_err);
-  TVM_FFI_ICHECK_GE(props.major, 9)
+  static thread_local std::unordered_map<int, int> sm_major_cache;
+  int sm_major;
+  {
+    auto it = sm_major_cache.find(device_id);
+    if (it != sm_major_cache.end()) {
+      sm_major = it->second;
+    } else {
+      cudaDeviceProp props;
+      cudaError_t prop_err = cudaGetDeviceProperties(&props, device_id);
+      TVM_FFI_ICHECK(prop_err == cudaSuccess)
+          << "cudaGetDeviceProperties failed: " << cudaGetErrorString(prop_err);
+      sm_major = props.major;
+      sm_major_cache[device_id] = sm_major;
+    }
+  }
+  TVM_FFI_ICHECK_GE(sm_major, 9)
       << "fused_add_rmsnorm_fp4_quant requires SM90 (Hopper) or newer; current sm_"
-      << props.major << props.minor;
+      << sm_major;
 
   cudaStream_t const stream = get_stream(input.device());
   static int const multi_processor_count = tensorrt_llm::common::getMultiProcessorCount();
