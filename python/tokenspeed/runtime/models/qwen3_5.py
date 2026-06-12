@@ -577,7 +577,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
     def forward_mlp(
         self,
         hidden_states,
-        residual,t dif
+        residual,
         ctx: ForwardContext,
         num_global_tokens,
         max_num_tokens_per_gpu,
