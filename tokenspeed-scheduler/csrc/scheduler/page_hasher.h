@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -141,7 +142,7 @@ inline std::vector<std::string> ComputePagedHashes(
 // We compute the content hash first, then wrap the group_id around the result
 // to form the lookup key. The group_id is a 4-byte big-endian value appended
 // as 8 hex characters (64-hex content hash -> 72-hex key).
-static constexpr std::size_t kGroupIdHexLen = 8;  // 4-byte group_id as hex
+inline constexpr std::size_t kGroupIdHexLen = 8;  // 4-byte group_id as hex
 
 inline std::string MakeKeyWithGroupId(const std::string& block_hash, uint32_t group_id) {
     std::string key = block_hash;

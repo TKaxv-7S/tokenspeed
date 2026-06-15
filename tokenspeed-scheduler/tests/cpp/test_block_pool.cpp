@@ -129,6 +129,17 @@ TEST(BlockPoolTest, MissReturnsNull) {
     EXPECT_EQ(pool.GetCachedBlock(RealKey({9, 9}, 0)), nullptr);
 }
 
+TEST(BlockPoolTest, CachingDisabledNeverHits) {
+    BlockPool pool(8, /*enable_caching=*/false);
+    const std::string key = RealKey({1, 2, 3, 4}, 0);
+
+    auto blocks = pool.AllocateBlocks(1);
+    CacheBlock* b = blocks.front();
+    pool.CacheFullBlocks(b, key);   // no-op when caching is disabled
+    EXPECT_FALSE(b->IsCached());
+    EXPECT_EQ(pool.GetCachedBlock(key), nullptr);  // lookups always miss
+}
+
 TEST(BlockPoolTest, GroupIdDistinguishesSameContent) {
     BlockPool pool(8);
     const std::string k0 = RealKey({1, 2, 3, 4}, 0);
