@@ -365,5 +365,44 @@ TEST(CoordinatorAllocTest, AcquireShortfallLeavesClaimedPrefixForCallerToFree) {
     EXPECT_EQ(pool.NumFreeBlocks(), free_before);
 }
 
+// AdvanceWindow only touches sliding-window groups; full-attention groups are
+// left completely untouched (spec.kind gate). page_size=2 for both groups,
+// swa window=4.
+TEST(KvCacheCoordinatorAdvanceWindow, OnlySlidingWindowGroupEvicts) {
+    BlockPool pool(/*total_num_blocks=*/32, /*enable_caching=*/true);
+    std::vector<KvCacheSpec> specs{
+        KvCacheSpec{AttnKind::kFull, /*page_size=*/2, /*sliding_window=*/0},
+        KvCacheSpec{AttnKind::kSlidingWindow, /*page_size=*/2, /*sliding_window=*/4},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
+
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    // Allocate 6 tokens -> 3 pages per group (page_size=2).
+    ASSERT_TRUE(coordinator.Acquire(tables, /*num_tokens=*/6));
+    ASSERT_EQ(tables[0].NumBlocks(), 3);
+    ASSERT_EQ(tables[1].NumBlocks(), 3);
+
+    auto full_before = tables[0].Blocks();
+    std::vector<CacheBlock*> full_snapshot(full_before.begin(), full_before.end());
+
+    // num_computed_tokens=5 -> swa skipped=5-4+1=2 -> skipped_blocks=2/2=1:
+    // swa group evicts page 0 (one page slides fully out of window).
+    coordinator.AdvanceWindow(tables, /*num_computed_tokens=*/5);
+
+    // Full group untouched: same length, same blocks, no nulls.
+    ASSERT_EQ(tables[0].NumBlocks(), 3);
+    auto full_after = tables[0].Blocks();
+    for (std::int32_t i = 0; i < tables[0].NumBlocks(); ++i) {
+        EXPECT_EQ(full_after[i], full_snapshot[i]) << "full group block " << i << " changed";
+        EXPECT_NE(full_after[i], pool.NullBlock()) << "full group got a null hole at " << i;
+    }
+
+    // Swa group: page 0 became a null hole, length unchanged.
+    ASSERT_EQ(tables[1].NumBlocks(), 3);
+    EXPECT_EQ(tables[1].Blocks()[0], pool.NullBlock());
+    EXPECT_NE(tables[1].Blocks()[1], pool.NullBlock());
+    EXPECT_NE(tables[1].Blocks()[2], pool.NullBlock());
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

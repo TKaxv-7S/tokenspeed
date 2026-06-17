@@ -47,6 +47,12 @@
 #include "fsm/forward_events.h"
 #include "fsm/cache_events.h"
 #include "fsm/pd_events.h"
+
+#if TOKENSPEED_FLAT_KVCACHE
+#include "cache/block_pool.h"
+#include "cache/kv_cache_coordinator.h"
+#include "cache/forward_cache_ops.h"
+#endif
 namespace tokenspeed {
 
 class Scheduler {
@@ -138,6 +144,11 @@ private:
     KVPrefixCache kv_prefix_cache_;
     ReqPoolAllocator req_pool_allocator_;
     std::optional<HybridPrefixCache> hybrid_prefix_cache_{};
+
+#if TOKENSPEED_FLAT_KVCACHE
+    BlockPool block_pool_;
+    KvCacheCoordinator coordinator_;
+#endif
 
 private:
     std::unordered_map<std::string, std::unique_ptr<Request>> requests_;

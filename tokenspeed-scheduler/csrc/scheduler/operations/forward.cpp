@@ -166,6 +166,9 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
         mamba_allocator_ ? &*mamba_allocator_ : nullptr,
         std::move(mamba_loadback_nodes),
+#if TOKENSPEED_FLAT_KVCACHE
+        &coordinator_,
+#endif
     };
 }
 
@@ -193,7 +196,12 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     }
 
     return fsm::SchedulePrefillEvent{tokens_this_round, reserve_num_tokens_in_next_schedule_event,
-                                     hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
+                                     hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
+#if TOKENSPEED_FLAT_KVCACHE
+                                     ,
+                                     &coordinator_
+#endif
+    };
 }
 
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* request,
@@ -219,7 +227,12 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
     }
 
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens,
-                                    hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
+                                    hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
+#if TOKENSPEED_FLAT_KVCACHE
+                                    ,
+                                    &coordinator_
+#endif
+    };
 }
 
 std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFromRetracted(
@@ -246,7 +259,11 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
         if (mamba_recovery_node == nullptr) {
             spdlog::warn("[Scheduler] Retracted request {} lost tree-owned Mamba state, aborting request",
                          request->Id());
-            request->Apply(fsm::AbortEvent{});
+            request->Apply(fsm::AbortEvent{
+#if TOKENSPEED_FLAT_KVCACHE
+                &coordinator_
+#endif
+            });
             return {};
         }
         if (!needs_mamba_loadback) {
@@ -390,7 +407,11 @@ std::optional<WriteBackOperation> Scheduler::newRetractOperation(Request* retrac
     } else {
         spdlog::warn("[Scheduler] Retract failed for request {}: host capacity exhausted, aborting request",
                      retract_request->Id());
-        retract_request->Apply(fsm::AbortEvent{});
+        retract_request->Apply(fsm::AbortEvent{
+#if TOKENSPEED_FLAT_KVCACHE
+            &coordinator_
+#endif
+        });
     }
     return std::nullopt;
 }

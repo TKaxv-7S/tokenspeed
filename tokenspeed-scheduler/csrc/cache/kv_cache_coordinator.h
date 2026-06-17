@@ -72,6 +72,12 @@ public:
                          std::int32_t num_full_blocks);
     void Free(std::span<BlockTable> tables);
 
+    // Fan out window-eviction to sliding-window groups only. Full-attention
+    // groups never evict mid-sequence, so they're skipped via the spec.kind
+    // gate. tables are aligned by group index (size must equal NumGroups()).
+    // Mirrors Acquire's per-group fan-out shape.
+    void AdvanceWindow(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
+
 private:
     std::vector<std::string> keysForGroup(std::span<const std::string> content_hashes,
                                           std::uint32_t group_id) const;

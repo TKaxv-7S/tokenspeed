@@ -37,6 +37,7 @@
 #include "resource/allocator/req_pool_allocator.h"
 #include "resource/types.h"
 #include "scheduler/request_spec.h"
+#include "cache/cache_types.h"
 
 namespace tokenspeed::fsm {
 
@@ -136,6 +137,11 @@ public:
     LocalMambaAllocator* GetLocalMambaAllocator() { return local_mamba_allocator_.get(); }
     std::unique_ptr<LocalMambaAllocator> TakeLocalMambaAllocator() && { return std::move(local_mamba_allocator_); }
 
+    std::vector<BlockTable>& BlockTables() { return block_tables_; }
+    const std::vector<BlockTable>& BlockTables() const { return block_tables_; }
+    std::vector<BlockTable> TakeBlockTables() && { return std::move(block_tables_); }
+    void SetBlockTables(std::vector<BlockTable> tables) { block_tables_ = std::move(tables); }
+
 protected:
     TokenContainer* token_container_;
     std::int32_t page_size_{};
@@ -144,6 +150,7 @@ protected:
     std::unique_ptr<DeviceNodeRef> device_node_ref_;
     std::unique_ptr<LocalKVAllocator> local_kv_allocator_;
     std::unique_ptr<LocalMambaAllocator> local_mamba_allocator_;
+    std::vector<BlockTable> block_tables_{};  // flat KV-cache path; empty under radix path
 };
 
 struct ForwardState : public BaseState {

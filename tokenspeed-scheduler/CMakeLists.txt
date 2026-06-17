@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(TOKENSPEED_SCHEDULER_BUILD_PYTHON "Build Python bindings" OFF)
 option(TOKENSPEED_SCHEDULER_BUILD_TESTS "Build tests" OFF)
+option(TOKENSPEED_FLAT_KVCACHE "Use the new flat KV-cache (KvCacheCoordinator) path in the FSM instead of the radix LocalKVAllocator path" OFF)
 
 include(FetchContent)
 FetchContent_Declare(
@@ -59,6 +60,7 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/scheduler/scheduler.cpp
 
     csrc/cache/kv_cache_coordinator.cpp
+    csrc/cache/forward_cache_ops.cpp
 )
 
 target_include_directories(tokenspeed_scheduler_core
@@ -78,6 +80,10 @@ target_compile_definitions(tokenspeed_scheduler_core
     PUBLIC
         OPENSSL_SUPPRESS_DEPRECATED
 )
+
+if(TOKENSPEED_FLAT_KVCACHE)
+    target_compile_definitions(tokenspeed_scheduler_core PUBLIC TOKENSPEED_FLAT_KVCACHE=1)
+endif()
 
 if(TOKENSPEED_SCHEDULER_BUILD_PYTHON)
     nanobind_add_module(tokenspeed_scheduler_ext
@@ -113,6 +119,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_full_attn_manager.cpp
         tests/cpp/test_swa_manager.cpp
         tests/cpp/test_kv_cache_coordinator.cpp
+        tests/cpp/test_forward_cache_ops.cpp
         tests/cpp/test_scheduler_plan.cpp
         tests/cpp/test_outside_event_handler.cpp
         tests/cpp/test_write_back.cpp

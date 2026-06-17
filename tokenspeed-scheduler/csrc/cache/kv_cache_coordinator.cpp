@@ -115,6 +115,17 @@ void KvCacheCoordinator::Free(std::span<BlockTable> tables) {
     }
 }
 
+void KvCacheCoordinator::AdvanceWindow(std::span<BlockTable> tables, std::int32_t num_computed_tokens) {
+    _assert(static_cast<std::int32_t>(tables.size()) == NumGroups(),
+            "AdvanceWindow: tables size must match group count");
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        if (groups_[i].Spec().kind == AttnKind::kSlidingWindow) {
+            auto& swa = static_cast<SwaManager&>(groups_[i].Manager());
+            swa.AdvanceWindow(tables[i], num_computed_tokens);
+        }
+    }
+}
+
 KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, BlockPool& pool) {
     _assert(!specs.empty(), "MakeCoordinator requires at least one spec");
     std::int32_t page_size = specs[0].page_size;
