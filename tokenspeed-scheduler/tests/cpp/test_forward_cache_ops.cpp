@@ -20,6 +20,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -127,6 +128,124 @@ TEST(ForwardCacheOpsSpecs, TranslatesPagedCacheGroups) {
     EXPECT_EQ(specs[1].kind, AttnKind::kSlidingWindow);
     EXPECT_EQ(specs[1].page_size, 16);
     EXPECT_EQ(specs[1].sliding_window, 128);
+}
+
+TEST(ForwardCacheOpsBuildFlatBlockTables, TwoGroupsRowsAndIds) {
+    BlockPool pool(/*total_num_blocks=*/32, /*enable_caching=*/true);
+    KvCacheCoordinator coordinator = MakeTwoGroup(pool);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    // 6 tokens, page_size 2 -> 3 pages per group.
+    ASSERT_TRUE(coordinator.Acquire(tables, /*num_tokens=*/6));
+
+    std::vector<std::string> group_ids{"full", "swa"};
+    auto built = BuildFlatBlockTables(tables, group_ids);
+
+    ASSERT_EQ(built.size(), 2u);
+    ASSERT_TRUE(built.count("full"));
+    ASSERT_TRUE(built.count("swa"));
+    EXPECT_EQ(built.at("full").size(), 3u);
+    EXPECT_EQ(built.at("swa").size(), 3u);
+    // Full group has no null holes: every id is a real (non-zero) physical page.
+    for (std::int32_t id : built.at("full")) {
+        EXPECT_GT(id, 0);
+    }
+    // Rows must match the source span exactly: absolute logical-page order,
+    // no compaction, null hole = 0 in its exact slot.
+    std::vector<std::int32_t> expected_full;
+    for (auto* b : tables[0].Blocks()) {
+        expected_full.push_back(b->IsNull() ? 0 : b->BlockId());
+    }
+    std::vector<std::int32_t> expected_swa;
+    for (auto* b : tables[1].Blocks()) {
+        expected_swa.push_back(b->IsNull() ? 0 : b->BlockId());
+    }
+    EXPECT_EQ(built.at("full"), expected_full);
+    EXPECT_EQ(built.at("swa"), expected_swa);
+}
+
+TEST(ForwardCacheOpsBuildFlatBlockTables, SwaRowGetsNullHoleAfterAdvance) {
+    BlockPool pool(/*total_num_blocks=*/32, /*enable_caching=*/true);
+    KvCacheCoordinator coordinator = MakeTwoGroup(pool);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    // sliding_window=4, page_size=2. Acquire enough tokens that the window
+    // (4 tokens = 2 pages) leaves an earlier page out of window.
+    ASSERT_TRUE(coordinator.Acquire(tables, /*num_tokens=*/8));      // 4 pages/group
+    coordinator.AdvanceWindow(tables, /*num_computed_tokens=*/8);
+
+    std::vector<std::string> group_ids{"full", "swa"};
+    auto built = BuildFlatBlockTables(tables, group_ids);
+    // Full row never has a 0 hole.
+    for (std::int32_t id : built.at("full")) {
+        EXPECT_GT(id, 0);
+    }
+    // SWA row has at least one null hole (id 0) where a page slid out of window.
+    const auto& swa = built.at("swa");
+    EXPECT_NE(std::find(swa.begin(), swa.end(), 0), swa.end());
+    // Pin the exact hole position (not just its existence): the row must equal
+    // the source span verbatim, with null holes mapped to 0 in their own slot.
+    std::vector<std::int32_t> expected_swa;
+    for (auto* b : tables[1].Blocks()) {
+        expected_swa.push_back(b->IsNull() ? 0 : b->BlockId());
+    }
+    EXPECT_EQ(swa, expected_swa);
+}
+
+TEST(ForwardCacheOpsBuildFlatBlockTables, FreshTablesProduceEmptyRows) {
+    BlockPool pool(/*total_num_blocks=*/32, /*enable_caching=*/true);
+    KvCacheCoordinator coordinator = MakeTwoGroup(pool);
+    // Never Acquire: both BlockTables have zero blocks.
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+
+    std::vector<std::string> group_ids{"full", "swa"};
+    auto built = BuildFlatBlockTables(tables, group_ids);
+
+    // One key per group, each row empty (zero pages allocated).
+    ASSERT_EQ(built.size(), 2u);
+    EXPECT_TRUE(built.at("full").empty());
+    EXPECT_TRUE(built.at("swa").empty());
+}
+
+TEST(ForwardCacheOpsBuildFlatBlockTables, SingleGroupRowMatchesSource) {
+    BlockPool pool(/*total_num_blocks=*/32, /*enable_caching=*/true);
+    std::vector<KvCacheSpec> specs{
+        KvCacheSpec{AttnKind::kFull, /*page_size=*/2, /*sliding_window=*/0},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(coordinator.Acquire(tables, /*num_tokens=*/4));  // 2 pages
+
+    std::vector<std::string> group_ids{"only"};
+    auto built = BuildFlatBlockTables(tables, group_ids);
+
+    ASSERT_EQ(built.size(), 1u);
+    std::vector<std::int32_t> expected;
+    for (auto* b : tables[0].Blocks()) {
+        expected.push_back(b->IsNull() ? 0 : b->BlockId());
+    }
+    EXPECT_EQ(built.at("only"), expected);
+    // Sanity: keyed by the supplied group_id, not a bare index.
+    EXPECT_EQ(built.count("0"), 0u);
+}
+
+TEST(ForwardCacheOpsBuildFlatBlockTables, KeyMatchesSuppliedGroupIdStrings) {
+    BlockPool pool(/*total_num_blocks=*/32, /*enable_caching=*/true);
+    KvCacheCoordinator coordinator = MakeTwoGroup(pool);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(coordinator.Acquire(tables, /*num_tokens=*/4));
+
+    // Arbitrary (non-"full"/"swa") ids: keys must come straight from the input,
+    // and group_ids[i] must pair with tables[i] by index.
+    std::vector<std::string> group_ids{"alpha", "beta"};
+    auto built = BuildFlatBlockTables(tables, group_ids);
+
+    ASSERT_EQ(built.size(), 2u);
+    EXPECT_TRUE(built.count("alpha"));
+    EXPECT_TRUE(built.count("beta"));
+    std::vector<std::int32_t> expected_alpha;
+    for (auto* b : tables[0].Blocks()) {
+        expected_alpha.push_back(b->IsNull() ? 0 : b->BlockId());
+    }
+    EXPECT_EQ(built.at("alpha"), expected_alpha);
 }
 
 }  // namespace

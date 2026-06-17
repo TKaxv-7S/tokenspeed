@@ -387,6 +387,17 @@ public:
             return std::move(state);
         }
 
+#if TOKENSPEED_FLAT_KVCACHE
+        // TODO(radix-removal): the publish body below is radix-only and
+        // unreachable on the flat path (flat states carry no device node;
+        // allocation is driven by block_tables_, and result tokens were already
+        // extended above). This guard shields the GetDeviceNode() null-deref in
+        // that body until the radix path is deleted.
+        if (!state.HasDeviceNodeRef()) {
+            return std::move(state);
+        }
+#endif
+
         const std::int32_t accepted_token_size = token_container->Size();
         auto publishable_pages = [page_size](std::int32_t token_size) {
             if (page_size <= 0 || token_size <= 0) return 0;

@@ -69,4 +69,15 @@ void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& table
     coordinator.Free(tables);
 }
 
+std::map<std::string, std::vector<std::int32_t>> BuildFlatBlockTables(
+    const std::vector<BlockTable>& tables, std::span<const std::string> group_ids) {
+    _assert(tables.size() == group_ids.size(),
+            "BuildFlatBlockTables: tables/group_ids size mismatch");
+    std::map<std::string, std::vector<std::int32_t>> out;
+    for (std::size_t i = 0; i < tables.size(); ++i) {
+        out.emplace(group_ids[i], BlockTablePageIds(tables[i]));
+    }
+    return out;
+}
+
 }  // namespace tokenspeed

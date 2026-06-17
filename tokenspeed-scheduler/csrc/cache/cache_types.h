@@ -77,6 +77,18 @@ private:
     std::int32_t tail_avail_{0};
 };
 
+// Physical page ids of one BlockTable: BlockId() per logical slot, with
+// null-block holes written as 0, in absolute logical-page order (no
+// compaction). The single source of truth for flattening a BlockTable's pages.
+inline std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) {
+    std::vector<std::int32_t> ids;
+    ids.reserve(static_cast<std::size_t>(table.NumBlocks()));
+    for (CacheBlock* b : table.Blocks()) {
+        ids.push_back(b->IsNull() ? 0 : b->BlockId());
+    }
+    return ids;
+}
+
 // Unified prefix-match result across all managers (mirrors vLLM computed_blocks).
 // blocks maps logical page -> physical page; an unmatched / out-of-window slot is
 // a null_block hole. blocks.size() is the compute coverage (every slot, real or

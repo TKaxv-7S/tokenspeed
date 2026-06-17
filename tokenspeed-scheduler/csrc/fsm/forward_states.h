@@ -117,7 +117,18 @@ public:
 
     const TreeNode* GetDeviceNode() const { return device_node_ref_->Node(); }
 
-    std::int32_t TailPageAvailableTokens() const { return local_kv_allocator_->TailPageAvailableTokens(); }
+    // Flat KV-cache path leaves device_node_ref_/local_kv_allocator_ null and
+    // drives allocation through block_tables_ instead; radix path always holds a
+    // device node here. Lets radix-only publishing branches skip on flat input.
+    // TODO(radix-removal): drop together with the radix device-node publish path.
+    bool HasDeviceNodeRef() const { return device_node_ref_ != nullptr; }
+
+    std::int32_t TailPageAvailableTokens() const {
+        if (!block_tables_.empty()) {
+            return block_tables_[0].TailAvailableTokens();  // flat: full group tail
+        }
+        return local_kv_allocator_->TailPageAvailableTokens();  // radix
+    }
 
     auto GetFullPagedTokens() const { return token_container_->GetFullPagedTokens(page_size_, false); }
     auto GetFullPagedTokens(bool except_last) const {
@@ -167,10 +178,20 @@ struct ForwardState : public BaseState {
     std::unique_ptr<ReqPoolIndex> TakeReqPoolIndex() && { return std::move(req_pool_index_); }
     std::int32_t GetReqPoolIndex() const { return req_pool_index_ ? req_pool_index_->slot_ : -1; }
 
-    std::vector<std::int32_t> GetOccupiedPages() const { return GetPageContainer().Pages(); }
+    std::vector<std::int32_t> GetOccupiedPages() const {
+        if (!block_tables_.empty()) {
+            return BlockTablePageIds(block_tables_[0]);  // flat: full group page ids
+        }
+        return GetPageContainer().Pages();  // radix
+    }
 
     // Returns only the pages held by the local KV allocator (tail pages, not radix-tree prefix pages).
-    std::vector<std::int32_t> GetLocalAllocatorPages() const { return local_kv_allocator_->Pages(); }
+    std::vector<std::int32_t> GetLocalAllocatorPages() const {
+        if (!block_tables_.empty()) {
+            return BlockTablePageIds(block_tables_[0]);  // flat: full group page ids
+        }
+        return local_kv_allocator_->Pages();  // radix
+    }
 
 private:
     std::unique_ptr<ReqPoolIndex> req_pool_index_;

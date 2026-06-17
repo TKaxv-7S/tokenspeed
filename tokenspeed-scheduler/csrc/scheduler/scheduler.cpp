@@ -64,7 +64,15 @@ Scheduler::Scheduler(SchedulerConfig config)
 #if TOKENSPEED_FLAT_KVCACHE
       ,
       block_pool_{config_.device_allocator.total_pages},
-      coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), block_pool_)}
+      coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), block_pool_)},
+      flat_group_ids_{[&] {
+          std::vector<std::string> ids;
+          ids.reserve(config_.paged_cache_groups.size());
+          for (const auto& g : config_.paged_cache_groups) {
+              ids.push_back(g.group_id);
+          }
+          return ids;
+      }()}
 #endif
 {
     if (auto* env = std::getenv("SPDLOG_LEVEL")) {

@@ -37,6 +37,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "cache/forward_cache_ops.h"
 #include "fsm/cache_states.h"
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
@@ -74,6 +75,13 @@ void AddUniqueNode(std::vector<TreeNode*>& nodes, TreeNode* node) {
     if (node == nullptr) return;
     if (std::find(nodes.begin(), nodes.end(), node) == nodes.end()) {
         nodes.push_back(node);
+    }
+}
+
+template <typename Op>
+static void MaybeFillFlatBlockTables(Op& op, Request* request, std::span<const std::string> flat_group_ids) {
+    if (!request->FlatBlockTablesEmpty()) {
+        op.flat_block_tables = BuildFlatBlockTables(request->FlatBlockTablesRef(), flat_group_ids);
     }
 }
 
@@ -419,7 +427,8 @@ std::optional<WriteBackOperation> Scheduler::newRetractOperation(Request* retrac
 // Apply event: state transfer + resource allocation
 template <typename Event>
     requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> || std::same_as<Event, fsm::SchedulePrefillEvent>)
-static PrefillOperation applyPrefillEvent(Request* request, Event event) {
+static PrefillOperation applyPrefillEvent(Request* request, Event event,
+                                          std::span<const std::string> flat_group_ids) {
     std::int32_t begin = static_cast<std::int32_t>(request->GetOccupiedPages().size());
     request->Apply(event);
     std::vector<std::int32_t> all_pages = request->GetOccupiedPages();
@@ -447,12 +456,22 @@ static PrefillOperation applyPrefillEvent(Request* request, Event event) {
         }
     }
 
+    MaybeFillFlatBlockTables(op, request, flat_group_ids);
+
     return op;
 }
 
+// TODO(radix-removal): radix hybrid prefix-cache publishing is compile-cut on
+// the flat build (#if !TOKENSPEED_FLAT_KVCACHE below): in the flat binary these
+// op-builders are only reached by flat requests, which carry no radix device
+// node. Reachable by radix requests only in the radix build. Remove these arms
+// with the radix path.
 PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillFirstChunkEvent event) {
+#if !TOKENSPEED_FLAT_KVCACHE
     auto match = event.GetMatchResult();
-    auto op = applyPrefillEvent(request, std::move(event));
+#endif
+    auto op = applyPrefillEvent(request, std::move(event), FlatGroupIds());
+#if !TOKENSPEED_FLAT_KVCACHE
     // Mamba fields only when adjunct is active.
     if (hybrid_prefix_cache_ && hybrid_prefix_cache_->HasMambaAdjunct()) {
         op.mamba_cow_src_idx = match.mamba_cow_src_index;
@@ -466,11 +485,13 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sched
                                                 op.extend_prefix_len + op.input_length, match.paged_cache);
         hybrid_prefix_cache_->PopulateOp(op);
     }
+#endif
     return op;
 }
 
 PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillEvent event) {
-    auto op = applyPrefillEvent(request, std::move(event));
+    auto op = applyPrefillEvent(request, std::move(event), FlatGroupIds());
+#if !TOKENSPEED_FLAT_KVCACHE
     // Order: attach, acquire, populate (see SchedulePrefillFirstChunkEvent).
     if (hybrid_prefix_cache_) {
         hybrid_prefix_cache_->CommitChunk(op.request_id, const_cast<TreeNode*>(request->GetDeviceNode()));
@@ -478,13 +499,15 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sched
                                                 op.extend_prefix_len + op.input_length);
         hybrid_prefix_cache_->PopulateOp(op);
     }
+#endif
     return op;
 }
 
 template <typename Event>
     requires(std::same_as<Event, fsm::ScheduleDecodeEvent> ||
              std::same_as<Event, fsm::ScheduleDecodeFromRetractedEvent>)
-static DecodeOperation applyDecodeEvent(Request* request, Event event, std::int32_t decode_input_tokens) {
+static DecodeOperation applyDecodeEvent(Request* request, Event event, std::int32_t decode_input_tokens,
+                                        std::span<const std::string> flat_group_ids) {
     std::int32_t begin = static_cast<std::int32_t>(request->GetOccupiedPages().size());
     request->Apply(std::move(event));
     std::vector<std::int32_t> all_pages = request->GetOccupiedPages();
@@ -508,19 +531,24 @@ static DecodeOperation applyDecodeEvent(Request* request, Event event, std::int3
         }
     }
 
+    MaybeFillFlatBlockTables(op, request, flat_group_ids);
+
     return op;
 }
 
 DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::ScheduleDecodeEvent event) {
     const bool need_bootstrap_token = request->Is<fsm::PrefillDone>() && config_.role == Role::kD;
     std::int32_t bootstrap_token = need_bootstrap_token ? request->GetLastToken() : -1;
+#if !TOKENSPEED_FLAT_KVCACHE
     const std::int32_t first_pos = request->TokenSize();
     const bool came_from_prefill_done = request->Is<fsm::PrefillDone>();
+#endif
 
-    auto op = applyDecodeEvent(request, std::move(event), config_.decode_input_tokens);
+    auto op = applyDecodeEvent(request, std::move(event), config_.decode_input_tokens, FlatGroupIds());
     if (need_bootstrap_token) {
         op.decode_input_id = bootstrap_token;
     }
+#if !TOKENSPEED_FLAT_KVCACHE
     // Order: attach, acquire, populate.
     if (hybrid_prefix_cache_) {
         if (came_from_prefill_done) {
@@ -529,12 +557,15 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
         hybrid_prefix_cache_->AcquireForRequest(op.request_id, first_pos, first_pos + op.input_length);
         hybrid_prefix_cache_->PopulateOp(op);
     }
+#endif
     return op;
 }
 
 DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::ScheduleDecodeFromRetractedEvent event) {
     const std::int32_t mamba_cow_src_index = event.GetMatchResult().mamba_cow_src_index;
+#if !TOKENSPEED_FLAT_KVCACHE
     auto paged_cache_hit = event.GetMatchResult().paged_cache;
+#endif
     request->Apply(std::move(event));
     if (!request->Is<fsm::Decoding>()) {
         throw std::logic_error(
@@ -563,11 +594,16 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
         }
     }
 
+#if !TOKENSPEED_FLAT_KVCACHE
     if (hybrid_prefix_cache_) {
         hybrid_prefix_cache_->ReleaseRequest(op.request_id);
         hybrid_prefix_cache_->AcquireForRequest(op.request_id, 0, request->TokenSize(), paged_cache_hit);
         hybrid_prefix_cache_->PopulateOp(op);
     }
+#endif
+
+    MaybeFillFlatBlockTables(op, request, FlatGroupIds());
+
     return op;
 }
 

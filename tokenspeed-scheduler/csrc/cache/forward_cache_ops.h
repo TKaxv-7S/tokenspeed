@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <span>
 #include <string>
 #include <vector>
@@ -57,5 +58,13 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
 
 // Finish / abort: return every page in every table to the pool.
 void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables);
+
+// flat per-group block table extraction. One row per group: the BlockId()
+// sequence of table.Blocks(), with null-block holes written as 0, in absolute
+// logical-page order (no compaction). key = group_id string, taken from
+// config_.paged_cache_groups[i].group_id (e.g. "full"/"swa"), so the keys match
+// the downstream / Python assertions rather than a bare index.
+std::map<std::string, std::vector<std::int32_t>> BuildFlatBlockTables(
+    const std::vector<BlockTable>& tables, std::span<const std::string> group_ids);
 
 }  // namespace tokenspeed
