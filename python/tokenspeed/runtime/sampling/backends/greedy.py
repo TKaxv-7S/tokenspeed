@@ -145,6 +145,11 @@ class GreedySamplingBackend(SamplingBackend):
         self._sample_token_buf = torch.empty(
             (config.max_bs,), dtype=torch.int32, device=config.device
         )
+        self._target_predict_buf = torch.empty(
+            (config.max_bs * config.max_draft_tokens_per_req,),
+            dtype=torch.int64,
+            device=config.device,
+        )
         self._predict_buf = torch.zeros(
             (config.max_bs * config.max_draft_tokens_per_req,),
             dtype=torch.int32,
@@ -214,7 +219,10 @@ class GreedySamplingBackend(SamplingBackend):
                 logits=logits,
                 vocab_mask=sampling_info.vocab_mask,
             )
-        target_predict = sampling_argmax(logits).reshape(bs, num_tokens_per_req)
+        target_predict = sampling_argmax(
+            logits,
+            out=self._target_predict_buf[: bs * num_tokens_per_req],
+        ).view(bs, num_tokens_per_req)
 
         _verify_chain_greedy(
             predicts=predict,

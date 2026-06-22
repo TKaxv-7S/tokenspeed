@@ -40,12 +40,6 @@ from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
-# Resolved once at import: the fused top-k + top-p kernel is NVIDIA-only.
-# On non-NVIDIA platforms (e.g. ROCm) we fall back to the back-to-back
-# flashinfer renorm calls. Defining this at module scope keeps the hot path
-# branch-free in the captured graph.
-_FUSED_TOPK_TOPP_AVAILABLE = current_platform().is_nvidia
-
 from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
@@ -64,6 +58,12 @@ from tokenspeed.runtime.sampling.utils import (
 )
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.pdl import pdl_enabled
+
+# Resolved once at import: the fused top-k + top-p kernel is NVIDIA-only.
+# On non-NVIDIA platforms (e.g. ROCm) we fall back to the back-to-back
+# flashinfer renorm calls. Defining this at module scope keeps the hot path
+# branch-free in the captured graph.
+_FUSED_TOPK_TOPP_AVAILABLE = current_platform().is_nvidia
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -242,6 +242,14 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._ones_buf = torch.ones(
             (max_pad_bs,), dtype=torch.int32, device=config.device
         )
+        self._sample_token_buf = torch.empty(
+            (max_pad_bs,), dtype=torch.int32, device=config.device
+        )
+        self._target_predict_buf = torch.empty(
+            (max_pad_bs * max_n,),
+            dtype=torch.int64,
+            device=config.device,
+        )
         # predict + accept_length share one packed backing store.
         # Layout: [0, max_bs * max_n) is predict, [max_bs * max_n, total)
         # is accept_length.
@@ -309,6 +317,7 @@ class FlashInferSamplingBackend(SamplingBackend):
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         logits = logits_output.next_token_logits
+        bs = logits.shape[0]
 
         # Grammar bitmask apply — captured inside the CUDA graph. Buffer is
         # pre-bound by bind_grammar_mask_buf; non-grammar rows stay all-ones.
@@ -319,7 +328,7 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         if sampling_info.is_all_greedy:
 
-            batch_next_token_ids = sampling_argmax(logits)
+            sampled = sampling_argmax(logits, out=self._sample_token_buf[:bs])
 
         else:
 
@@ -347,8 +356,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                 offset=offsets,
                 deterministic=True,
             )
-
-        sampled = batch_next_token_ids.to(torch.int32)
+            sampled = batch_next_token_ids.to(torch.int32)
 
         # TP-rank sync: rank 0 wins.
         self.maybe_broadcast(sampled)
@@ -357,8 +365,6 @@ class FlashInferSamplingBackend(SamplingBackend):
             logits_output.next_token_logprobs = gather_token_logprobs_torch(
                 logits, sampled
             )
-
-        bs = logits.shape[0]
 
         return sampled, self._ones_buf[:bs]
 
@@ -468,7 +474,10 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         if sampling_info.is_all_greedy:
 
-            target_predict = sampling_argmax(logits).reshape(bs, num_tokens_per_req)
+            target_predict = sampling_argmax(
+                logits,
+                out=self._target_predict_buf[: bs * num_tokens_per_req],
+            ).view(bs, num_tokens_per_req)
 
             verify_chain_greedy(
                 predicts=predict,
@@ -590,9 +599,10 @@ class FlashInferSamplingBackend(SamplingBackend):
         """One D2H of the packed predict+accept_length region.
 
         Only applies when both outputs alias into ``_output_pack_buf`` (the
-        verify() path). For ``sample()``, ``output_tokens`` is a fresh
-        argmax/top_k_top_p result and ``output_lengths`` is ``_ones_buf``,
-        neither of which lives in the pack. We fall back to two D2Hs.
+        verify() path). For ``sample()``, ``output_tokens`` comes from either
+        the argmax scratch buffer or the top_k_top_p result, and
+        ``output_lengths`` is ``_ones_buf``; neither output lives in the pack.
+        We fall back to two D2Hs.
         """
         if (
             output_tokens.data_ptr() != self._output_pack_buf.data_ptr()

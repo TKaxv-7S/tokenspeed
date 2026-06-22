@@ -27,6 +27,10 @@ the test doesn't invoke any flashinfer kernels.
 import os
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -82,6 +86,25 @@ def _sp(rid_suffix: str, **overrides) -> SamplingParams:
     return sp
 
 
+def _logits_output(logits):
+    return SimpleNamespace(next_token_logits=logits, next_token_logprobs=None)
+
+
+def _sampling_info(*, is_all_greedy: bool = True):
+    return SimpleNamespace(
+        vocab_mask=None,
+        apply_vocab_mask=None,
+        is_all_greedy=is_all_greedy,
+        req_pool_indices=None,
+        valid_cache_lengths=None,
+    )
+
+
+def _write_argmax_to_out(logits, *, out):
+    out.copy_(torch.argmax(logits, dim=-1).to(out.dtype))
+    return out
+
+
 class TestGreedyNoPoolState(unittest.TestCase):
     """Greedy backend declares ``_HAS_POOL_STATE = False`` so prepare_step
     must short-circuit with no allocation or iteration. Guards against a
@@ -99,6 +122,69 @@ class TestGreedyNoPoolState(unittest.TestCase):
             sampling_params_list=[_sp("a"), _sp("b")],
         )
 
+    def test_sample_writes_argmax_into_persistent_buffer(self):
+        b = GreedySamplingBackend(_make_config())
+        logits = torch.randn(3, VOCAB, device="cuda")
+
+        with patch(
+            "tokenspeed.runtime.sampling.backends.greedy.sampling_argmax",
+            side_effect=_write_argmax_to_out,
+        ) as argmax:
+            tokens, lengths = b.sample(_logits_output(logits), _sampling_info())
+
+        out = argmax.call_args.kwargs["out"]
+        self.assertEqual(out.dtype, torch.int32)
+        self.assertEqual(out.data_ptr(), b._sample_token_buf.data_ptr())
+        self.assertEqual(tokens.data_ptr(), b._sample_token_buf.data_ptr())
+        self.assertEqual(lengths.shape, (3,))
+
+    def test_verify_writes_argmax_into_persistent_buffer(self):
+        b = GreedySamplingBackend(_make_config())
+        bs = 2
+        n = 3
+        logits = torch.randn(bs * n, VOCAB, device="cuda")
+        candidates = torch.zeros((bs, n), dtype=torch.int32, device="cuda")
+
+        def fake_verify(
+            *,
+            predicts,
+            accept_index,
+            accept_token_num,
+            target_predict,
+            batch_size,
+            num_draft_tokens,
+            **_kwargs,
+        ):
+            self.assertEqual(target_predict.dtype, torch.int64)
+            self.assertEqual(target_predict.data_ptr(), b._target_predict_buf.data_ptr())
+            self.assertEqual(batch_size, bs)
+            self.assertEqual(num_draft_tokens, n)
+            predicts.copy_(target_predict.reshape(-1).to(torch.int32))
+            accept_index.fill_(-1)
+            accept_token_num.fill_(num_draft_tokens - 1)
+
+        with (
+            patch(
+                "tokenspeed.runtime.sampling.backends.greedy.sampling_argmax",
+                side_effect=_write_argmax_to_out,
+            ) as argmax,
+            patch(
+                "tokenspeed.runtime.sampling.backends.greedy._verify_chain_greedy",
+                side_effect=fake_verify,
+            ),
+        ):
+            tokens, lengths = b.verify(
+                _logits_output(logits), _sampling_info(), candidates
+            )
+
+        out = argmax.call_args.kwargs["out"]
+        self.assertEqual(out.dtype, torch.int64)
+        self.assertEqual(out.data_ptr(), b._target_predict_buf.data_ptr())
+        self.assertEqual(tokens.shape, (bs * n,))
+        self.assertTrue(
+            torch.equal(lengths, torch.full((bs,), n, dtype=torch.int32, device="cuda"))
+        )
+
 
 class TestFlashInferFlipDetection(unittest.TestCase):
     """flashinfer's pool-indexed scalar buffers are core scheduler state.
@@ -112,6 +198,71 @@ class TestFlashInferFlipDetection(unittest.TestCase):
         self.assertIsNone(self.backend._predict_local_buf)
         self.assertIsNone(self.backend._accept_index_local_buf)
         self.assertIsNone(self.backend._accept_length_local_buf)
+
+    def test_all_greedy_sample_writes_argmax_into_persistent_buffer(self):
+        logits = torch.randn(3, VOCAB, device="cuda")
+
+        with patch(
+            "tokenspeed.runtime.sampling.backends.flashinfer.sampling_argmax",
+            side_effect=_write_argmax_to_out,
+        ) as argmax:
+            tokens, lengths = self.backend.sample(
+                _logits_output(logits), _sampling_info()
+            )
+
+        out = argmax.call_args.kwargs["out"]
+        self.assertEqual(out.dtype, torch.int32)
+        self.assertEqual(out.data_ptr(), self.backend._sample_token_buf.data_ptr())
+        self.assertEqual(tokens.data_ptr(), self.backend._sample_token_buf.data_ptr())
+        self.assertEqual(lengths.shape, (3,))
+
+    def test_all_greedy_verify_writes_argmax_into_persistent_buffer(self):
+        bs = 2
+        n = 3
+        logits = torch.randn(bs * n, VOCAB, device="cuda")
+        candidates = torch.zeros((bs, n), dtype=torch.int32, device="cuda")
+
+        def fake_verify(
+            *,
+            predicts,
+            accept_index,
+            accept_token_num,
+            target_predict,
+            batch_size,
+            num_draft_tokens,
+            **_kwargs,
+        ):
+            self.assertEqual(target_predict.dtype, torch.int64)
+            self.assertEqual(
+                target_predict.data_ptr(), self.backend._target_predict_buf.data_ptr()
+            )
+            self.assertEqual(batch_size, bs)
+            self.assertEqual(num_draft_tokens, n)
+            predicts.copy_(target_predict.reshape(-1).to(torch.int32))
+            accept_index.fill_(-1)
+            accept_token_num.fill_(num_draft_tokens - 1)
+
+        with (
+            patch(
+                "tokenspeed.runtime.sampling.backends.flashinfer.sampling_argmax",
+                side_effect=_write_argmax_to_out,
+            ) as argmax,
+            patch(
+                "tokenspeed.runtime.sampling.backends.flashinfer.verify_chain_greedy",
+                side_effect=fake_verify,
+            ),
+        ):
+            tokens, lengths = self.backend.verify(
+                _logits_output(logits), _sampling_info(), candidates
+            )
+
+        out = argmax.call_args.kwargs["out"]
+        self.assertEqual(out.dtype, torch.int64)
+        self.assertEqual(out.data_ptr(), self.backend._target_predict_buf.data_ptr())
+        self.assertEqual(tokens.shape, (bs * n,))
+        self.assertTrue(
+            torch.equal(lengths, torch.full((bs,), n, dtype=torch.int32, device="cuda"))
+        )
 
     def test_first_admission_flips_and_scatters(self):
         sp_a = _sp("a", temperature=0.7, top_k=50, top_p=0.9, seed=42)
