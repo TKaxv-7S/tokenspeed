@@ -165,6 +165,8 @@ def _dynamic_mxfp4_constraints(n_tokens: int) -> dict[str, int] | None:
         return {"block_m": 16, "block_n": 128, "block_k": 256, "num_warps": 4}
     if n_tokens >= 8:
         return {"block_m": 32, "block_n": 128, "block_k": 256, "num_warps": 4}
+    if n_tokens > 0:
+        return {"block_m": 16, "block_n": 128, "block_k": 256, "num_warps": 4}
     return None
 
 
