@@ -41,8 +41,9 @@ cache, and the TRTLLM MoE backend. GLM5.2 FP8 is available on Hugging Face as
 pass an explicit parser flag to override it. When MTP is enabled, GLM NextN keeps
 the real position-0 prompt embedding in the draft KV path to match the checkpoint
 semantics used by SGLang. For DSA MTP, the first draft step computes NextN's own
-indexer top-k and only reuses draft-produced top-k across later MTP iterations;
-the draft MoE path is also excluded from expert-distribution recording.
+indexer top-k and only reuses the gathered draft-produced top-k rows across
+later MTP iterations; the draft MoE path is also excluded from
+expert-distribution recording.
 
 ```bash
 tokenspeed serve zai-org/GLM-5.2-FP8 \

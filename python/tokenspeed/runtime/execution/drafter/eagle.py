@@ -317,17 +317,17 @@ class Eagle(BaseDrafter):
         )
         dsa_topk = draft_input.dsa_topk
         select_dsa_topk_for_next_step = False
-        if draft_input.num_extends == 0:
-            if should_compute_dsa_topk_for_draft_first_step(
-                self.draft_model_runner.model
-            ):
-                # GLM NextN has its own indexer weights. Match SGLang by
-                # computing the first draft step's top-k in the draft model,
-                # then reusing draft-produced top-k for later MTP iterations.
-                dsa_topk = (None, None)
-                select_dsa_topk_for_next_step = True
-            else:
-                dsa_topk = self._select_dsa_decode_topk(dsa_topk, gather_ids)
+        compute_dsa_topk_first_step = should_compute_dsa_topk_for_draft_first_step(
+            self.draft_model_runner.model
+        )
+        if compute_dsa_topk_first_step:
+            # GLM NextN has its own indexer weights. Match SGLang by computing
+            # first-step top-k in the draft model, then select the rows that
+            # feed later MTP iterations.
+            dsa_topk = (None, None)
+            select_dsa_topk_for_next_step = True
+        elif draft_input.num_extends == 0:
+            dsa_topk = self._select_dsa_decode_topk(dsa_topk, gather_ids)
         else:
             dsa_topk = (None, None)
         self._attach_dsa_topk(ctx, dsa_topk)

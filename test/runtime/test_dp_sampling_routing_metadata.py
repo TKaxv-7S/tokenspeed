@@ -634,6 +634,75 @@ def test_eagle_glm_first_step_computes_draft_dsa_decode_topk_before_reuse():
     assert logits_output.next_token_logits.shape == (2, 8)
 
 
+def test_eagle_glm_mixed_first_step_selects_draft_dsa_decode_topk_rows():
+    eagle = Eagle.__new__(Eagle)
+    eagle.spec_num_tokens = 6
+    eagle.input_buffers = SimpleNamespace(
+        shifted_prefill_ids_buf=torch.arange(16, dtype=torch.int32),
+        input_lengths_buf=torch.tensor([4, 1, 4], dtype=torch.int64),
+        positions_buf=torch.arange(16, dtype=torch.int64),
+        out_cache_loc_buf=torch.arange(100, 116, dtype=torch.int32),
+    )
+    eagle.mm_pad_substitute_id = None
+    eagle.padded_gather_ids_offsets_buf = torch.arange(2, dtype=torch.int64) * 6 - 1
+    eagle.attn_backend = SimpleNamespace()
+    eagle.token_to_kv_pool = None
+    eagle.req_to_page = None
+    eagle._dsa_reuse_mtp_topk = True
+    eagle.draft_seq_lens_buf = torch.zeros((3,), dtype=torch.int32)
+    draft_model = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
+    seen = {}
+    draft_decode_topk = GlmDsaDecodeTopK(
+        topk_indices=(1000 + torch.arange(16 * 3, dtype=torch.int32)).view(16, 3),
+        topk_lens=100 + torch.arange(16, dtype=torch.int32),
+    )
+
+    class Runner:
+        model = draft_model
+
+        def forward(self, **kwargs):
+            seen.update(kwargs)
+            seen["initial_ctx_dsa_decode_topk"] = kwargs["ctx"].dsa_decode_topk
+            kwargs["ctx"].dsa_decode_topk = draft_decode_topk
+            return SimpleNamespace(
+                hidden_states=torch.empty((3, 4)),
+                next_token_logits=torch.empty((3, 8)),
+            )
+
+    eagle.draft_model_runner = Runner()
+    full_decode_topk = GlmDsaDecodeTopK(
+        topk_indices=torch.arange(16 * 3, dtype=torch.int32).view(16, 3),
+        topk_lens=torch.arange(16, dtype=torch.int32),
+    )
+    draft_input = SimpleNamespace(
+        input_num_tokens=16,
+        num_extends=1,
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        base_model_output=torch.arange(13, dtype=torch.int32),
+        accept_lengths=torch.tensor([0, 1, 4], dtype=torch.int64),
+        base_out_hidden_states=torch.empty((16, 4)),
+        global_num_tokens=[16],
+        global_bs=[3],
+        all_decode_or_idle=False,
+        dsa_topk=(None, full_decode_topk),
+    )
+
+    logits_output, dsa_topk = eagle._run_first_step(3, draft_input)
+
+    assert seen["initial_ctx_dsa_decode_topk"] is None
+    assert seen["ctx"].gather_ids.tolist() == [3, 4, 13]
+    selected = dsa_topk[1]
+    assert selected is not draft_decode_topk
+    assert selected is not full_decode_topk
+    assert selected.topk_lens.tolist() == [103, 104, 113]
+    assert selected.topk_indices.tolist() == [
+        draft_decode_topk.topk_indices[3].tolist(),
+        draft_decode_topk.topk_indices[4].tolist(),
+        draft_decode_topk.topk_indices[13].tolist(),
+    ]
+    assert logits_output.next_token_logits.shape == (3, 8)
+
+
 def test_eagle_multi_step_starts_from_accepted_prefix(monkeypatch):
     captured = {}
 
