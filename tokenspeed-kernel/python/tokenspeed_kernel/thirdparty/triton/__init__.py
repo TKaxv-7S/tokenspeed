@@ -26,6 +26,7 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 
 __all__ = [
+    "deepseek_v4_softplus_topk",
     "minimax_biased_grouped_topk",
     "stage_deepseek_v4_mega_moe_inputs",
 ]
@@ -192,6 +193,157 @@ def stage_deepseek_v4_mega_moe_inputs(
         BLOCK_TOPK=block_topk,
         num_warps=4,
     )
+
+
+@triton.jit
+def _deepseek_v4_softplus_topk_kernel(
+    gating_output_ptr,
+    correction_bias_ptr,
+    topk_weights_ptr,
+    topk_ids_ptr,
+    stride_gm,
+    stride_ge,
+    stride_wm,
+    stride_wk,
+    stride_im,
+    stride_ik,
+    num_experts: tl.constexpr,
+    renormalize: tl.constexpr,
+    has_correction_bias: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    TOPK: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    offs_e = tl.arange(0, BLOCK_E)
+    expert_mask = offs_e < num_experts
+
+    logits = tl.load(
+        gating_output_ptr + token_id * stride_gm + offs_e * stride_ge,
+        mask=expert_mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+    softplus = tl.log(1.0 + tl.exp(-tl.abs(logits))) + tl.maximum(logits, 0.0)
+    scores = tl.sqrt(softplus)
+    choice_scores = scores
+    if has_correction_bias:
+        bias = tl.load(
+            correction_bias_ptr + offs_e,
+            mask=expert_mask,
+            other=0.0,
+        ).to(tl.float32)
+        choice_scores = choice_scores + bias
+    choice_scores = tl.where(expert_mask, choice_scores, -float("inf"))
+
+    weights_sum = 0.0
+    for k in tl.static_range(0, TOPK):
+        best_choice_score = tl.max(choice_scores, axis=0)
+        best_expert = tl.min(
+            tl.where(choice_scores == best_choice_score, offs_e, BLOCK_E), axis=0
+        )
+        best_weight = tl.max(tl.where(offs_e == best_expert, scores, 0.0), axis=0)
+        weights_sum += best_weight
+
+        tl.store(
+            topk_ids_ptr + token_id * stride_im + k * stride_ik,
+            best_expert.to(tl.int32),
+        )
+        tl.store(
+            topk_weights_ptr + token_id * stride_wm + k * stride_wk,
+            best_weight,
+        )
+        choice_scores = tl.where(offs_e == best_expert, -float("inf"), choice_scores)
+
+    if renormalize:
+        denom = tl.where(weights_sum != 0.0, weights_sum, 1.0)
+        for k in tl.static_range(0, TOPK):
+            weight = tl.load(topk_weights_ptr + token_id * stride_wm + k * stride_wk)
+            tl.store(
+                topk_weights_ptr + token_id * stride_wm + k * stride_wk,
+                weight / denom,
+            )
+
+
+def _deepseek_v4_softplus_topk_reference(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor | None,
+    topk: int,
+    renormalize: bool,
+):
+    scores = torch.nn.functional.softplus(gating_output.float()).sqrt()
+    choice_scores = scores
+    if correction_bias is not None:
+        choice_scores = choice_scores + correction_bias.to(
+            device=scores.device,
+            dtype=scores.dtype,
+        ).unsqueeze(0)
+    topk_ids = torch.topk(choice_scores, k=topk, dim=-1, sorted=True)[1]
+    topk_weights = scores.gather(1, topk_ids)
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
+            torch.finfo(topk_weights.dtype).tiny
+        )
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+def deepseek_v4_softplus_topk(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor | None,
+    topk: int,
+    renormalize: bool,
+):
+    if (
+        gating_output.ndim != 2
+        or topk <= 0
+        or topk > 32
+        or gating_output.shape[1] > 1024
+        or (correction_bias is not None and correction_bias.ndim != 1)
+        or (
+            correction_bias is not None
+            and correction_bias.shape[0] != gating_output.shape[1]
+        )
+        or not gating_output.is_cuda
+    ):
+        return _deepseek_v4_softplus_topk_reference(
+            gating_output,
+            correction_bias,
+            topk=topk,
+            renormalize=renormalize,
+        )
+
+    num_tokens, num_experts = gating_output.shape
+    topk_weights = torch.empty(
+        (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+    )
+    topk_ids = torch.empty(
+        (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+    )
+    if num_tokens == 0:
+        return topk_weights, topk_ids
+
+    correction_bias_arg = (
+        correction_bias
+        if correction_bias is not None
+        else gating_output.reshape(-1)[:num_experts]
+    )
+    _deepseek_v4_softplus_topk_kernel[(num_tokens,)](
+        gating_output,
+        correction_bias_arg,
+        topk_weights,
+        topk_ids,
+        gating_output.stride(0),
+        gating_output.stride(1),
+        topk_weights.stride(0),
+        topk_weights.stride(1),
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        num_experts=num_experts,
+        renormalize=renormalize,
+        has_correction_bias=correction_bias is not None,
+        BLOCK_E=triton.next_power_of_2(num_experts),
+        TOPK=topk,
+        num_warps=1,
+    )
+    return topk_weights, topk_ids
 
 
 @triton.jit

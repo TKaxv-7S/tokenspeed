@@ -743,6 +743,48 @@ def test_moe_plan_selects_feature_gated_backend_routing_kernel() -> None:
     assert out["topk_ids"] is None
 
 
+def test_mxfp4_deepseek_v4_backend_routing_selects_triton_on_amd() -> None:
+    if not Platform.get().is_amd:
+        pytest.skip("DeepSeek V4 MXFP4 backend routing is AMD-only")
+
+    routing_config = {
+        "kernel_feature": "backend_routing:deepseek_v4",
+        "routing_method_type": 1,
+        "top_k": 8,
+        "renormalize": True,
+        "score_function": "sqrtsoftplus",
+        "choice_score_function": "sqrtsoftplus",
+        "group_score_function": "none",
+    }
+    tp_plan = tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        ep_size=1,
+        ispp=128,
+        internal_activation_dtype="input",
+        with_bias=True,
+        routing_config=routing_config,
+    )
+    ep_plan = tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        ep_size=4,
+        ispp=128,
+        internal_activation_dtype="input",
+        with_bias=True,
+        routing_config=routing_config,
+    )
+
+    assert tp_plan["apply_kernel_name"] == "triton_mxfp4_deepseek_v4_moe_apply"
+    assert ep_plan["apply_kernel_name"] == "triton_mxfp4_deepseek_v4_ep_moe_apply"
+    assert tp_plan["support_routing"] is True
+    assert ep_plan["support_routing"] is True
+    assert tp_plan["backend_routing_config"] is routing_config
+    assert ep_plan["backend_routing_config"] is routing_config
+
+
 def test_mxfp4_ep_topk_localization_masks_remote_experts() -> None:
     w = torch.nn.Module()
     w.num_experts = 8

@@ -66,6 +66,7 @@ from triton_kernels.topk import topk
 
 # isort: off
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
+from tokenspeed_kernel.thirdparty.triton import deepseek_v4_softplus_topk
 
 platform = current_platform()
 
@@ -275,6 +276,44 @@ def _local_topk_for_ep(
     return local_weights, local_ids, num_local_experts
 
 
+def _deepseek_v4_topk_from_logits(
+    router_logits: torch.Tensor,
+    routing_config: dict,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    score_function = routing_config.get("score_function")
+    choice_score_function = routing_config.get("choice_score_function")
+    if score_function != "sqrtsoftplus":
+        raise ValueError(f"unsupported DeepSeek V4 score function: {score_function!r}")
+    if choice_score_function not in {
+        "sqrtsoftplus",
+        "sqrtsoftplus_plus_correction_bias",
+    }:
+        raise ValueError(
+            "unsupported DeepSeek V4 choice score function: "
+            f"{choice_score_function!r}"
+        )
+    if routing_config.get("group_score_function", "none") != "none":
+        raise ValueError("DeepSeek V4 MXFP4 routing does not support grouped choice")
+    if routing_config.get("supports_hash_indices", False):
+        raise ValueError("DeepSeek V4 hash routing is not supported by this kernel")
+
+    top_k = int(routing_config["top_k"])
+    renormalize = bool(routing_config["renormalize"])
+    correction_bias = routing_config.get("correction_bias")
+    if choice_score_function == "sqrtsoftplus_plus_correction_bias":
+        if correction_bias is None:
+            raise ValueError("DeepSeek V4 correction-bias routing requires bias")
+    else:
+        correction_bias = None
+
+    return deepseek_v4_softplus_topk(
+        router_logits,
+        correction_bias=correction_bias,
+        topk=top_k,
+        renormalize=renormalize,
+    )
+
+
 @register_kernel(
     "moe",
     "process_weights",
@@ -414,6 +453,56 @@ def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
 @register_kernel(
     "moe",
     "apply",
+    name="triton_mxfp4_deepseek_v4_moe_apply",
+    features={"backend_routing:deepseek_v4"},
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+    signatures=format_signatures(
+        "x",
+        "dense",
+        {torch.float16, torch.bfloat16},
+    ),
+    traits={
+        "weight_dtype": frozenset({"mxfp4"}),
+        "activation": frozenset({"swiglu"}),
+        "routing_mode": frozenset({"kernel_routing"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({False}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({1}),
+        "internal_activation_dtype": frozenset({"input", "fp8"}),
+        "supports_bias": frozenset({True}),
+    },
+    priority=Priority.REFERENCE + 1,
+)
+@register_kernel(
+    "moe",
+    "apply",
+    name="triton_mxfp4_deepseek_v4_ep_moe_apply",
+    features={"backend_routing:deepseek_v4"},
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+    signatures=format_signatures(
+        "x",
+        "dense",
+        {torch.float16, torch.bfloat16},
+    ),
+    traits={
+        "weight_dtype": frozenset({"mxfp4"}),
+        "activation": frozenset({"swiglu"}),
+        "routing_mode": frozenset({"kernel_routing"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({1}),
+        "internal_activation_dtype": frozenset({"input", "fp8"}),
+        "supports_bias": frozenset({True}),
+    },
+    priority=Priority.REFERENCE,
+)
+@register_kernel(
+    "moe",
+    "apply",
     name="triton_mxfp4_moe_apply",
     solution="triton",
     signatures=format_signatures(
@@ -445,14 +534,33 @@ def triton_mxfp4_moe_apply(
     max_num_tokens_per_gpu: int | None = None,
     do_finalize: bool = True,
     enable_pdl: bool = False,
+    routing_config: dict | None = None,
+    num_token_non_padded: torch.Tensor | None = None,
+    expert_location_dispatch_info: object | None = None,
 ):
-    del enable_pdl
+    del enable_pdl, num_token_non_padded, expert_location_dispatch_info
     swiglu_arg = getattr(w, "swiglu_arg", None)
 
     top_k = getattr(w, "top_k")
     n_tokens = router_logits.shape[0]
 
-    if topk_weights is not None or topk_ids is not None:
+    if routing_config is not None:
+        topk_weights, topk_ids = _deepseek_v4_topk_from_logits(
+            router_logits,
+            routing_config,
+        )
+        topk_weights, topk_ids, num_experts = _local_topk_for_ep(
+            topk_weights,
+            topk_ids,
+            w,
+        )
+        ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing_from_topk(
+            topk_weights,
+            topk_ids,
+            num_experts=num_experts,
+            dtype=router_logits.dtype,
+        )
+    elif topk_weights is not None or topk_ids is not None:
         if topk_weights is None or topk_ids is None:
             raise ValueError("topk_weights and topk_ids must be provided together")
         topk_weights, topk_ids, num_experts = _local_topk_for_ep(
