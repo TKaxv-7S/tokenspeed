@@ -157,6 +157,46 @@ _MXFP4_QUANT_EPILOGUE = Epilogue(
 )
 
 
+@triton.jit(repr=lambda _: "_swiglu_beta_interleaved")
+def _swiglu_beta_interleaved_fn(input, alpha, limit: tl.constexpr, beta: tl.constexpr):
+    gate, up = tl.split(tl.reshape(input, (input.shape[0], input.shape[1] // 2, 2)))
+    gate = gate.to(tl.float32)
+    up = up.to(tl.float32)
+    if limit is not None:
+        gate = tl.minimum(gate, limit)
+        up = tl.clamp(up, -limit, limit)
+    silu = gate / (1.0 + tl.exp(-alpha * gate))
+    return silu * (up + beta)
+
+
+def _swiglu_activation_for_weights(
+    w: torch.nn.Module,
+    swiglu_arg,
+) -> FusedActivation:
+    alpha = 1.0 if swiglu_arg.alpha is None else swiglu_arg.alpha
+    limit = swiglu_arg.limit
+    beta = getattr(w, "swiglu_beta", None)
+    w13_input_layout = getattr(w, "w13_input_layout", "concatenated")
+    if w13_input_layout != "interleaved":
+        raise ValueError(
+            "fused swiglu activation requires interleaved w13 input layout"
+        )
+    if beta == 1.0 and w13_input_layout == "interleaved":
+        return FusedActivation(
+            FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
+            (alpha, limit),
+        )
+    return FusedActivation(
+        FnSpecs(
+            "swiglu_beta",
+            _swiglu_beta_interleaved_fn,
+            ("alpha", "limit", "beta"),
+            reduction_n=2,
+        ),
+        (alpha, limit, 0.0 if beta is None else beta),
+    )
+
+
 @triton.jit
 def _topk_sum_reduce_kernel(
     x_ptr,
@@ -260,6 +300,35 @@ def _with_output_mx_scale(
     precision_config.c_value_pack_factor = 2
     precision_config.out_dtype = torch.uint8
     return precision_config
+
+
+def _interleave_gate_up(tensor: torch.Tensor, dim: int) -> torch.Tensor:
+    dim = tensor.dim() + dim if dim < 0 else dim
+    gate, up = tensor.chunk(2, dim=dim)
+    shape = list(tensor.shape)
+    return torch.stack((gate, up), dim=dim + 1).reshape(shape).contiguous()
+
+
+def _maybe_interleave_w13_for_swiglu(w: torch.nn.Module) -> None:
+    if getattr(w, "swiglu_arg", None) is None:
+        return
+    if getattr(w, "w13_input_layout", "concatenated") != "concatenated":
+        return
+
+    w.w13_weight = torch.nn.Parameter(
+        _interleave_gate_up(w.w13_weight.data, dim=-2),
+        requires_grad=False,
+    )
+    w.w13_weight_scale = torch.nn.Parameter(
+        _interleave_gate_up(w.w13_weight_scale.data, dim=-2),
+        requires_grad=False,
+    )
+    if hasattr(w, "w13_weight_bias"):
+        w.w13_weight_bias = torch.nn.Parameter(
+            _interleave_gate_up(w.w13_weight_bias.data, dim=-1),
+            requires_grad=False,
+        )
+    w.w13_input_layout = "interleaved"
 
 
 def _release_parameter(module: torch.nn.Module, name: str) -> None:
@@ -669,6 +738,7 @@ def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
         w.w2_weight_bias = torch.nn.Parameter(
             w.w2_weight_bias.to(torch.float32), requires_grad=False
         )
+    _maybe_interleave_w13_for_swiglu(w)
 
     num_warps = 8
     w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
@@ -934,10 +1004,7 @@ def triton_mxfp4_moe_apply(
 
     act = None
     if swiglu_arg is not None:
-        act = FusedActivation(
-            FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
-            (swiglu_arg.alpha, swiglu_arg.limit),
-        )
+        act = _swiglu_activation_for_weights(w, swiglu_arg)
 
     use_dynamic_mxfp4 = _uses_dynamic_mxfp4_activations(w)
     use_dynamic_mxfp4_tile_policy = use_dynamic_mxfp4 and int(
