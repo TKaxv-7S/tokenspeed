@@ -55,6 +55,9 @@ from tokenspeed.runtime.models.glm5 import (
     GlmMoeDsaForCausalLM,
     pad_fused_qkv_a_proj_weight_for_fp8_blockscale,
 )
+from tokenspeed.runtime.moe.distribution_recorder import (
+    get_global_expert_distribution_recorder,
+)
 
 _NEXTN_SPEC_WEIGHT_NAMES = (
     "shared_head.norm",
@@ -180,13 +183,14 @@ class GlmMoeDsaModelNextN(nn.Module):
                 CP_METADATA.value.split_list,
                 CP_METADATA.value.zigzag_index,
             )
-        hidden_states, residual = self.decoder(
-            positions,
-            hidden_states,
-            ctx,
-            out_cache_loc,
-            residual,
-        )
+        with get_global_expert_distribution_recorder().disable_this_region():
+            hidden_states, residual = self.decoder(
+                positions,
+                hidden_states,
+                ctx,
+                out_cache_loc,
+                residual,
+            )
 
         if not ctx.forward_mode.is_idle():
             if not ENABLE_CP:

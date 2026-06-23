@@ -27,6 +27,7 @@ from tokenspeed.runtime.models.glm5_nextn import (
     GlmMoeDsaForCausalLMNextN,
     GlmMoeDsaModelNextN,
 )
+from tokenspeed.runtime.moe import distribution_recorder as recorder_module
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeConfig,
     DpSamplingRuntimeLimits,
@@ -332,6 +333,39 @@ def test_glm_nextn_preserves_real_position_zero_embedding():
     assert eh_proj.seen is not None
     assert torch.equal(eh_proj.seen[:, : embeddings.shape[1]], embeddings)
     assert torch.equal(eh_proj.seen[:, embeddings.shape[1] :], captured_hidden_states)
+
+
+def test_expert_distribution_recorder_disable_region_suppresses_hooks():
+    calls = []
+
+    class Gatherer:
+        def on_select_experts(self, **kwargs):
+            calls.append(kwargs)
+
+    class Accumulator:
+        def get_single_pass_gatherer_key(self, debug_name):
+            return "default"
+
+    recorder = recorder_module._ExpertDistributionRecorderReal.__new__(
+        recorder_module._ExpertDistributionRecorderReal
+    )
+    recorder._recording = True
+    recorder._disable_all = False
+    recorder._single_pass_gatherers = {"default": Gatherer()}
+    recorder._accumulator = Accumulator()
+    recorder._current_debug_name = SimpleNamespace(value=None)
+    recorder._current_layer_idx = SimpleNamespace(value=7)
+
+    with recorder.disable_this_region():
+        recorder.on_select_experts(torch.tensor([1], dtype=torch.int64))
+
+    assert calls == []
+
+    recorder.on_select_experts(torch.tensor([2], dtype=torch.int64))
+
+    assert len(calls) == 1
+    assert calls[0]["layer_idx"] == 7
+    assert calls[0]["topk_ids"].tolist() == [2]
 
 
 def test_glm_nextn_first_step_correction_refreshes_dsa_metadata():
