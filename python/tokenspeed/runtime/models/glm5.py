@@ -700,9 +700,10 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         ``seq_lens - q_len_per_req + j + 1`` positions. With
         ``q_len_per_req == 1`` this is ``seq_lens`` itself (plain decode).
 
-        The draft model's first catch-up step is the opposite: it writes its KV
-        one token at a time after target verify, so visible lengths advance from
-        ``seq_lens`` through ``seq_lens + q_len_per_req - 1``.
+        Later draft catch-up is the opposite: it writes KV one token at a time
+        after target verify, so visible lengths advance from ``seq_lens`` through
+        ``seq_lens + q_len_per_req - 1``. GLM's draft first-step full-window KV
+        fill still uses the target-verify convention above.
         """
         if q_len_per_req == 1:
             return seq_lens
@@ -874,6 +875,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             getattr(ctx.attn_backend, "is_draft", False)
             and ctx.forward_mode is not None
             and ctx.forward_mode.is_draft_extend()
+            and not ctx.draft_first_step_reduce
         )
         seq_lens_per_token = self._expand_decode_seq_lens_per_token(
             seq_lens,
@@ -985,6 +987,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             getattr(ctx.attn_backend, "is_draft", False)
             and ctx.forward_mode is not None
             and ctx.forward_mode.is_draft_extend()
+            and not ctx.draft_first_step_reduce
         )
         seq_lens_per_token = self._expand_decode_seq_lens_per_token(
             seq_lens,
@@ -1797,7 +1800,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
         )

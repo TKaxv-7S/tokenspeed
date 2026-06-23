@@ -51,6 +51,7 @@ _DRAFT_FIRST_STEP_REDUCE_MODELS = (
     LlamaForCausalLMEagle3,
     Qwen3_5ForConditionalGenerationNextN,
 )
+_DRAFT_FIRST_STEP_FULL_TOPK_MODELS = (GlmMoeDsaForCausalLMNextN,)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
@@ -72,6 +73,10 @@ def should_reduce_draft_first_step(model: Any, forward_mode: ForwardMode) -> boo
         isinstance(model, _DRAFT_FIRST_STEP_REDUCE_MODELS)
         and not forward_mode.is_idle()
     )
+
+
+def should_keep_full_dsa_topk_for_draft_first_step(model: Any) -> bool:
+    return isinstance(model, _DRAFT_FIRST_STEP_FULL_TOPK_MODELS)
 
 
 @dataclass
@@ -311,8 +316,14 @@ class Eagle(BaseDrafter):
             accept_lengths=draft_input.accept_lengths,
         )
         dsa_topk = draft_input.dsa_topk
+        select_dsa_topk_for_next_step = False
         if draft_input.num_extends == 0:
-            dsa_topk = self._select_dsa_decode_topk(dsa_topk, gather_ids)
+            if not should_keep_full_dsa_topk_for_draft_first_step(
+                self.draft_model_runner.model
+            ):
+                dsa_topk = self._select_dsa_decode_topk(dsa_topk, gather_ids)
+            else:
+                select_dsa_topk_for_next_step = True
         else:
             dsa_topk = (None, None)
         self._attach_dsa_topk(ctx, dsa_topk)
@@ -326,6 +337,8 @@ class Eagle(BaseDrafter):
             spec_step_idx=0,
         )
         dsa_topk = self._extract_dsa_topk(ctx, dsa_topk)
+        if select_dsa_topk_for_next_step:
+            dsa_topk = self._select_dsa_decode_topk(dsa_topk, gather_ids)
         return logits_output, dsa_topk
 
     @nvtx_range("draft_multi_step", color="purple")

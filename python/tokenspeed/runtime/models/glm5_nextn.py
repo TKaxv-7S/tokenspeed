@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import replace
 
 import torch
 from torch import nn
@@ -94,9 +93,14 @@ class GlmMoeDsaDraftDecoderLayer(GlmMoeDsaDecoderLayer):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Keep the full verified window visible while GLM DSA fills draft KV.
+        # The accepted-prefix seq lens is installed only for later draft steps.
+        layer_output = super().forward(
+            positions, hidden_states, ctx, out_cache_loc, residual
+        )
         self._apply_correction(ctx)
-        return super().forward(positions, hidden_states, ctx, out_cache_loc, residual)
+        return layer_output
 
 
 class GlmMoeDsaModelNextN(nn.Module):
@@ -245,45 +249,6 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
             tp_group=self.mapping.attn.tp_group,
         )
 
-    def _narrow_decode_first_step(
-        self,
-        ctx: ForwardContext,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
-        captured_hidden_states: torch.Tensor | None,
-    ) -> tuple[
-        ForwardContext,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | None,
-    ]:
-        if (
-            ctx.accept_lengths is None
-            or not ctx.draft_first_step_reduce
-            or ctx.gather_ids is None
-            or ctx.num_extends != 0
-        ):
-            return ctx, input_ids, positions, out_cache_loc, captured_hidden_states
-
-        self.model.decoder._apply_correction(ctx)
-        gather_ids = ctx.gather_ids
-        narrowed_ctx = replace(
-            ctx,
-            input_num_tokens=ctx.bs,
-            global_num_tokens=ctx.global_bs,
-            draft_first_step_reduce=False,
-            gather_ids=None,
-            accept_lengths=None,
-        )
-        input_ids = input_ids.index_select(0, gather_ids)
-        positions = positions.index_select(0, gather_ids)
-        out_cache_loc = out_cache_loc.index_select(0, gather_ids)
-        if captured_hidden_states is not None:
-            captured_hidden_states = captured_hidden_states.index_select(0, gather_ids)
-        return narrowed_ctx, input_ids, positions, out_cache_loc, captured_hidden_states
-
     @torch.no_grad()
     def forward(
         self,
@@ -293,22 +258,14 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         out_cache_loc: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        model_ctx, input_ids, positions, out_cache_loc, captured_hidden_states = (
-            self._narrow_decode_first_step(
-                ctx, input_ids, positions, out_cache_loc, captured_hidden_states
-            )
-        )
         hidden_states, _ = self.model(
             input_ids,
             positions,
-            model_ctx,
+            ctx,
             out_cache_loc,
             captured_hidden_states=captured_hidden_states,
         )
-        if model_ctx is not ctx:
-            ctx.dsa_prefill_topk = model_ctx.dsa_prefill_topk
-            ctx.dsa_decode_topk = model_ctx.dsa_decode_topk
-        logits_metadata = LogitsMetadata.from_forward_context(model_ctx)
+        logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, logits_metadata
         )

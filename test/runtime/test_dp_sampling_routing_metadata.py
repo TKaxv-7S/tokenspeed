@@ -7,9 +7,24 @@ import torch
 
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
+from tokenspeed.runtime.execution.drafter import eagle as eagle_module
+from tokenspeed.runtime.execution.drafter.eagle import (
+    Eagle,
+    should_keep_full_dsa_topk_for_draft_first_step,
+    should_reduce_draft_first_step,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.models.extensible import ExtensibleLM
+from tokenspeed.runtime.models.glm5 import (
+    GlmDsaDecodeTopK,
+    GlmMoeDsaAttention,
+    GlmMoeDsaDecoderLayer,
+)
+from tokenspeed.runtime.models.glm5_nextn import (
+    GlmMoeDsaDraftDecoderLayer,
+    GlmMoeDsaForCausalLMNextN,
+)
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeConfig,
     DpSamplingRuntimeLimits,
@@ -143,12 +158,14 @@ def test_cuda_graph_wrapper_uses_existing_route_for_padding():
     assert wrapper.padded_bs(30, ctx) == 32
 
 
-def test_cuda_graph_req_pool_padding_keeps_attention_default_row():
+def test_cuda_graph_req_pool_padding_uses_reserved_sink_row():
+    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    wrapper.config = SimpleNamespace(max_req_pool_size=99)
     active_indices = torch.tensor([7, 8], dtype=torch.int64)
 
-    padded_indices = CudaGraphWrapper._pad_graph_req_pool_indices(active_indices, 4)
+    padded_indices = wrapper._pad_graph_req_pool_indices(active_indices, 4)
 
-    assert padded_indices.tolist() == [7, 8, 0, 0]
+    assert padded_indices.tolist() == [7, 8, 99, 99]
 
 
 def test_cuda_graph_state_write_padding_uses_reserved_sink_row():
@@ -167,6 +184,450 @@ def test_cuda_graph_state_write_padding_uses_reserved_sink_row():
         99,
         99,
     ]
+
+
+def test_cuda_graph_replay_syncs_draft_seq_lens_before_draft_metadata():
+    class Backend:
+        uses_paged_cache_groups = False
+        uses_padded_decode_token_mask = False
+
+        def __init__(self):
+            self.calls = []
+
+        def init_forward_metadata_replay_cuda_graph(
+            self,
+            bs,
+            req_pool_indices,
+            seq_lens,
+            *,
+            req_to_page,
+            forward_mode,
+            **kwargs,
+        ):
+            self.calls.append(
+                SimpleNamespace(
+                    bs=bs,
+                    seq_lens=seq_lens.clone(),
+                    seq_lens_ptr=seq_lens.data_ptr(),
+                    req_to_page=req_to_page,
+                    forward_mode=forward_mode,
+                )
+            )
+
+    target_backend = Backend()
+    draft_backend = Backend()
+    draft_seq_lens_buf = torch.full((4,), -1, dtype=torch.int32)
+    draft_req_to_page = torch.zeros((4, 1), dtype=torch.int32)
+    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    wrapper.attn_backend = target_backend
+    wrapper.draft_attn_backend = draft_backend
+    wrapper.drafter = SimpleNamespace(
+        draft_seq_lens_buf=draft_seq_lens_buf,
+        req_to_page=draft_req_to_page,
+    )
+    wrapper.max_tokens_per_req = 6
+    wrapper.use_target_verify_forward_mode = True
+
+    seq_lens = torch.tensor([10, 11, 12, 13], dtype=torch.int32)
+    wrapper._init_replay_metadata(
+        padded_bs=4,
+        actual_bs=4,
+        req_pool_indices=torch.arange(4, dtype=torch.int64),
+        seq_lens=seq_lens,
+        req_to_page=torch.zeros((4, 1), dtype=torch.int32),
+        forward_mode=ForwardMode.TARGET_VERIFY,
+    )
+
+    assert draft_seq_lens_buf.tolist() == [10, 11, 12, 13]
+    assert target_backend.calls[0].seq_lens_ptr == seq_lens.data_ptr()
+    assert draft_backend.calls[0].seq_lens_ptr == draft_seq_lens_buf.data_ptr()
+    assert draft_backend.calls[0].seq_lens.tolist() == [10, 11, 12, 13]
+    assert draft_backend.calls[0].req_to_page is draft_req_to_page
+    assert draft_backend.calls[0].forward_mode is ForwardMode.DRAFT_EXTEND
+
+
+def test_glm_nextn_draft_first_step_uses_reduced_collectives():
+    model = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
+
+    assert should_reduce_draft_first_step(model, ForwardMode.TARGET_VERIFY)
+    assert should_keep_full_dsa_topk_for_draft_first_step(model)
+    assert not should_reduce_draft_first_step(model, ForwardMode.IDLE)
+    assert should_reduce_draft_first_step(object(), ForwardMode.DECODE)
+    assert not should_keep_full_dsa_topk_for_draft_first_step(object())
+    assert not should_reduce_draft_first_step(object(), ForwardMode.TARGET_VERIFY)
+
+
+def test_glm_nextn_first_step_correction_refreshes_dsa_metadata():
+    layer = GlmMoeDsaDraftDecoderLayer.__new__(GlmMoeDsaDraftDecoderLayer)
+    seq_lens = torch.tensor([100, 100, 100], dtype=torch.int32)
+    accept_lengths = torch.tensor([4, 2, 1], dtype=torch.int32)
+    refreshed_seq_lens = []
+
+    class Backend:
+        spec_num_tokens = 4
+
+        def advance_draft_forward_metadata(self, lens):
+            refreshed_seq_lens.append(lens.clone())
+
+    ctx = ForwardContext(
+        attn_backend=Backend(),
+        token_to_kv_pool=None,
+        bs=3,
+        num_extends=1,
+        input_num_tokens=9,
+        forward_mode=ForwardMode.DRAFT_EXTEND,
+        draft_seq_lens_buf=seq_lens,
+        accept_lengths=accept_lengths,
+    )
+
+    layer._apply_correction(ctx)
+
+    assert seq_lens.tolist() == [100, 98, 97]
+    assert len(refreshed_seq_lens) == 1
+    assert refreshed_seq_lens[0].tolist() == [100, 98, 97]
+
+
+def test_glm_nextn_draft_layer_corrects_after_full_forward(monkeypatch):
+    layer = GlmMoeDsaDraftDecoderLayer.__new__(GlmMoeDsaDraftDecoderLayer)
+    seq_lens = torch.tensor([100, 100], dtype=torch.int32)
+    accept_lengths = torch.tensor([4, 2], dtype=torch.int32)
+    events = []
+
+    class Backend:
+        spec_num_tokens = 6
+
+        def advance_draft_forward_metadata(self, lens):
+            events.append(("advance", lens.clone()))
+
+    def fake_full_forward(
+        self,
+        positions,
+        hidden_states,
+        ctx,
+        out_cache_loc,
+        residual,
+    ):
+        events.append(("full_forward", ctx.draft_seq_lens_buf.clone()))
+        return hidden_states[: ctx.bs], residual
+
+    monkeypatch.setattr(GlmMoeDsaDecoderLayer, "forward", fake_full_forward)
+    ctx = ForwardContext(
+        attn_backend=Backend(),
+        token_to_kv_pool=None,
+        bs=2,
+        num_extends=0,
+        input_num_tokens=12,
+        forward_mode=ForwardMode.DRAFT_EXTEND,
+        draft_seq_lens_buf=seq_lens,
+        accept_lengths=accept_lengths,
+        draft_first_step_reduce=True,
+    )
+
+    out = layer.forward(
+        positions=torch.arange(12, dtype=torch.int64),
+        hidden_states=torch.empty((12, 3)),
+        ctx=ctx,
+        out_cache_loc=torch.arange(12, dtype=torch.int32),
+        residual=None,
+    )
+
+    assert events[0][0] == "full_forward"
+    assert events[0][1].tolist() == [100, 100]
+    assert seq_lens.tolist() == [98, 96]
+    assert events[1][0] == "advance"
+    assert events[1][1].tolist() == [98, 96]
+    assert isinstance(out, tuple)
+    assert out[0].shape == (2, 3)
+    assert out[1] is None
+
+
+def test_glm_dsa_decode_seq_lens_distinguish_full_window_and_catchup():
+    seq_lens = torch.tensor([106, 206], dtype=torch.int32)
+
+    full_window = GlmMoeDsaAttention._expand_decode_seq_lens_per_token(
+        seq_lens,
+        q_len_per_req=6,
+        draft_catchup=False,
+    )
+    catchup = GlmMoeDsaAttention._expand_decode_seq_lens_per_token(
+        seq_lens,
+        q_len_per_req=6,
+        draft_catchup=True,
+    )
+
+    assert full_window.tolist() == [
+        101,
+        102,
+        103,
+        104,
+        105,
+        106,
+        201,
+        202,
+        203,
+        204,
+        205,
+        206,
+    ]
+    assert catchup.tolist() == [
+        106,
+        107,
+        108,
+        109,
+        110,
+        111,
+        206,
+        207,
+        208,
+        209,
+        210,
+        211,
+    ]
+
+
+def test_glm_nextn_decode_first_step_keeps_full_verify_window():
+    model = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
+    torch.nn.Module.__init__(model)
+    seen = {}
+
+    class DraftModel(torch.nn.Module):
+        def forward(
+            self,
+            input_ids,
+            positions,
+            ctx,
+            out_cache_loc,
+            captured_hidden_states=None,
+        ):
+            seen["input_ids"] = input_ids
+            seen["positions"] = positions
+            seen["ctx"] = ctx
+            seen["out_cache_loc"] = out_cache_loc
+            seen["captured_hidden_states"] = captured_hidden_states
+            # Simulate the decoder layer's draft_first_step_reduce output.
+            return torch.empty((ctx.bs, 3)), None
+
+    class Processor:
+        def __call__(self, input_ids, hidden_states, lm_head, logits_metadata):
+            seen["logits_input_ids"] = input_ids
+            seen["logits_hidden_states"] = hidden_states
+            seen["logits_metadata"] = logits_metadata
+            return SimpleNamespace(
+                hidden_states=hidden_states,
+                next_token_logits=torch.empty((hidden_states.shape[0], 8)),
+            )
+
+    model.model = DraftModel()
+    model.logits_processor = Processor()
+    model.lm_head = object()
+
+    input_ids = torch.arange(12, dtype=torch.int32)
+    positions = torch.arange(100, 112, dtype=torch.int64)
+    out_cache_loc = torch.arange(200, 212, dtype=torch.int32)
+    hidden_states = torch.arange(12 * 3, dtype=torch.float32).view(12, 3)
+    gather_ids = torch.tensor([3, 10], dtype=torch.int64)
+    ctx = ForwardContext(
+        attn_backend=SimpleNamespace(spec_num_tokens=6),
+        token_to_kv_pool=None,
+        bs=2,
+        num_extends=0,
+        input_num_tokens=12,
+        forward_mode=ForwardMode.DRAFT_EXTEND,
+        gather_ids=gather_ids,
+        global_num_tokens=[12],
+        global_bs=[2],
+        draft_first_step_reduce=True,
+        accept_lengths=torch.tensor([4, 5], dtype=torch.int32),
+    )
+
+    logits_output = model.forward(
+        ctx,
+        input_ids,
+        positions,
+        out_cache_loc,
+        captured_hidden_states=hidden_states,
+    )
+
+    assert seen["ctx"] is ctx
+    assert torch.equal(seen["input_ids"], input_ids)
+    assert torch.equal(seen["positions"], positions)
+    assert torch.equal(seen["out_cache_loc"], out_cache_loc)
+    assert torch.equal(seen["captured_hidden_states"], hidden_states)
+    assert seen["logits_metadata"].gather_ids is gather_ids
+    assert seen["logits_hidden_states"].shape == (2, 3)
+    assert logits_output.next_token_logits.shape == (2, 8)
+
+
+def test_eagle_glm_first_step_reuses_full_target_dsa_decode_topk():
+    eagle = Eagle.__new__(Eagle)
+    eagle.spec_num_tokens = 6
+    eagle.input_buffers = SimpleNamespace(
+        positions_buf=torch.arange(12, dtype=torch.int64),
+        out_cache_loc_buf=torch.arange(100, 112, dtype=torch.int32),
+    )
+    eagle.mm_pad_substitute_id = None
+    eagle.padded_gather_ids_offsets_buf = torch.arange(2, dtype=torch.int64) * 6 - 1
+    eagle.attn_backend = SimpleNamespace()
+    eagle.token_to_kv_pool = None
+    eagle.req_to_page = None
+    eagle._dsa_reuse_mtp_topk = True
+    eagle.draft_seq_lens_buf = torch.zeros((2,), dtype=torch.int32)
+    draft_model = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
+    seen = {}
+
+    class Runner:
+        model = draft_model
+
+        def forward(self, **kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(
+                hidden_states=torch.empty((2, 4)),
+                next_token_logits=torch.empty((2, 8)),
+            )
+
+    eagle.draft_model_runner = Runner()
+    full_decode_topk = GlmDsaDecodeTopK(
+        topk_indices=torch.arange(12 * 3, dtype=torch.int32).view(12, 3),
+        topk_lens=torch.arange(12, dtype=torch.int32),
+    )
+    draft_input = SimpleNamespace(
+        input_num_tokens=12,
+        num_extends=0,
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        base_model_output=torch.arange(12, dtype=torch.int32),
+        accept_lengths=torch.tensor([1, 4], dtype=torch.int64),
+        base_out_hidden_states=torch.empty((12, 4)),
+        global_num_tokens=[12],
+        global_bs=[2],
+        all_decode_or_idle=True,
+        dsa_topk=(None, full_decode_topk),
+    )
+
+    logits_output, dsa_topk = eagle._run_first_step(2, draft_input)
+
+    assert seen["ctx"].dsa_decode_topk is full_decode_topk
+    assert seen["ctx"].gather_ids.tolist() == [0, 9]
+    selected = dsa_topk[1]
+    assert selected is not full_decode_topk
+    assert selected.topk_lens.tolist() == [0, 9]
+    assert selected.topk_indices.tolist() == [
+        full_decode_topk.topk_indices[0].tolist(),
+        full_decode_topk.topk_indices[9].tolist(),
+    ]
+    assert logits_output.next_token_logits.shape == (2, 8)
+
+
+def test_eagle_multi_step_starts_from_accepted_prefix(monkeypatch):
+    captured = {}
+
+    def fake_compute_out_cache_loc_uniform(
+        *,
+        out_cache_loc_ptr,
+        req_pool_indices,
+        uniform_input_length,
+        cache_start,
+        req_to_pages,
+        page_size,
+    ):
+        captured["req_pool_indices"] = req_pool_indices.clone()
+        captured["uniform_input_length"] = uniform_input_length
+        captured["cache_start"] = cache_start.clone()
+        captured["page_size"] = page_size
+        out_cache_loc_ptr.copy_(torch.tensor([11, 12, 21, 22], dtype=torch.int32))
+
+    monkeypatch.setattr(
+        eagle_module,
+        "compute_out_cache_loc_uniform",
+        fake_compute_out_cache_loc_uniform,
+    )
+    monkeypatch.setattr(
+        eagle_module,
+        "sampling_argmax",
+        lambda logits: torch.argmax(logits, dim=-1),
+    )
+
+    class Backend:
+        def __init__(self):
+            self.advanced = []
+
+        def advance_draft_forward_metadata(self, lens):
+            self.advanced.append(lens.clone())
+
+    backend = Backend()
+    calls = []
+
+    class Runner:
+        def forward(self, **kwargs):
+            calls.append(
+                {
+                    "ctx": kwargs["ctx"],
+                    "input_ids": kwargs["input_ids"].clone(),
+                    "positions": kwargs["positions"].clone(),
+                    "out_cache_loc": kwargs["out_cache_loc"].clone(),
+                    "spec_step_idx": kwargs["spec_step_idx"],
+                }
+            )
+            return SimpleNamespace(
+                hidden_states=torch.full((2, 3), kwargs["spec_step_idx"]),
+                next_token_logits=torch.tensor([[0.0, 1.0, 0.0], [0.0, 2.0, 0.0]]),
+            )
+
+    eagle = Eagle.__new__(Eagle)
+    eagle.spec_num_steps = 3
+    eagle.spec_num_tokens = 6
+    eagle.page_size = 16
+    eagle.req_to_page = torch.empty((8, 2), dtype=torch.int32)
+    eagle.token_to_kv_pool = None
+    eagle.attn_backend = backend
+    eagle.draft_model_runner = Runner()
+    eagle.hot_token_ids = None
+    eagle.dp_size = 1
+    eagle.world_size = 1
+    eagle._dsa_reuse_mtp_topk = False
+    eagle.draft_out_cache_loc_buf = torch.empty(4, dtype=torch.int32)
+    eagle.draft_seq_lens_buf = torch.zeros(2, dtype=torch.int32)
+    eagle.input_buffers = SimpleNamespace(
+        req_pool_indices_buf=torch.tensor([4, 7], dtype=torch.int64),
+        seq_lens_buf=torch.tensor([106, 206], dtype=torch.int32),
+    )
+    valid_cache_lengths = torch.zeros(8, dtype=torch.int32)
+    valid_cache_lengths[4] = 100
+    valid_cache_lengths[7] = 200
+    eagle.runtime_states = SimpleNamespace(valid_cache_lengths=valid_cache_lengths)
+
+    next_tokens = torch.full((2, 4), -1, dtype=torch.int32)
+    draft_input = SimpleNamespace(
+        num_extends=0,
+        accept_lengths=torch.tensor([2, 5], dtype=torch.int32),
+        global_num_tokens=[12],
+        global_bs=[2],
+        all_decode_or_idle=True,
+    )
+    logits_output = SimpleNamespace(
+        hidden_states=torch.zeros((2, 3)),
+        next_token_logits=torch.empty((2, 3)),
+    )
+
+    eagle._run_multi_step_decode(
+        2,
+        draft_ids=torch.tensor([8, 9], dtype=torch.int32),
+        next_tokens=next_tokens,
+        logits_output=logits_output,
+        draft_input=draft_input,
+        dsa_topk=(None, None),
+    )
+
+    assert captured["req_pool_indices"].tolist() == [4, 7]
+    assert captured["uniform_input_length"] == 2
+    assert captured["cache_start"].tolist() == [102, 205]
+    assert captured["page_size"] == 16
+    assert [x.tolist() for x in backend.advanced] == [[103, 206], [104, 207]]
+    assert [call["spec_step_idx"] for call in calls] == [1, 2]
+    assert [call["positions"].tolist() for call in calls] == [[102, 205], [103, 206]]
+    assert [call["out_cache_loc"].tolist() for call in calls] == [[11, 21], [12, 22]]
+    assert calls[0]["input_ids"].tolist() == [8, 9]
+    assert calls[1]["input_ids"].tolist() == [1, 1]
+    assert next_tokens[:, 2:].tolist() == [[1, 1], [1, 1]]
 
 
 def test_cuda_graph_route_uses_global_batch_for_dp_idle_rank():
