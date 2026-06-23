@@ -160,11 +160,11 @@ def _dynamic_mxfp4_constraints(n_tokens: int) -> dict[str, int] | None:
     if not current_platform().is_cdna4:
         return None
     if n_tokens >= 1024:
-        return {"block_m": 64, "block_n": 128, "block_k": 256}
+        return {"block_m": 64, "block_n": 128, "block_k": 256, "num_warps": 4}
     if n_tokens >= 16:
-        return {"block_m": 16, "block_n": 128, "block_k": 256}
+        return {"block_m": 16, "block_n": 128, "block_k": 256, "num_warps": 4}
     if n_tokens >= 8:
-        return {"block_m": 32, "block_n": 128, "block_k": 256}
+        return {"block_m": 32, "block_n": 128, "block_k": 256, "num_warps": 4}
     return None
 
 
