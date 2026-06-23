@@ -114,6 +114,31 @@ def token_indices_from_pages(
     return page_ids * page_size + offsets
 
 
+def workspace_indices_to_kv_slots(
+    workspace_indices: torch.Tensor,
+    kv_workspace_slots: torch.Tensor | None,
+) -> torch.Tensor:
+    """Map workspace-local sparse top-k indices to global KV cache slots.
+
+    Negative entries are padding and remain negative in the output. The mapping
+    is written as a pure tensor expression so sparse prefill and mixed MTP reuse
+    can run under CUDA graph capture without a validity sync.
+    """
+    if kv_workspace_slots is None:
+        return workspace_indices.to(torch.int32)
+    if workspace_indices.numel() == 0 or kv_workspace_slots.numel() == 0:
+        return workspace_indices.to(torch.int32)
+
+    flat_indices = workspace_indices.reshape(-1)
+    valid = flat_indices >= 0
+    safe_indices = flat_indices.clamp_min(0).to(torch.int64)
+    mapped_slots = kv_workspace_slots.to(
+        device=workspace_indices.device,
+    ).index_select(0, safe_indices)
+    flat_slots = torch.where(valid, mapped_slots, flat_indices.to(mapped_slots.dtype))
+    return flat_slots.view_as(workspace_indices).to(torch.int32)
+
+
 # --- Page-based memory profiling ---
 
 

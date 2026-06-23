@@ -36,9 +36,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.layers.attention.backends.dsa import (
-    _workspace_indices_to_kv_slots,
-)
+from tokenspeed.runtime.layers.attention.utils import workspace_indices_to_kv_slots
 from tokenspeed.runtime.models.glm5_nextn import GlmMoeDsaForCausalLMNextN
 from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
 from tokenspeed.runtime.models.qwen3_5_nextn import Qwen3_5ForConditionalGenerationNextN
@@ -227,7 +225,7 @@ class Eagle(BaseDrafter):
                 min=decode_start,
                 max=topk_indices.shape[0] - 1,
             )
-            selected_prefill_indices = _workspace_indices_to_kv_slots(
+            selected_prefill_indices = workspace_indices_to_kv_slots(
                 prefill_indices.index_select(0, prefill_row_ids),
                 kv_workspace_slots,
             ).to(device=topk_indices.device, dtype=topk_indices.dtype)

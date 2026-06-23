@@ -43,6 +43,7 @@ from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.trtllm_mla import TRTLLMMLABackend
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.registry import register_backend
+from tokenspeed.runtime.layers.attention.utils import workspace_indices_to_kv_slots
 
 _DSA_TRTLLM_WORKSPACE_BYTES = 384 * 1024 * 1024
 _SPARSE_IMPL_FLASHMLA = "flashmla"
@@ -104,26 +105,6 @@ def _default_dsa_sparse_prefill_impl(kv_cache_dtype: torch.dtype | None = None) 
     ):
         return _SPARSE_IMPL_TRTLLM
     return _SPARSE_IMPL_FLASHMLA
-
-
-def _workspace_indices_to_kv_slots(
-    workspace_indices: torch.Tensor,
-    kv_workspace_slots: torch.Tensor | None,
-) -> torch.Tensor:
-    if kv_workspace_slots is None:
-        return workspace_indices.to(torch.int32)
-    if workspace_indices.numel() == 0 or kv_workspace_slots.numel() == 0:
-        return workspace_indices.to(torch.int32)
-
-    flat_indices = workspace_indices.reshape(-1)
-    valid = flat_indices >= 0
-    safe_indices = flat_indices.clamp_min(0).to(torch.int64)
-    mapped_slots = kv_workspace_slots.to(
-        device=workspace_indices.device,
-        dtype=torch.int64,
-    ).index_select(0, safe_indices)
-    flat_slots = torch.where(valid, mapped_slots, flat_indices.to(torch.int64))
-    return flat_slots.view_as(workspace_indices).to(torch.int32)
 
 
 class DSABackend(AttentionBackend):
@@ -896,7 +877,7 @@ class DSABackend(AttentionBackend):
         if q.shape[0] == 0:
             return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
 
-        block_tables = _workspace_indices_to_kv_slots(
+        block_tables = workspace_indices_to_kv_slots(
             workspace_indices.to(torch.int32),
             kv_workspace_slots,
         ).view(q.shape[0], 1, self.index_topk)

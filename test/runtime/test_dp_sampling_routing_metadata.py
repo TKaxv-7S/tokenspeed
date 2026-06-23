@@ -15,9 +15,7 @@ from tokenspeed.runtime.execution.drafter.eagle import (
     should_reduce_draft_first_step,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.dsa import (
-    _workspace_indices_to_kv_slots,
-)
+from tokenspeed.runtime.layers.attention.utils import workspace_indices_to_kv_slots
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.models import glm5 as glm5_module
 from tokenspeed.runtime.models.extensible import ExtensibleLM
@@ -373,14 +371,14 @@ def test_expert_distribution_recorder_disable_region_suppresses_hooks():
     assert calls[0]["topk_ids"].tolist() == [2]
 
 
-def test_dsa_workspace_indices_to_kv_slots_preserves_padding():
+def test_workspace_indices_to_kv_slots_preserves_padding():
     workspace_indices = torch.tensor(
         [[0, 2, -1], [3, -1, 1]],
         dtype=torch.int32,
     )
     kv_workspace_slots = torch.tensor([100, 101, 102, 103], dtype=torch.int32)
 
-    mapped = _workspace_indices_to_kv_slots(workspace_indices, kv_workspace_slots)
+    mapped = workspace_indices_to_kv_slots(workspace_indices, kv_workspace_slots)
 
     assert mapped.dtype == torch.int32
     assert mapped.tolist() == [[100, 102, -1], [103, -1, 101]]
