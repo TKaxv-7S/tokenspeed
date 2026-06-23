@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from tokenspeed_kernel.ops.moe.triton.mxfp4 import (
+    _sum_topk_rows,
     triton_mxfp4_moe_apply,
     triton_mxfp4_moe_process_weights,
 )
@@ -183,3 +184,19 @@ def test_dynamic_mxfp4_swiglu_quant_epilogue_matches_unfused(device: str) -> Non
     torch.cuda.synchronize()
 
     torch.testing.assert_close(fused, reference, rtol=1e-2, atol=1e-2)
+
+
+def test_topk_sum_reduce_matches_torch(device: str) -> None:
+    generator = torch.Generator(device=device).manual_seed(20260624)
+    output = torch.randn(
+        (TOKENS * TOPK, HIDDEN_SIZE),
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+
+    reduced = _sum_topk_rows(output, TOKENS, TOPK)
+    expected = output.view(TOKENS, TOPK, HIDDEN_SIZE).sum(dim=1)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(reduced, expected, rtol=1e-2, atol=1e-2)

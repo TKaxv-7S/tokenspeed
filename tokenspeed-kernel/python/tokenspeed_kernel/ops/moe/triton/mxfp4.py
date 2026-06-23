@@ -157,6 +157,68 @@ _MXFP4_QUANT_EPILOGUE = Epilogue(
 )
 
 
+@triton.jit
+def _topk_sum_reduce_kernel(
+    x_ptr,
+    out_ptr,
+    n_cols,
+    stride_x_row: tl.constexpr,
+    stride_x_col: tl.constexpr,
+    stride_out_row: tl.constexpr,
+    stride_out_col: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_TOP_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_topk = tl.arange(0, BLOCK_TOP_K)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rows = pid_m * TOP_K + offs_topk
+    mask = (offs_topk[:, None] < TOP_K) & (offs_n[None, :] < n_cols)
+    vals = tl.load(
+        x_ptr + rows[:, None] * stride_x_row + offs_n[None, :] * stride_x_col,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    acc = tl.sum(vals, axis=0)
+    tl.store(
+        out_ptr + pid_m * stride_out_row + offs_n * stride_out_col,
+        acc,
+        mask=offs_n < n_cols,
+    )
+
+
+def _sum_topk_rows(output: torch.Tensor, n_tokens: int, top_k: int) -> torch.Tensor:
+    if top_k <= 1:
+        return output
+    if not output.is_cuda:
+        return output.view(n_tokens, top_k, output.shape[-1]).sum(dim=1)
+
+    n_cols = int(output.shape[-1])
+    reduced = torch.empty(
+        (n_tokens, n_cols),
+        device=output.device,
+        dtype=output.dtype,
+    )
+    block_n = 256
+    grid = (n_tokens, triton.cdiv(n_cols, block_n))
+    _topk_sum_reduce_kernel[grid](
+        output,
+        reduced,
+        n_cols,
+        output.stride(0),
+        output.stride(1),
+        reduced.stride(0),
+        reduced.stride(1),
+        TOP_K=top_k,
+        BLOCK_TOP_K=triton.next_power_of_2(top_k),
+        BLOCK_N=block_n,
+        num_warps=1,
+    )
+    return reduced
+
+
 def _uses_dynamic_mxfp4_activations(w: torch.nn.Module) -> bool:
     quant_config = getattr(w, "quant_config", None)
     return current_platform().is_amd and bool(
@@ -958,6 +1020,4 @@ def triton_mxfp4_moe_apply(
             scatter_indx=scatter_indx,
             gammas=gate_scal,
         )
-    if top_k > 1:
-        return output.view(n_tokens, top_k, output.shape[-1]).sum(dim=1)
-    return output
+    return _sum_topk_rows(output, n_tokens, top_k)
