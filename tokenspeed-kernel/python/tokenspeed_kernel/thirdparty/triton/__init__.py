@@ -348,12 +348,18 @@ def deepseek_v4_softplus_topk(
 
 
 @triton.jit
-def _moe_topk_metadata_small_m_kernel(
+def _moe_topk_routing_small_m_kernel(
+    topk_weights_ptr,
     topk_ids_ptr,
     slice_sizes_ptr,
     slice_offs_ptr,
     block_offs_ptr,
     block_schedule_ptr,
+    gather_indx_ptr,
+    scatter_indx_ptr,
+    gate_scal_ptr,
+    weights_stride_m: tl.constexpr,
+    weights_stride_k: tl.constexpr,
     ids_stride_m: tl.constexpr,
     ids_stride_k: tl.constexpr,
     block_offs_stride_b: tl.constexpr,
@@ -372,13 +378,25 @@ def _moe_topk_metadata_small_m_kernel(
     experts = tl.arange(0, BLOCK_E)
     expert_mask = experts < num_experts
 
+    flat = tl.arange(0, BLOCK_G)
+    valid = flat < num_tokens * topk
+    token_idx = flat // topk
+    slot_idx = flat - token_idx * topk
+
+    expert_ids = tl.load(
+        topk_ids_ptr + token_idx * ids_stride_m + slot_idx * ids_stride_k,
+        mask=valid,
+        other=-1,
+    ).to(tl.int32)
+    expert_valid = valid & (expert_ids >= 0) & (expert_ids < num_experts)
+
     hist = tl.zeros([BLOCK_E], dtype=tl.int32)
     for flat_idx in tl.static_range(0, BLOCK_G):
-        token_idx = flat_idx // topk
-        slot_idx = flat_idx - token_idx * topk
+        token = flat_idx // topk
+        slot = flat_idx - token * topk
         valid_flat = flat_idx < num_tokens * topk
         expert = tl.load(
-            topk_ids_ptr + token_idx * ids_stride_m + slot_idx * ids_stride_k,
+            topk_ids_ptr + token * ids_stride_m + slot * ids_stride_k,
             mask=valid_flat,
             other=-1,
         ).to(tl.int32)
@@ -421,53 +439,25 @@ def _moe_topk_metadata_small_m_kernel(
             mask=expert_mask & has_block,
         )
 
-
-@triton.jit
-def _moe_topk_indices_small_m_kernel(
-    topk_weights_ptr,
-    topk_ids_ptr,
-    slice_offs_ptr,
-    gather_indx_ptr,
-    scatter_indx_ptr,
-    gate_scal_ptr,
-    weights_stride_m: tl.constexpr,
-    weights_stride_k: tl.constexpr,
-    ids_stride_m: tl.constexpr,
-    ids_stride_k: tl.constexpr,
-    num_tokens: tl.constexpr,
-    topk: tl.constexpr,
-    num_experts: tl.constexpr,
-    BLOCK_G: tl.constexpr,
-):
-    flat = tl.arange(0, BLOCK_G)
-    valid = flat < num_tokens * topk
-    token_idx = flat // topk
-    slot_idx = flat - token_idx * topk
-
-    expert_ids = tl.load(
-        topk_ids_ptr + token_idx * ids_stride_m + slot_idx * ids_stride_k,
-        mask=valid,
-        other=-1,
-    ).to(tl.int32)
-    expert_valid = valid & (expert_ids >= 0) & (expert_ids < num_experts)
-
     row_ids = tl.expand_dims(expert_ids, 1)
     col_ids = tl.expand_dims(expert_ids, 0)
     row_flat = tl.expand_dims(flat, 1)
     col_flat = tl.expand_dims(flat, 0)
     row_valid = tl.expand_dims(expert_valid, 1)
     col_valid = tl.expand_dims(expert_valid, 0)
-    rank = tl.sum(
+    sorted_pos = tl.sum(
         tl.where(
-            row_valid & col_valid & (row_ids == col_ids) & (col_flat < row_flat),
+            row_valid
+            & col_valid
+            & (
+                (col_ids < row_ids)
+                | ((col_ids == row_ids) & (col_flat < row_flat))
+            ),
             1,
             0,
         ),
         axis=1,
     )
-
-    slice_base = tl.load(slice_offs_ptr + expert_ids, mask=expert_valid, other=0)
-    sorted_pos = slice_base + rank
     weights = tl.load(
         topk_weights_ptr + token_idx * weights_stride_m + slot_idx * weights_stride_k,
         mask=valid,
@@ -542,12 +532,18 @@ def moe_routing_from_topk_small_m(
     block_g = triton.next_power_of_2(total_rows)
     block_e = triton.next_power_of_2(num_experts)
     block_b = triton.next_power_of_2(max(1, max_num_blocks))
-    _moe_topk_metadata_small_m_kernel[(1,)](
+    _moe_topk_routing_small_m_kernel[(1,)](
+        topk_weights,
         topk_ids,
         slice_sizes,
         slice_offs,
         block_offs_data,
         block_schedule_data,
+        gather_indx,
+        scatter_indx,
+        gate_scal,
+        topk_weights.stride(0),
+        topk_weights.stride(1),
         topk_ids.stride(0),
         topk_ids.stride(1),
         block_offs_data.stride(0),
@@ -562,23 +558,6 @@ def moe_routing_from_topk_small_m(
         BLOCK_E=block_e,
         BLOCK_G=block_g,
         BLOCK_B=block_b,
-        num_warps=4,
-    )
-    _moe_topk_indices_small_m_kernel[(1,)](
-        topk_weights,
-        topk_ids,
-        slice_offs,
-        gather_indx,
-        scatter_indx,
-        gate_scal,
-        topk_weights.stride(0),
-        topk_weights.stride(1),
-        topk_ids.stride(0),
-        topk_ids.stride(1),
-        num_tokens=num_tokens,
-        topk=topk,
-        num_experts=num_experts,
-        BLOCK_G=block_g,
         num_warps=4,
     )
     return (

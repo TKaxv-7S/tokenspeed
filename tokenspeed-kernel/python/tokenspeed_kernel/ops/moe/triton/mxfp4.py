@@ -318,6 +318,32 @@ def _routing_from_topk_small_m(
     return ragged_metadata, gather_indx, scatter_indx, gate_scal
 
 
+def _routing_from_local_topk(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    num_experts: int,
+    dtype: torch.dtype,
+    ep_size: int,
+) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
+    routed = None
+    if ep_size <= 1:
+        routed = _routing_from_topk_small_m(
+            topk_weights,
+            topk_ids,
+            num_experts=num_experts,
+            dtype=dtype,
+        )
+    if routed is None:
+        routed = _routing_from_topk(
+            topk_weights,
+            topk_ids,
+            num_experts=num_experts,
+            dtype=dtype,
+        )
+    return routed
+
+
 def _local_topk_for_ep(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -616,22 +642,15 @@ def triton_mxfp4_moe_apply(
             topk_ids,
             w,
         )
-        routed = None
-        if int(getattr(w, "ep_size", 1)) <= 1:
-            routed = _routing_from_topk_small_m(
+        ragged_metadata, gather_indx, scatter_indx, gate_scal = (
+            _routing_from_local_topk(
                 topk_weights,
                 topk_ids,
                 num_experts=num_experts,
                 dtype=router_logits.dtype,
+                ep_size=int(getattr(w, "ep_size", 1)),
             )
-        if routed is None:
-            routed = _routing_from_topk(
-                topk_weights,
-                topk_ids,
-                num_experts=num_experts,
-                dtype=router_logits.dtype,
-            )
-        ragged_metadata, gather_indx, scatter_indx, gate_scal = routed
+        )
     elif topk_weights is not None or topk_ids is not None:
         if topk_weights is None or topk_ids is None:
             raise ValueError("topk_weights and topk_ids must be provided together")
@@ -640,11 +659,14 @@ def triton_mxfp4_moe_apply(
             topk_ids,
             w,
         )
-        ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing_from_topk(
-            topk_weights,
-            topk_ids,
-            num_experts=num_experts,
-            dtype=router_logits.dtype,
+        ragged_metadata, gather_indx, scatter_indx, gate_scal = (
+            _routing_from_local_topk(
+                topk_weights,
+                topk_ids,
+                num_experts=num_experts,
+                dtype=router_logits.dtype,
+                ep_size=int(getattr(w, "ep_size", 1)),
+            )
         )
     else:
         ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing(
