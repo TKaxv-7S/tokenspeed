@@ -763,6 +763,54 @@ def test_glm_dsa_prefill_topk_uses_cpu_length_metadata(monkeypatch):
     assert captured["deepgemm_num_prefill_tokens"] == 5
 
 
+def test_glm_dsa_forward_skips_sparse_prefill_when_local_prefill_empty():
+    attn = GlmMoeDsaAttention.__new__(GlmMoeDsaAttention)
+    attn.q_lora_rank = 2
+    attn.kv_lora_rank = 2
+    attn.qk_rope_head_dim = 1
+    attn.num_local_heads = 1
+    attn.v_head_dim = 2
+    attn.is_nextn = False
+    attn.skip_indexer_topk = False
+    attn.index_topk = 3
+    attn.fused_qkv_a_proj_with_mqa = (
+        lambda hidden_states, block_scale, output_dtype: torch.empty(
+            (hidden_states.shape[0], 5),
+            dtype=output_dtype,
+        )
+    )
+    attn.fused_qk_layernorm = lambda **kwargs: None
+    attn.q_b_proj = lambda q_norm: (torch.empty((q_norm.shape[0], 2)), None)
+    attn.o_proj = lambda attn_output: (torch.empty((attn_output.shape[0], 4)), None)
+    attn.forward_dsa_sparse_prefill = lambda *args, **kwargs: pytest.fail(
+        "local empty prefill should not call sparse prefill"
+    )
+    attn.forward_absorb = lambda *args, **kwargs: pytest.fail(
+        "local empty prefill should not call decode"
+    )
+
+    ctx = ForwardContext(
+        attn_backend=SimpleNamespace(forward_decode_metadata=None),
+        token_to_kv_pool=SimpleNamespace(),
+        bs=1,
+        num_extends=1,
+        input_num_tokens=0,
+        forward_mode=ForwardMode.EXTEND,
+    )
+    comm_manager = SimpleNamespace(pre_attn_comm=lambda tensor, ctx: tensor)
+
+    out = attn.forward(
+        positions=torch.empty(0, dtype=torch.int64),
+        hidden_states=torch.empty((0, 4)),
+        ctx=ctx,
+        out_cache_loc=torch.empty(0, dtype=torch.int64),
+        comm_manager=comm_manager,
+    )
+
+    assert out.shape == (0, 4)
+    assert ctx.dsa_prefill_topk is None
+
+
 def test_glm_dsa_prefill_chunk_max_seqlens_use_request_order_cpu():
     chunk_maxes = glm5_module._glm_dsa_prefill_chunk_max_seqlens_cpu(
         torch.tensor([7, 1, 20], dtype=torch.int32),

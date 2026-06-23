@@ -1649,7 +1649,9 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             device=q.device,
         )
 
-        if ctx.num_extends > 0:
+        # Dense-DP ranks can have ctx.num_extends > 0 while this rank owns no
+        # local prefill rows; only run sparse prefill for local query tokens.
+        if num_prefill_tokens > 0:
             prefill_ctx = replace(
                 ctx,
                 bs=ctx.num_extends,
