@@ -197,6 +197,7 @@ class Eagle(BaseDrafter):
         gather_ids: torch.Tensor,
         *,
         decode_start: int = 0,
+        num_prefill_rows: int = 0,
     ) -> DsaTopKState:
         prefill_topk, decode_topk = dsa_topk
         if not self._dsa_reuse_mtp_topk or decode_topk is None:
@@ -209,7 +210,7 @@ class Eagle(BaseDrafter):
             return dsa_topk
         if decode_start <= 0 and topk_indices.shape[0] <= gather_ids.numel():
             return dsa_topk
-        if decode_start <= 0:
+        if decode_start <= 0 or num_prefill_rows <= 0:
             selected_indices = topk_indices.index_select(0, gather_ids)
             selected_lens = topk_lens.index_select(0, gather_ids)
         else:
@@ -220,11 +221,9 @@ class Eagle(BaseDrafter):
             kv_workspace_slots = getattr(prefill_topk, "kv_workspace_slots", None)
             if prefill_indices is None or prefill_lens is None:
                 return dsa_topk
-            prefill_row_ids = gather_ids.clamp_max(decode_start - 1)
-            decode_row_ids = gather_ids.clamp(
-                min=decode_start,
-                max=topk_indices.shape[0] - 1,
-            )
+            num_prefill_rows = min(int(num_prefill_rows), gather_ids.numel())
+            prefill_row_ids = gather_ids[:num_prefill_rows]
+            decode_row_ids = gather_ids[num_prefill_rows:]
             selected_prefill_indices = workspace_indices_to_kv_slots(
                 prefill_indices.index_select(0, prefill_row_ids),
                 kv_workspace_slots,
@@ -233,19 +232,20 @@ class Eagle(BaseDrafter):
                 device=topk_lens.device,
                 dtype=topk_lens.dtype,
             )
-            selected_decode_indices = topk_indices.index_select(0, decode_row_ids)
-            selected_decode_lens = topk_lens.index_select(0, decode_row_ids)
-            is_prefill_row = gather_ids < decode_start
-            selected_indices = torch.where(
-                is_prefill_row.view(-1, 1),
-                selected_prefill_indices,
-                selected_decode_indices,
-            )
-            selected_lens = torch.where(
-                is_prefill_row,
-                selected_prefill_lens,
-                selected_decode_lens,
-            )
+            if decode_row_ids.numel() > 0:
+                selected_decode_indices = topk_indices.index_select(0, decode_row_ids)
+                selected_decode_lens = topk_lens.index_select(0, decode_row_ids)
+                selected_indices = torch.cat(
+                    [selected_prefill_indices, selected_decode_indices],
+                    dim=0,
+                )
+                selected_lens = torch.cat(
+                    [selected_prefill_lens, selected_decode_lens],
+                    dim=0,
+                )
+            else:
+                selected_indices = selected_prefill_indices
+                selected_lens = selected_prefill_lens
         selected_decode_topk = replace(
             decode_topk,
             topk_indices=selected_indices,
@@ -393,6 +393,7 @@ class Eagle(BaseDrafter):
                 dsa_topk,
                 gather_ids,
                 decode_start=first_step_decode_start,
+                num_prefill_rows=draft_input.num_extends,
             )
         return logits_output, dsa_topk
 
