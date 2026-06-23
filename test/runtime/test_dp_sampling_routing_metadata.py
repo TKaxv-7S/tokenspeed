@@ -699,10 +699,16 @@ def test_glm_dsa_prefill_topk_uses_cpu_length_metadata(monkeypatch):
 
     def fake_compute_prefill_topk_indices_deepgemm(self, **kwargs):
         captured["deepgemm_max_seq_len"] = kwargs["max_seq_len"]
-        captured["deepgemm_seq_len_sum"] = kwargs["seq_len_sum"]
+        captured["deepgemm_max_query_rows"] = kwargs["max_query_rows"]
+        captured["deepgemm_chunk_max_seqlens"] = kwargs["prefill_chunk_max_seqlens"]
         captured["deepgemm_num_prefill_tokens"] = kwargs["num_prefill_tokens"]
         return "prefill-topk"
 
+    monkeypatch.setitem(
+        glm5_module.global_server_args_dict,
+        glm5_module._INDEXER_PREFILL_MAX_LOGITS_MB_ARG,
+        1,
+    )
     monkeypatch.setattr(
         glm5_module,
         "_build_prefill_kv_workspace_slots",
@@ -715,8 +721,8 @@ def test_glm_dsa_prefill_topk_uses_cpu_length_metadata(monkeypatch):
     )
 
     # The live tensors deliberately disagree with the CPU mirror. The scalar
-    # token-count, max-len, and chunk-budget decisions should use the CPU mirror
-    # to avoid GPU syncs in the GLM DSA prefill top-k path.
+    # token-count, max-len, chunk-budget, and per-chunk max-seqlen decisions
+    # should use the CPU mirror to avoid GPU syncs in the GLM DSA prefill top-k path.
     chunk_meta = SimpleNamespace(
         extend_prefix_lens=torch.tensor([100], dtype=torch.int32),
         extend_seq_lens=torch.tensor([100], dtype=torch.int32),
@@ -752,8 +758,19 @@ def test_glm_dsa_prefill_topk_uses_cpu_length_metadata(monkeypatch):
     assert captured["workspace_max_seq_len"] == 12
     assert captured["workspace_block_tables_shape"] == (1, 1)
     assert captured["deepgemm_max_seq_len"] == 12
-    assert captured["deepgemm_seq_len_sum"] == 12
+    assert captured["deepgemm_max_query_rows"] == (1024 * 1024) // (12 * 4)
+    assert captured["deepgemm_chunk_max_seqlens"] == [12]
     assert captured["deepgemm_num_prefill_tokens"] == 5
+
+
+def test_glm_dsa_prefill_chunk_max_seqlens_use_request_order_cpu():
+    chunk_maxes = glm5_module._glm_dsa_prefill_chunk_max_seqlens_cpu(
+        torch.tensor([7, 1, 20], dtype=torch.int32),
+        torch.tensor([5, 4, 3], dtype=torch.int32),
+        max_query_rows=4,
+    )
+
+    assert chunk_maxes == [11, 12, 23]
 
 
 def test_glm_nextn_decode_first_step_keeps_full_verify_window():

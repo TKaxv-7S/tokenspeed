@@ -192,6 +192,41 @@ def _build_prefill_kv_workspace_slots(
     return slots[valid].contiguous(), seq_cu[:-1].contiguous()
 
 
+def _glm_dsa_prefill_chunk_max_seqlens_cpu(
+    prefix_lens_cpu: torch.Tensor,
+    extend_lens_cpu: torch.Tensor,
+    max_query_rows: int,
+) -> list[int]:
+    max_query_rows = max(1, int(max_query_rows))
+    chunk_max_seqlens: list[int] = []
+    chunk_rows = 0
+    chunk_max = 0
+
+    for prefix_len, extend_len in zip(
+        prefix_lens_cpu.tolist(),
+        extend_lens_cpu.tolist(),
+        strict=False,
+    ):
+        prefix_len = int(prefix_len)
+        extend_len = int(extend_len)
+        offset = 0
+        while offset < extend_len:
+            take = min(extend_len - offset, max_query_rows - chunk_rows)
+            # The last token in a contiguous request segment has the largest
+            # visible KV length for that segment.
+            chunk_max = max(chunk_max, prefix_len + offset + take)
+            offset += take
+            chunk_rows += take
+            if chunk_rows == max_query_rows:
+                chunk_max_seqlens.append(max(1, chunk_max))
+                chunk_rows = 0
+                chunk_max = 0
+
+    if chunk_rows > 0:
+        chunk_max_seqlens.append(max(1, chunk_max))
+    return chunk_max_seqlens
+
+
 def _glm_dsa_rope_scaling(
     rope_scaling: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
@@ -1259,6 +1294,19 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         else:
             max_seq_len = int(seq_lens.max().item())
             seq_len_sum = int(seq_lens.sum().item())
+        max_logits_mb = int(global_server_args_dict[_INDEXER_PREFILL_MAX_LOGITS_MB_ARG])
+        seq_len_sum = max(seq_len_sum, 1)
+        max_logits_bytes = max(1, max_logits_mb) * 1024 * 1024
+        max_query_rows = max(1, max_logits_bytes // (seq_len_sum * 4))
+        prefill_chunk_max_seqlens = (
+            _glm_dsa_prefill_chunk_max_seqlens_cpu(
+                prefix_lens_cpu,
+                extend_lens_cpu,
+                max_query_rows,
+            )
+            if prefix_lens_cpu is not None and extend_lens_cpu is not None
+            else None
+        )
         max_pages = (max_seq_len + page_size - 1) // page_size
         block_tables_snapshot = getattr(ctx.attn_backend, "_prefill_block_tables", None)
         if block_tables_snapshot is None:
@@ -1285,7 +1333,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             kv_workspace_slots=kv_workspace_slots,
             kv_workspace_bases=kv_workspace_bases,
             max_seq_len=max_seq_len,
-            seq_len_sum=seq_len_sum,
+            max_query_rows=max_query_rows,
+            prefill_chunk_max_seqlens=prefill_chunk_max_seqlens,
             num_prefill_tokens=num_prefill_tokens,
             topk=topk,
         )
@@ -1302,7 +1351,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         kv_workspace_slots: torch.Tensor,
         kv_workspace_bases: torch.Tensor,
         max_seq_len: int,
-        seq_len_sum: int,
+        max_query_rows: int,
+        prefill_chunk_max_seqlens: list[int] | None,
         num_prefill_tokens: int,
         topk: int,
     ) -> GlmDsaPrefillTopK:
@@ -1326,7 +1376,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if num_prefill_tokens <= 0 or seq_lens.numel() == 0:
             raise RuntimeError("GLM DSA prefill top-k requires at least one token.")
 
-        max_logits_mb = int(global_server_args_dict[_INDEXER_PREFILL_MAX_LOGITS_MB_ARG])
         q = indexer_output.query[:num_prefill_tokens].contiguous()
         q_2d = q.view(-1, self.indexer.index_head_dim)
         q_fp8, q_scale = quantize_fp8_with_scale(
@@ -1389,14 +1438,15 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 "GLM DSA prefill top-k requires torch.ops.trtllm.indexer_topk_prefill."
             )
 
-        seq_len_sum = max(seq_len_sum, 1)
-        max_logits_bytes = max(1, max_logits_mb) * 1024 * 1024
-        max_query_rows = max(1, max_logits_bytes // (seq_len_sum * 4))
-
         row_starts_i32 = row_starts.to(torch.int32).contiguous()
         row_ends_i32 = row_ends.to(torch.int32).contiguous()
-        for start in range(0, num_prefill_tokens, max_query_rows):
+        for chunk_idx, start in enumerate(range(0, num_prefill_tokens, max_query_rows)):
             end = min(start + max_query_rows, num_prefill_tokens)
+            max_seqlen_k = (
+                prefill_chunk_max_seqlens[chunk_idx]
+                if prefill_chunk_max_seqlens is not None
+                else int(causal_lens[start:end].max().item())
+            )
             logits = deep_gemm.fp8_mqa_logits(
                 q_fp8[start:end].contiguous(),
                 kv_fp8,
@@ -1404,7 +1454,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 row_starts_i32[start:end].contiguous(),
                 row_ends_i32[start:end].contiguous(),
                 clean_logits=False,
-                max_seqlen_k=int(causal_lens[start:end].max().item()),
+                max_seqlen_k=max_seqlen_k,
             )
             logits.nan_to_num_(
                 nan=float("-inf"),
