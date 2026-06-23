@@ -476,7 +476,7 @@ def _swiglu_activation() -> FusedActivation:
     )
 
 
-def _swiglu_beta_activation() -> FusedActivation:
+def _swiglu_beta_activation(limit: float | None = SWIGLU_LIMIT) -> FusedActivation:
     return FusedActivation(
         FnSpecs(
             "swiglu_beta",
@@ -484,7 +484,7 @@ def _swiglu_beta_activation() -> FusedActivation:
             ("alpha", "limit", "beta"),
             reduction_n=2,
         ),
-        (SWIGLU_ALPHA, SWIGLU_LIMIT, SWIGLU_BETA),
+        (SWIGLU_ALPHA, limit, SWIGLU_BETA),
     )
 
 
@@ -630,9 +630,11 @@ def _assert_gluon_matches_triton(
 @requires_gfx950
 @pytest.mark.parametrize("num_tokens", [4, 64])
 @pytest.mark.parametrize("preshuffled", [False, True])
+@pytest.mark.parametrize("swiglu_limit", [SWIGLU_LIMIT, 0.0, None])
 def test_gluon_dynamic_stage1_a4w4_beta_matches_triton_gfx950(
     num_tokens: int,
     preshuffled: bool,
+    swiglu_limit: float | None,
     mxfp4_weights: Mxfp4WeightVariants,
 ) -> None:
     weights = mxfp4_weights.preshuffled if preshuffled else mxfp4_weights.nonpreshuffled
@@ -658,7 +660,7 @@ def test_gluon_dynamic_stage1_a4w4_beta_matches_triton_gfx950(
         a_ragged_metadata=ragged_metadata,
         gather_indx=gather_indx,
         precision_config=reference_pc,
-        fused_activation=_swiglu_beta_activation(),
+        fused_activation=_swiglu_beta_activation(swiglu_limit),
     )
     actual_pc = _dynamic_mxfp4_precision_config(
         weights.w13_precision_config,
@@ -671,7 +673,7 @@ def test_gluon_dynamic_stage1_a4w4_beta_matches_triton_gfx950(
         a_ragged_metadata=ragged_metadata,
         gather_indx=gather_indx,
         precision_config=actual_pc,
-        fused_activation=_swiglu_beta_activation(),
+        fused_activation=_swiglu_beta_activation(swiglu_limit),
     )
     torch.cuda.synchronize()
 

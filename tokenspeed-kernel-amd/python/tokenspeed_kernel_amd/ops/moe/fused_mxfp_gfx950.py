@@ -331,7 +331,7 @@ def _swiglu_reduce(
     acc = gl.convert_layout(acc, SPLIT_LAYOUT)
     reshaped = acc.reshape((BLOCK_M, OUT_BLOCK_N, 2))
     gate, linear = gl.split(reshaped)
-    if limit > 0.0:
+    if limit >= 0.0:
         gate = gl.minimum(gate, limit)
         linear = gl.clamp(linear, -limit, limit)
     s = gate / (1.0 + gl.exp(-alpha * gate))
@@ -5292,7 +5292,7 @@ def _launch_kernel(
     )
 
     swiglu_alpha = swiglu[0] if swiglu is not None else 0.0
-    swiglu_limit = swiglu[1] if swiglu is not None else 0.0
+    swiglu_limit = swiglu[1] if swiglu is not None else -1.0
     swiglu_beta = swiglu[2] if swiglu is not None and len(swiglu) > 2 else 1.0
 
     w3 = w if w.ndim == 3 else w.unsqueeze(0)
@@ -5960,7 +5960,7 @@ def gluon_mxfp_dispatch_swiglu(
     gather_indx,
     out_dtype: torch.dtype = torch.bfloat16,
     swiglu_alpha: float = 1.0,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: float | None = None,
     swiglu_beta: float = 1.0,
     block_m: int | None = None,
     block_n: int | None = None,
@@ -6104,7 +6104,11 @@ def gluon_mxfp_dispatch_swiglu(
         scatter_indx=None,
         gate_scal=None,
         a_ragged_metadata=a_ragged_metadata,
-        swiglu=(float(swiglu_alpha), float(swiglu_limit), float(swiglu_beta)),
+        swiglu=(
+            float(swiglu_alpha),
+            -1.0 if swiglu_limit is None else float(swiglu_limit),
+            float(swiglu_beta),
+        ),
         out_block_n=out_block_n,
         block_m=block_m,
         block_n=block_n,
@@ -6426,8 +6430,9 @@ def _maybe_extract_swiglu_args(fused_activation):
         args = getattr(fused_activation, "args", None)
     if args is None or len(args) < 2:
         return None
+    limit = -1.0 if args[1] is None else float(args[1])
     beta = float(args[2]) if fn_name == "swiglu_beta" and len(args) >= 3 else 1.0
-    return float(args[0]), float(args[1]), beta
+    return float(args[0]), limit, beta
 
 
 def _global_scale_passthrough(scale):
@@ -6583,7 +6588,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     w2_act_scale: torch.Tensor,
     top_k: int,
     swiglu_alpha: float = 1.702,
-    swiglu_limit: float = 7.0,
+    swiglu_limit: float | None = 7.0,
 ) -> torch.Tensor | None:
     """Small-M direct warp-decode MoE for GPT-OSS FP8 x MXFP4 path."""
     assert hidden_states.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
@@ -6721,7 +6726,8 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         NUM_BUFFERS=COOP_NUM_BUFFERS, NUM_WARPS=COOP_NUM_WARPS,
         W_PRESHUFFLED=w13_preshuffled,
         HAS_BIAS=w13_bias is not None,
-        SWIGLU_ALPHA=float(swiglu_alpha), SWIGLU_LIMIT=float(swiglu_limit),
+        SWIGLU_ALPHA=float(swiglu_alpha),
+        SWIGLU_LIMIT=-1.0 if swiglu_limit is None else float(swiglu_limit),
         num_warps=COOP_NUM_WARPS,
     )
     # fmt: on
@@ -6787,7 +6793,7 @@ def gluon_mxfp_fused_moe(
     top_k: int,
     enable_warp_decode: bool = True,
     swiglu_alpha: float = 1.702,
-    swiglu_limit: float = 7.0,
+    swiglu_limit: float | None = 7.0,
 ) -> torch.Tensor:
     """Route + dispatch GEMM + SwiGLU + combine GEMM, all fused for the
     gluon mxfp4 / fp8-activation path.
@@ -7247,7 +7253,7 @@ def _load_w_scale_tile_direct_cdna4(
 @gluon.jit
 def _swiglu_gate_up(gate, linear, alpha: gl.constexpr, limit: gl.constexpr):
     """SwiGLU on separate gate/up MFMA accumulators (pre-split form)."""
-    if limit > 0.0:
+    if limit >= 0.0:
         gate = gl.minimum(gate, limit)
         linear = gl.clamp(linear, -limit, limit)
     sigmoid = 1.0 / (1.0 + gl.exp(-alpha * gate))
