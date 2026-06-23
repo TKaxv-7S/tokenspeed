@@ -23,12 +23,20 @@ if not _IS_GFX950:
 
 from tokenspeed_kernel.ops.moe.gluon.mxfp4 import gluon_mxfp4_moe_process_weights
 from tokenspeed_kernel.ops.moe.triton.mxfp4 import (
+    _quantize_mxfp4_activation,
     _routing,
+    _swiglu_beta_interleaved_fn,
     fp8_quantize,
     triton_mxfp4_moe_process_weights,
 )
 from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx950 as gluon_moe
-from triton_kernels.matmul import FnSpecs, FusedActivation, matmul
+from triton_kernels.matmul import (
+    FlexCtx,
+    FnSpecs,
+    FusedActivation,
+    PrecisionConfig,
+    matmul,
+)
 from triton_kernels.swiglu import swiglu_fn
 
 HIDDEN_SIZE = 2880
@@ -39,6 +47,7 @@ MXFP4_BLOCK = 32
 GLUON_COMBINE_BLOCK_N = 128
 SWIGLU_ALPHA = 1.702
 SWIGLU_LIMIT = 7.0
+SWIGLU_BETA = 0.0
 W13_ACT_SCALE = 0.125
 W2_ACT_SCALE = 0.125
 # E2M1 codes for 0, +0.5, +1, -0.5, -1.
@@ -467,6 +476,34 @@ def _swiglu_activation() -> FusedActivation:
     )
 
 
+def _swiglu_beta_activation() -> FusedActivation:
+    return FusedActivation(
+        FnSpecs(
+            "swiglu_beta",
+            _swiglu_beta_interleaved_fn,
+            ("alpha", "limit", "beta"),
+            reduction_n=2,
+        ),
+        (SWIGLU_ALPHA, SWIGLU_LIMIT, SWIGLU_BETA),
+    )
+
+
+def _dynamic_mxfp4_precision_config(
+    base_precision_config: Any,
+    activation_scale: torch.Tensor,
+) -> PrecisionConfig:
+    flex_ctx = getattr(base_precision_config, "flex_ctx", None)
+    rhs_data = getattr(flex_ctx, "rhs_data", None) if flex_ctx is not None else None
+    return PrecisionConfig(
+        flex_ctx=FlexCtx(rhs_data=rhs_data) if rhs_data is not None else FlexCtx(),
+        a_mx_scale=activation_scale,
+        a_microblock_size=MXFP4_BLOCK,
+        b_mx_scale=getattr(base_precision_config, "b_mx_scale"),
+        b_microblock_size=MXFP4_BLOCK,
+        out_dtype=torch.bfloat16,
+    )
+
+
 def _compute_triton_reference(
     num_tokens: int,
     weights: Mxfp4Weights,
@@ -585,6 +622,62 @@ def _assert_gluon_matches_triton(
     torch.testing.assert_close(
         gluon_gemm2.float(),
         reference.gemm2_output.float(),
+        atol=GEMM_ATOL,
+        rtol=RTOL,
+    )
+
+
+@requires_gfx950
+@pytest.mark.parametrize("num_tokens", [4, 64])
+@pytest.mark.parametrize("preshuffled", [False, True])
+def test_gluon_dynamic_stage1_a4w4_beta_matches_triton_gfx950(
+    num_tokens: int,
+    preshuffled: bool,
+    mxfp4_weights: Mxfp4WeightVariants,
+) -> None:
+    weights = mxfp4_weights.preshuffled if preshuffled else mxfp4_weights.nonpreshuffled
+    reference_weights = mxfp4_weights.nonpreshuffled
+    hidden_states, router_logits = _make_hidden_and_router(num_tokens)
+
+    ragged_metadata, gather_indx, _scatter_indx, _gate_scal = _routing(
+        router_logits,
+        TOPK,
+        sm_first=False,
+        dtype=router_logits.dtype,
+    )
+    x_quant, token_scales = _quantize_mxfp4_activation(hidden_states)
+
+    reference_pc = _dynamic_mxfp4_precision_config(
+        reference_weights.w13_precision_config,
+        token_scales,
+    )
+    expected = matmul(
+        x_quant,
+        reference_weights.w13_weight,
+        reference_weights.w13_bias,
+        a_ragged_metadata=ragged_metadata,
+        gather_indx=gather_indx,
+        precision_config=reference_pc,
+        fused_activation=_swiglu_beta_activation(),
+    )
+    actual_pc = _dynamic_mxfp4_precision_config(
+        weights.w13_precision_config,
+        token_scales,
+    )
+    actual = gluon_moe.gluon_mxfp_ragged_matmul(
+        x_quant,
+        weights.w13_weight,
+        weights.w13_bias,
+        a_ragged_metadata=ragged_metadata,
+        gather_indx=gather_indx,
+        precision_config=actual_pc,
+        fused_activation=_swiglu_beta_activation(),
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(
+        actual.float(),
+        expected.float(),
         atol=GEMM_ATOL,
         rtol=RTOL,
     )

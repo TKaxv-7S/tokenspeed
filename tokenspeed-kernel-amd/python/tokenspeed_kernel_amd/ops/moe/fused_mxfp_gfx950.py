@@ -319,6 +319,7 @@ def _swiglu_reduce(
     acc,
     alpha: gl.constexpr,
     limit: gl.constexpr,
+    beta: gl.constexpr,
     OUT_BLOCK_N: gl.constexpr,
     MMA: gl.constexpr,
 ):
@@ -334,7 +335,7 @@ def _swiglu_reduce(
         gate = gl.minimum(gate, limit)
         linear = gl.clamp(linear, -limit, limit)
     s = gate / (1.0 + gl.exp(-alpha * gate))
-    return s * (linear + 1.0)
+    return s * (linear + beta)
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +454,8 @@ class MoEConfig:
     SCALE_BLOCK: gl.constexpr
     WITH_X_MX_SCALE: gl.constexpr
     WITH_W_MX_SCALE: gl.constexpr
+    X_SCALE_VIA_LDS: gl.constexpr
+    W_SCALE_VIA_LDS: gl.constexpr
     SCALE_LOAD_MODE: gl.constexpr
     SCALE_VIA_LDS: gl.constexpr
     PRESHUFFLE_FACTOR: gl.constexpr
@@ -510,6 +513,8 @@ class MoEConfig:
         W_PRESHUFFLED=False,
         W_VIA_VGPR=False,
         W_PREFETCH=True,
+        X_SCALE_VIA_LDS=None,
+        W_SCALE_VIA_LDS=None,
     ):
         if SCALE_LOAD_MODE not in _SCALE_LOAD_MODES:
             raise ValueError(
@@ -533,9 +538,19 @@ class MoEConfig:
         self.DTYPE_X = gl.constexpr(DTYPE_X)
         self.DTYPE_W = gl.constexpr(DTYPE_W)
 
-        _scale_via_lds = SCALE_LOAD_MODE == "swizzle" and (
-            WITH_X_MX_SCALE or WITH_W_MX_SCALE
+        _default_x_scale_via_lds = SCALE_LOAD_MODE == "swizzle" and WITH_X_MX_SCALE
+        _default_w_scale_via_lds = SCALE_LOAD_MODE == "swizzle" and WITH_W_MX_SCALE
+        self.X_SCALE_VIA_LDS = gl.constexpr(
+            _default_x_scale_via_lds
+            if X_SCALE_VIA_LDS is None
+            else X_SCALE_VIA_LDS
         )
+        self.W_SCALE_VIA_LDS = gl.constexpr(
+            _default_w_scale_via_lds
+            if W_SCALE_VIA_LDS is None
+            else W_SCALE_VIA_LDS
+        )
+        _scale_via_lds = self.X_SCALE_VIA_LDS or self.W_SCALE_VIA_LDS
         self.SCALE_VIA_LDS = gl.constexpr(_scale_via_lds)
         self.PRESHUFFLE_FACTOR = gl.constexpr(_SCALE_PRESHUFFLE_FACTOR)
         self.BLOCK_M_PRESHUFFLED = gl.constexpr(BLOCK_M // _SCALE_PRESHUFFLE_FACTOR)
@@ -557,11 +572,10 @@ class MoEConfig:
         num_loads = 1  # x
         if not W_VIA_VGPR:
             num_loads += 1  # w (LDS path)
-        if _scale_via_lds:
-            if WITH_X_MX_SCALE:
-                num_loads += 1
-            if WITH_W_MX_SCALE:
-                num_loads += 1
+        if self.X_SCALE_VIA_LDS:
+            num_loads += 1
+        if self.W_SCALE_VIA_LDS:
+            num_loads += 1
         self.NUM_LOADS_IN_BATCH = gl.constexpr(num_loads)
 
         BLOCK_K_SCALE = BLOCK_K // SCALE_BLOCK
@@ -726,15 +740,14 @@ class MoEProgramBase:
             self.w_desc.issue_async_load(
                 load_idx, self.w_buffer, pred, USE_MASK=USE_MASK
             )
-        if cfg.SCALE_VIA_LDS:
-            if cfg.WITH_X_MX_SCALE:
-                self.x_scale_desc.issue_async_load(
-                    load_idx, self.x_scale_buffer, pred, USE_MASK=USE_MASK
-                )
-            if cfg.WITH_W_MX_SCALE:
-                self.w_scale_desc.issue_async_load(
-                    load_idx, self.w_scale_buffer, pred, USE_MASK=USE_MASK
-                )
+        if cfg.X_SCALE_VIA_LDS:
+            self.x_scale_desc.issue_async_load(
+                load_idx, self.x_scale_buffer, pred, USE_MASK=USE_MASK
+            )
+        if cfg.W_SCALE_VIA_LDS:
+            self.w_scale_desc.issue_async_load(
+                load_idx, self.w_scale_buffer, pred, USE_MASK=USE_MASK
+            )
         return load_idx + 1
 
     @gluon.jit
@@ -1168,14 +1181,10 @@ class MoEPipelinedProgram:
         self.x_buffer = x_buffer
         self.w_buffer = w_buffer if not cfg.W_VIA_VGPR else gl.constexpr(0)
         self.x_scale_buffer = (
-            x_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE)
-            else gl.constexpr(0)
+            x_scale_buffer if cfg.X_SCALE_VIA_LDS else gl.constexpr(0)
         )
         self.w_scale_buffer = (
-            w_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE)
-            else gl.constexpr(0)
+            w_scale_buffer if cfg.W_SCALE_VIA_LDS else gl.constexpr(0)
         )
         self.x_desc = x_desc
         self.w_desc = w_desc
@@ -1215,7 +1224,7 @@ class MoEPipelinedProgram:
                 layout=cfg.shared_layout_w,
             )
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE:
+        if cfg.X_SCALE_VIA_LDS:
             x_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -1228,7 +1237,7 @@ class MoEPipelinedProgram:
         else:
             x_scale_buffer = gl.constexpr(0)
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE:
+        if cfg.W_SCALE_VIA_LDS:
             w_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -1308,7 +1317,7 @@ class MoEPipelinedProgram:
         BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
         if cfg.USE_MFMA_SCALED:
             if cfg.WITH_X_MX_SCALE:
-                if cfg.SCALE_VIA_LDS:
+                if cfg.X_SCALE_VIA_LDS:
                     scale_x = self.x_scale_desc.issue_local_load_unswizzle(
                         mfma_idx,
                         self.x_scale_buffer,
@@ -1327,7 +1336,7 @@ class MoEPipelinedProgram:
                     layout=cfg.layout_x_scale,
                 )
             if cfg.WITH_W_MX_SCALE:
-                if cfg.SCALE_VIA_LDS:
+                if cfg.W_SCALE_VIA_LDS:
                     scale_w = self.w_scale_desc.issue_local_load_unswizzle(
                         mfma_idx,
                         self.w_scale_buffer,
@@ -1359,7 +1368,7 @@ class MoEPipelinedProgram:
 
         if cfg.USE_MFMA_SCALED:
             if cfg.WITH_X_MX_SCALE:
-                if cfg.SCALE_VIA_LDS:
+                if cfg.X_SCALE_VIA_LDS:
                     scale_x = self.x_scale_desc.issue_local_load_unswizzle(
                         mfma_idx,
                         self.x_scale_buffer,
@@ -1379,7 +1388,7 @@ class MoEPipelinedProgram:
                 )
 
             if cfg.WITH_W_MX_SCALE:
-                if cfg.SCALE_VIA_LDS:
+                if cfg.W_SCALE_VIA_LDS:
                     scale_w = self.w_scale_desc.issue_local_load_unswizzle(
                         mfma_idx,
                         self.w_scale_buffer,
@@ -1646,12 +1655,12 @@ class MoESliceMNProgram:
         self.w_buffer_right = w_buffer_right
         self.x_scale_buffer = (
             x_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE)
+            if (cfg.X_SCALE_VIA_LDS)
             else gl.constexpr(0)
         )
         self.w_scale_buffer = (
             w_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE)
+            if (cfg.W_SCALE_VIA_LDS)
             else gl.constexpr(0)
         )
         self.x_desc_top = x_desc_top
@@ -1705,7 +1714,7 @@ class MoESliceMNProgram:
             layout=cfg.shared_layout_w_half_n,
         )
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE:
+        if cfg.X_SCALE_VIA_LDS:
             x_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -1718,7 +1727,7 @@ class MoESliceMNProgram:
         else:
             x_scale_buffer = gl.constexpr(0)
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE:
+        if cfg.W_SCALE_VIA_LDS:
             w_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -1840,23 +1849,22 @@ class MoESliceMNProgram:
         self.x_desc_top.issue_async_load(
             load_idx, self.x_buffer_top, pred, USE_MASK=USE_MASK, COMMIT=0
         )
-        if cfg.SCALE_VIA_LDS:
-            if cfg.WITH_X_MX_SCALE:
-                self.x_scale_desc.issue_async_load(
-                    load_idx,
-                    self.x_scale_buffer,
-                    pred,
-                    USE_MASK=USE_MASK,
-                    COMMIT=0,
-                )
-            if cfg.WITH_W_MX_SCALE:
-                self.w_scale_desc.issue_async_load(
-                    load_idx,
-                    self.w_scale_buffer,
-                    pred,
-                    USE_MASK=USE_MASK,
-                    COMMIT=0,
-                )
+        if cfg.X_SCALE_VIA_LDS:
+            self.x_scale_desc.issue_async_load(
+                load_idx,
+                self.x_scale_buffer,
+                pred,
+                USE_MASK=USE_MASK,
+                COMMIT=0,
+            )
+        if cfg.W_SCALE_VIA_LDS:
+            self.w_scale_desc.issue_async_load(
+                load_idx,
+                self.w_scale_buffer,
+                pred,
+                USE_MASK=USE_MASK,
+                COMMIT=0,
+            )
         gl.amd.cdna4.async_copy.commit_group()
         return load_idx
 
@@ -2076,12 +2084,12 @@ class MoESliceNProgram:
         self.w_buffer_bot = w_buffer_bot if not cfg.W_VIA_VGPR else gl.constexpr(0)
         self.x_scale_buffer = (
             x_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE)
+            if (cfg.X_SCALE_VIA_LDS)
             else gl.constexpr(0)
         )
         self.w_scale_buffer = (
             w_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE)
+            if (cfg.W_SCALE_VIA_LDS)
             else gl.constexpr(0)
         )
         self.x_desc = x_desc
@@ -2153,7 +2161,7 @@ class MoESliceNProgram:
                 layout=cfg.shared_layout_w_half_n,
             )
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE:
+        if cfg.X_SCALE_VIA_LDS:
             x_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -2166,7 +2174,7 @@ class MoESliceNProgram:
         else:
             x_scale_buffer = gl.constexpr(0)
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE:
+        if cfg.W_SCALE_VIA_LDS:
             w_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -2216,7 +2224,7 @@ class MoESliceNProgram:
 
         if cfg.USE_MFMA_SCALED:
             if cfg.WITH_X_MX_SCALE:
-                if cfg.SCALE_VIA_LDS:
+                if cfg.X_SCALE_VIA_LDS:
                     scale_x = self.x_scale_desc.issue_local_load_unswizzle(
                         mfma_idx,
                         self.x_scale_buffer,
@@ -2246,23 +2254,22 @@ class MoESliceNProgram:
         self.x_desc.issue_async_load(
             load_idx, self.x_buffer, pred, USE_MASK=USE_MASK, COMMIT=0
         )
-        if cfg.SCALE_VIA_LDS:
-            if cfg.WITH_X_MX_SCALE:
-                self.x_scale_desc.issue_async_load(
-                    load_idx,
-                    self.x_scale_buffer,
-                    pred,
-                    USE_MASK=USE_MASK,
-                    COMMIT=0,
-                )
-            if cfg.WITH_W_MX_SCALE:
-                self.w_scale_desc.issue_async_load(
-                    load_idx,
-                    self.w_scale_buffer,
-                    pred,
-                    USE_MASK=USE_MASK,
-                    COMMIT=0,
-                )
+        if cfg.X_SCALE_VIA_LDS:
+            self.x_scale_desc.issue_async_load(
+                load_idx,
+                self.x_scale_buffer,
+                pred,
+                USE_MASK=USE_MASK,
+                COMMIT=0,
+            )
+        if cfg.W_SCALE_VIA_LDS:
+            self.w_scale_desc.issue_async_load(
+                load_idx,
+                self.w_scale_buffer,
+                pred,
+                USE_MASK=USE_MASK,
+                COMMIT=0,
+            )
         if not cfg.W_VIA_VGPR:
             self.w_desc_top.issue_async_load(
                 load_idx, self.w_buffer_top, pred, USE_MASK=USE_MASK, COMMIT=0
@@ -3717,12 +3724,15 @@ def _pipelined_moe_tile_compute(
     DO_SWIGLU: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
+    SWIGLU_BETA: gl.constexpr,
     OUT_BLOCK_N: gl.constexpr,
     APPLY_GATE_SCAL: gl.constexpr,
     HAS_RAGGED_OFFS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     SCALE_LOAD_MODE: gl.constexpr,
+    X_SCALE_VIA_LDS: gl.constexpr,
+    W_SCALE_VIA_LDS: gl.constexpr,
     W_TRANSPOSE: gl.constexpr = False,
     NUM_SUBTILES: gl.constexpr = (1, 1, 1),
     EVEN_K: gl.constexpr = True,
@@ -3791,6 +3801,8 @@ def _pipelined_moe_tile_compute(
         W_PRESHUFFLED=W_PRESHUFFLED,
         W_VIA_VGPR=W_VIA_VGPR,
         W_PREFETCH=W_PREFETCH,
+        X_SCALE_VIA_LDS=X_SCALE_VIA_LDS,
+        W_SCALE_VIA_LDS=W_SCALE_VIA_LDS,
     )
     BLOCK_K_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
     BLOCK_K_W: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
@@ -3844,10 +3856,10 @@ def _pipelined_moe_tile_compute(
     k_limit_x = gl.multiple_of(K // cfg.DIV_FACTOR_X, 16)
     k_limit_w = gl.multiple_of(K // cfg.DIV_FACTOR_W, 16)
 
-    # SCALE_VIA_LDS uses post-swizzle HBM shape via buffer_load_to_shared;
-    # other modes load scales G->VGPR via gl.load.
+    # W scales use the CDNA4 post-swizzle HBM shape. A scales stay in logical
+    # row/K-group order; upstream Triton also loads CDNA4 A scales directly.
     if HAS_X_BLOCK_SCALE:
-        if cfg.SCALE_VIA_LDS:
+        if cfg.X_SCALE_VIA_LDS:
             BLOCK_M_PS: gl.constexpr = cfg.BLOCK_M_PRESHUFFLED
             BLOCK_K_S_PS: gl.constexpr = cfg.BLOCK_K_SCALE_PRESHUFFLED
             LX_S: gl.constexpr = cfg.load_layout_x_scale
@@ -3855,7 +3867,14 @@ def _pipelined_moe_tile_compute(
             offs_xs_k = gl.arange(0, BLOCK_K_S_PS, layout=gl.SliceLayout(0, LX_S))
             row_base_x_s = off_m // cfg.PRESHUFFLE_FACTOR
             rows_m_scale = row_base_x_s + offs_xs_m
-            row_limit_x_s = (M_X + cfg.PRESHUFFLE_FACTOR - 1) // cfg.PRESHUFFLE_FACTOR
+            if HAS_GATHER:
+                row_limit_x_s = (
+                    M + cfg.PRESHUFFLE_FACTOR - 1
+                ) // cfg.PRESHUFFLE_FACTOR
+            else:
+                row_limit_x_s = (
+                    M_X + cfg.PRESHUFFLE_FACTOR - 1
+                ) // cfg.PRESHUFFLE_FACTOR
             # Suppress the K-mask: the swizzle packs K with N so a
             # K-mask on the packed column scrambles both. The host
             # pads with e8m0=0 and the W K-mask zeros the OOB product
@@ -3884,7 +3903,10 @@ def _pipelined_moe_tile_compute(
             )
             rows_m_scale = off_m + offs_xs_m
             if HAS_GATHER:
-                rows_m_scale = rows_m
+                rows_m_scale = gl.convert_layout(
+                    rows_m,
+                    gl.SliceLayout(1, cfg.layout_x_scale),
+                )
             x_scale_desc = AsyncCopyDescriptor.initialize(
                 cfg,
                 0,
@@ -3901,7 +3923,7 @@ def _pipelined_moe_tile_compute(
         x_scale_desc: gl.constexpr = 0
 
     if HAS_W_BLOCK_SCALE:
-        if cfg.SCALE_VIA_LDS:
+        if cfg.W_SCALE_VIA_LDS:
             BLOCK_N_PS: gl.constexpr = cfg.BLOCK_N_PRESHUFFLED
             BLOCK_K_S_PS_W: gl.constexpr = cfg.BLOCK_K_SCALE_PRESHUFFLED
             LW_S: gl.constexpr = cfg.load_layout_w_scale
@@ -4119,7 +4141,12 @@ def _pipelined_moe_tile_compute(
 
     if DO_SWIGLU:
         out = _swiglu_reduce(
-            acc, SWIGLU_ALPHA, SWIGLU_LIMIT, OUT_BLOCK_N, cfg.acc_layout
+            acc,
+            SWIGLU_ALPHA,
+            SWIGLU_LIMIT,
+            SWIGLU_BETA,
+            OUT_BLOCK_N,
+            cfg.acc_layout,
         )
         if HAS_FP8_QUANT_OUT:
             scale = gl.load(out_quant_scale_ptr).to(gl.float32)
@@ -4381,6 +4408,7 @@ def _medium_decode_body(
     HAS_BIAS: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
+    SWIGLU_BETA: gl.constexpr,
     Y_N_CONST: gl.constexpr,
     MEDIUM_COMBINE: gl.constexpr,
 ):
@@ -4606,7 +4634,12 @@ def _medium_decode_body(
             acc = acc + bias[None, :]
 
         out = _swiglu_reduce(
-            acc, SWIGLU_ALPHA, SWIGLU_LIMIT, OUT_BLOCK_N, cfg.acc_layout
+            acc,
+            SWIGLU_ALPHA,
+            SWIGLU_LIMIT,
+            SWIGLU_BETA,
+            OUT_BLOCK_N,
+            cfg.acc_layout,
         )
         out_inv_scale = 1.0 / gl.load(out_quant_scale_ptr).to(gl.float32)
         out = (out * out_inv_scale).to(Y.dtype.element_ty)
@@ -4692,12 +4725,15 @@ def _pipelined_moe_kernel_scaled(
     DO_SWIGLU: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
+    SWIGLU_BETA: gl.constexpr,
     OUT_BLOCK_N: gl.constexpr,
     APPLY_GATE_SCAL: gl.constexpr,
     HAS_RAGGED_OFFS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     SCALE_LOAD_MODE: gl.constexpr,
+    X_SCALE_VIA_LDS: gl.constexpr = True,
+    W_SCALE_VIA_LDS: gl.constexpr = True,
     W_TRANSPOSE: gl.constexpr = False,
     NUM_SUBTILES: gl.constexpr = (1, 1, 1),
     EVEN_K: gl.constexpr = True,
@@ -4768,6 +4804,7 @@ def _pipelined_moe_kernel_scaled(
             HAS_BIAS=HAS_BIAS,
             SWIGLU_ALPHA=SWIGLU_ALPHA,
             SWIGLU_LIMIT=SWIGLU_LIMIT,
+            SWIGLU_BETA=SWIGLU_BETA,
             Y_N_CONST=Y_N_CONST,
             MEDIUM_COMBINE=MEDIUM_COMBINE,
         )
@@ -4855,12 +4892,15 @@ def _pipelined_moe_kernel_scaled(
             DO_SWIGLU=DO_SWIGLU,
             SWIGLU_ALPHA=SWIGLU_ALPHA,
             SWIGLU_LIMIT=SWIGLU_LIMIT,
+            SWIGLU_BETA=SWIGLU_BETA,
             OUT_BLOCK_N=OUT_BLOCK_N,
             APPLY_GATE_SCAL=APPLY_GATE_SCAL,
             HAS_RAGGED_OFFS=HAS_RAGGED_OFFS,
             NUM_WARPS=NUM_WARPS,
             NUM_BUFFERS=NUM_BUFFERS,
             SCALE_LOAD_MODE=SCALE_LOAD_MODE,
+            X_SCALE_VIA_LDS=X_SCALE_VIA_LDS,
+            W_SCALE_VIA_LDS=W_SCALE_VIA_LDS,
             W_TRANSPOSE=W_TRANSPOSE,
             NUM_SUBTILES=NUM_SUBTILES,
             EVEN_K=EVEN_K,
@@ -5045,7 +5085,7 @@ def _launch_kernel(
     scatter_indx,
     gate_scal: torch.Tensor | None,
     a_ragged_metadata,
-    swiglu: tuple[float, float] | None,
+    swiglu: tuple[float, float, float] | None,
     out_block_n: int,
     block_m: int,
     block_n: int,
@@ -5107,7 +5147,9 @@ def _launch_kernel(
         block_n,
         block_k,
         scale_block=32,
-        has_x_scale=has_x_block_scale,
+        # A scales are loaded directly below even when W uses CDNA4 swizzled
+        # scales, so only W scales impose the swizzle tile constraints here.
+        has_x_scale=False,
         has_w_scale=has_w_block_scale,
         k=K,
         x_format=x_format,
@@ -5251,6 +5293,7 @@ def _launch_kernel(
 
     swiglu_alpha = swiglu[0] if swiglu is not None else 0.0
     swiglu_limit = swiglu[1] if swiglu is not None else 0.0
+    swiglu_beta = swiglu[2] if swiglu is not None and len(swiglu) > 2 else 1.0
 
     w3 = w if w.ndim == 3 else w.unsqueeze(0)
 
@@ -5279,10 +5322,13 @@ def _launch_kernel(
         stride_wse = stride_wsn = stride_wsk = 0
         w_scale_buf = _make_dummy(x.device, torch.uint8)
 
-    x_scale_proc = (
-        _preprocess_scale(x_scale, scale_load_mode) if has_x_block_scale else None
-    )
-    stride_xsm, stride_xsk = _scale_strides(x_scale_proc, scale_load_mode)
+    # CDNA4 swizzled scale layout is a W-scale layout. A scales are loaded
+    # directly in logical row/K-group order, matching upstream Triton matmul.
+    x_scale_via_lds = False
+    w_scale_via_lds = has_w_block_scale and scale_load_mode == "swizzle"
+    x_scale_mode = "transpose" if has_x_block_scale else scale_load_mode
+    x_scale_proc = _preprocess_scale(x_scale, x_scale_mode) if has_x_block_scale else None
+    stride_xsm, stride_xsk = _scale_strides(x_scale_proc, x_scale_mode)
 
     x_scale_buf = (
         x_scale_proc if x_scale_proc is not None else _make_dummy(x.device, torch.uint8)
@@ -5394,12 +5440,15 @@ def _launch_kernel(
         DO_SWIGLU=swiglu is not None,
         SWIGLU_ALPHA=float(swiglu_alpha),
         SWIGLU_LIMIT=float(swiglu_limit),
+        SWIGLU_BETA=float(swiglu_beta),
         OUT_BLOCK_N=out_block_n,
         APPLY_GATE_SCAL=gate_scal is not None,
         HAS_RAGGED_OFFS=has_ragged_offs,
         NUM_WARPS=num_warps,
         NUM_BUFFERS=num_buffers,
         SCALE_LOAD_MODE=scale_load_mode,
+        X_SCALE_VIA_LDS=x_scale_via_lds,
+        W_SCALE_VIA_LDS=w_scale_via_lds,
         W_TRANSPOSE=w_transpose,
         NUM_SUBTILES=NUM_SUBTILES,
         EVEN_K=EVEN_K,
@@ -5912,6 +5961,7 @@ def gluon_mxfp_dispatch_swiglu(
     out_dtype: torch.dtype = torch.bfloat16,
     swiglu_alpha: float = 1.0,
     swiglu_limit: float = 0.0,
+    swiglu_beta: float = 1.0,
     block_m: int | None = None,
     block_n: int | None = None,
     block_k: int | None = None,
@@ -6054,7 +6104,7 @@ def gluon_mxfp_dispatch_swiglu(
         scatter_indx=None,
         gate_scal=None,
         a_ragged_metadata=a_ragged_metadata,
-        swiglu=(float(swiglu_alpha), float(swiglu_limit)),
+        swiglu=(float(swiglu_alpha), float(swiglu_limit), float(swiglu_beta)),
         out_block_n=out_block_n,
         block_m=block_m,
         block_n=block_n,
@@ -6363,20 +6413,21 @@ def _extract_gluon_raw_s(s):
 
 
 def _maybe_extract_swiglu_args(fused_activation):
-    """Pull ``(alpha, limit)`` from an upstream ``FusedActivation`` object
+    """Pull ``(alpha, limit, beta)`` from an upstream ``FusedActivation`` object
     representing SwiGLU. Returns ``None`` for any other activation."""
     if fused_activation is None:
         return None
     specs = getattr(fused_activation, "specs", None)
     fn_name = getattr(specs, "name", None) if specs is not None else None
-    if fn_name != "swiglu":
+    if fn_name not in {"swiglu", "swiglu_beta"}:
         return None
     args = getattr(fused_activation, "fn_args", None)
     if args is None:
         args = getattr(fused_activation, "args", None)
     if args is None or len(args) < 2:
         return None
-    return float(args[0]), float(args[1])
+    beta = float(args[2]) if fn_name == "swiglu_beta" and len(args) >= 3 else 1.0
+    return float(args[0]), float(args[1]), beta
 
 
 def _global_scale_passthrough(scale):
@@ -6465,7 +6516,7 @@ def gluon_mxfp_ragged_matmul(
     has_scatter = scatter_indx is not None
 
     if fused_activation is not None:
-        assert swiglu_args is not None, "SwiGLU activation requires swiglu_args"
+        assert swiglu_args is not None, "SwiGLU activation requires swiglu args"
 
     gammas = extra_kwargs.get("gammas")
     out_quant_scale = extra_kwargs.get("out_quant_scale")
@@ -6494,7 +6545,7 @@ def gluon_mxfp_ragged_matmul(
         return out
 
     if not has_scatter and swiglu_args is not None:
-        swiglu_alpha, swiglu_limit = swiglu_args
+        swiglu_alpha, swiglu_limit, swiglu_beta = swiglu_args
         w_preshuffle = bool(getattr(w_raw, "is_shuffled_for_gluon_dot", False))
         out = gluon_mxfp_dispatch_swiglu(
             x_view,
@@ -6509,6 +6560,7 @@ def gluon_mxfp_ragged_matmul(
             out_dtype=out_dtype,
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
+            swiglu_beta=swiglu_beta,
             scale_load_mode="swizzle",
             w_transpose=True,
             out_quant_scale=out_quant_scale,
@@ -7412,7 +7464,14 @@ def _warp_decode_stage1_coop_compute(
         )
         acc = acc + bias[None, :].to(gl.float32)
 
-    out = _swiglu_reduce(acc, SWIGLU_ALPHA, SWIGLU_LIMIT, OUT_BLOCK_N, cfg.acc_layout)
+    out = _swiglu_reduce(
+        acc,
+        SWIGLU_ALPHA,
+        SWIGLU_LIMIT,
+        1.0,
+        OUT_BLOCK_N,
+        cfg.acc_layout,
+    )
     out_inv_scale = 1.0 / gl.load(out_quant_scale_ptr).to(gl.float32)
     out = (out * out_inv_scale).to(Y.dtype.element_ty)
     STORE_LAYOUT: gl.constexpr = out.type.layout
