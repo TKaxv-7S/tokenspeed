@@ -25,6 +25,7 @@ from tokenspeed.runtime.models.glm5 import (
 from tokenspeed.runtime.models.glm5_nextn import (
     GlmMoeDsaDraftDecoderLayer,
     GlmMoeDsaForCausalLMNextN,
+    GlmMoeDsaModelNextN,
 )
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeConfig,
@@ -262,6 +263,75 @@ def test_glm_nextn_draft_first_step_uses_reduced_collectives():
     assert should_reduce_draft_first_step(object(), ForwardMode.DECODE)
     assert not should_keep_full_dsa_topk_for_draft_first_step(object())
     assert not should_reduce_draft_first_step(object(), ForwardMode.TARGET_VERIFY)
+
+
+def test_glm_nextn_preserves_real_position_zero_embedding():
+    model = GlmMoeDsaModelNextN.__new__(GlmMoeDsaModelNextN)
+    torch.nn.Module.__init__(model)
+
+    embeddings = torch.tensor(
+        [
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 6.0],
+        ]
+    )
+    captured_hidden_states = torch.tensor(
+        [
+            [10.0, 20.0, 30.0],
+            [40.0, 50.0, 60.0],
+        ]
+    )
+
+    class Embed(torch.nn.Module):
+        def forward(self, input_ids):
+            return embeddings.index_select(0, input_ids.to(torch.int64))
+
+    class IdentityNorm(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states
+
+    class CaptureEhProj(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.seen = None
+
+        def forward(self, hidden_states):
+            self.seen = hidden_states.clone()
+            return hidden_states[:, : embeddings.shape[1]].clone()
+
+    class Decoder(torch.nn.Module):
+        def forward(self, positions, hidden_states, ctx, out_cache_loc, residual):
+            return hidden_states, residual
+
+    eh_proj = CaptureEhProj()
+    model.embed_tokens = Embed()
+    model.enorm = IdentityNorm()
+    model.hnorm = IdentityNorm()
+    model.eh_proj = eh_proj
+    model.decoder = Decoder()
+    model.shared_head = torch.nn.Module()
+    model.shared_head.norm = IdentityNorm()
+
+    ctx = ForwardContext(
+        attn_backend=SimpleNamespace(),
+        token_to_kv_pool=None,
+        bs=2,
+        num_extends=0,
+        input_num_tokens=2,
+        forward_mode=ForwardMode.IDLE,
+    )
+
+    model.forward(
+        input_ids=torch.tensor([0, 1], dtype=torch.int32),
+        positions=torch.tensor([0, 1], dtype=torch.int64),
+        ctx=ctx,
+        out_cache_loc=torch.tensor([0, 1], dtype=torch.int32),
+        captured_hidden_states=captured_hidden_states,
+    )
+
+    assert eh_proj.seen is not None
+    assert torch.equal(eh_proj.seen[:, : embeddings.shape[1]], embeddings)
+    assert torch.equal(eh_proj.seen[:, embeddings.shape[1] :], captured_hidden_states)
 
 
 def test_glm_nextn_first_step_correction_refreshes_dsa_metadata():

@@ -153,7 +153,6 @@ class GlmMoeDsaModelNextN(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-        hidden_states = torch.where(positions.unsqueeze(-1) == 0, 0, hidden_states)
         if captured_hidden_states is None:
             if not ctx.forward_mode.is_idle():
                 raise ValueError("GLM5 NextN requires captured_hidden_states.")

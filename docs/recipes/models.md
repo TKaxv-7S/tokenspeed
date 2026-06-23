@@ -38,7 +38,9 @@ only if the model card requires a different value.
 GLM5 launches usually need remote code, long context, expert parallelism, FP8 KV
 cache, and the TRTLLM MoE backend. GLM5.2 FP8 is available on Hugging Face as
 `zai-org/GLM-5.2-FP8`. TokenSpeed defaults the reasoning parser to `glm45`;
-pass an explicit parser flag to override it.
+pass an explicit parser flag to override it. When MTP is enabled, GLM NextN keeps
+the real position-0 prompt embedding in the draft KV path to match the checkpoint
+semantics used by SGLang.
 
 ```bash
 tokenspeed serve zai-org/GLM-5.2-FP8 \
