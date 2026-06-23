@@ -11,7 +11,7 @@ from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.drafter import eagle as eagle_module
 from tokenspeed.runtime.execution.drafter.eagle import (
     Eagle,
-    should_keep_full_dsa_topk_for_draft_first_step,
+    should_compute_dsa_topk_for_draft_first_step,
     should_reduce_draft_first_step,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -258,10 +258,10 @@ def test_glm_nextn_draft_first_step_uses_reduced_collectives():
     model = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
 
     assert should_reduce_draft_first_step(model, ForwardMode.TARGET_VERIFY)
-    assert should_keep_full_dsa_topk_for_draft_first_step(model)
+    assert should_compute_dsa_topk_for_draft_first_step(model)
     assert not should_reduce_draft_first_step(model, ForwardMode.IDLE)
     assert should_reduce_draft_first_step(object(), ForwardMode.DECODE)
-    assert not should_keep_full_dsa_topk_for_draft_first_step(object())
+    assert not should_compute_dsa_topk_for_draft_first_step(object())
     assert not should_reduce_draft_first_step(object(), ForwardMode.TARGET_VERIFY)
 
 
@@ -535,7 +535,7 @@ def test_glm_nextn_decode_first_step_keeps_full_verify_window():
     assert logits_output.next_token_logits.shape == (2, 8)
 
 
-def test_eagle_glm_first_step_reuses_full_target_dsa_decode_topk():
+def test_eagle_glm_first_step_computes_draft_dsa_decode_topk_before_reuse():
     eagle = Eagle.__new__(Eagle)
     eagle.spec_num_tokens = 6
     eagle.input_buffers = SimpleNamespace(
@@ -551,12 +551,18 @@ def test_eagle_glm_first_step_reuses_full_target_dsa_decode_topk():
     eagle.draft_seq_lens_buf = torch.zeros((2,), dtype=torch.int32)
     draft_model = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
     seen = {}
+    draft_decode_topk = GlmDsaDecodeTopK(
+        topk_indices=(1000 + torch.arange(12 * 3, dtype=torch.int32)).view(12, 3),
+        topk_lens=100 + torch.arange(12, dtype=torch.int32),
+    )
 
     class Runner:
         model = draft_model
 
         def forward(self, **kwargs):
             seen.update(kwargs)
+            seen["initial_ctx_dsa_decode_topk"] = kwargs["ctx"].dsa_decode_topk
+            kwargs["ctx"].dsa_decode_topk = draft_decode_topk
             return SimpleNamespace(
                 hidden_states=torch.empty((2, 4)),
                 next_token_logits=torch.empty((2, 8)),
@@ -582,14 +588,14 @@ def test_eagle_glm_first_step_reuses_full_target_dsa_decode_topk():
 
     logits_output, dsa_topk = eagle._run_first_step(2, draft_input)
 
-    assert seen["ctx"].dsa_decode_topk is full_decode_topk
+    assert seen["initial_ctx_dsa_decode_topk"] is None
     assert seen["ctx"].gather_ids.tolist() == [0, 9]
     selected = dsa_topk[1]
-    assert selected is not full_decode_topk
-    assert selected.topk_lens.tolist() == [0, 9]
+    assert selected is not draft_decode_topk
+    assert selected.topk_lens.tolist() == [100, 109]
     assert selected.topk_indices.tolist() == [
-        full_decode_topk.topk_indices[0].tolist(),
-        full_decode_topk.topk_indices[9].tolist(),
+        draft_decode_topk.topk_indices[0].tolist(),
+        draft_decode_topk.topk_indices[9].tolist(),
     ]
     assert logits_output.next_token_logits.shape == (2, 8)
 

@@ -40,7 +40,8 @@ cache, and the TRTLLM MoE backend. GLM5.2 FP8 is available on Hugging Face as
 `zai-org/GLM-5.2-FP8`. TokenSpeed defaults the reasoning parser to `glm45`;
 pass an explicit parser flag to override it. When MTP is enabled, GLM NextN keeps
 the real position-0 prompt embedding in the draft KV path to match the checkpoint
-semantics used by SGLang.
+semantics used by SGLang. For DSA MTP, the first draft step computes NextN's own
+indexer top-k and only reuses draft-produced top-k across later MTP iterations.
 
 ```bash
 tokenspeed serve zai-org/GLM-5.2-FP8 \

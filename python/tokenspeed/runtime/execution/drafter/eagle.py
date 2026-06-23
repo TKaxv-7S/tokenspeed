@@ -51,7 +51,7 @@ _DRAFT_FIRST_STEP_REDUCE_MODELS = (
     LlamaForCausalLMEagle3,
     Qwen3_5ForConditionalGenerationNextN,
 )
-_DRAFT_FIRST_STEP_FULL_TOPK_MODELS = (GlmMoeDsaForCausalLMNextN,)
+_DRAFT_FIRST_STEP_COMPUTE_DSA_TOPK_MODELS = (GlmMoeDsaForCausalLMNextN,)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
@@ -75,8 +75,8 @@ def should_reduce_draft_first_step(model: Any, forward_mode: ForwardMode) -> boo
     )
 
 
-def should_keep_full_dsa_topk_for_draft_first_step(model: Any) -> bool:
-    return isinstance(model, _DRAFT_FIRST_STEP_FULL_TOPK_MODELS)
+def should_compute_dsa_topk_for_draft_first_step(model: Any) -> bool:
+    return isinstance(model, _DRAFT_FIRST_STEP_COMPUTE_DSA_TOPK_MODELS)
 
 
 @dataclass
@@ -318,12 +318,16 @@ class Eagle(BaseDrafter):
         dsa_topk = draft_input.dsa_topk
         select_dsa_topk_for_next_step = False
         if draft_input.num_extends == 0:
-            if not should_keep_full_dsa_topk_for_draft_first_step(
+            if should_compute_dsa_topk_for_draft_first_step(
                 self.draft_model_runner.model
             ):
-                dsa_topk = self._select_dsa_decode_topk(dsa_topk, gather_ids)
-            else:
+                # GLM NextN has its own indexer weights. Match SGLang by
+                # computing the first draft step's top-k in the draft model,
+                # then reusing draft-produced top-k for later MTP iterations.
+                dsa_topk = (None, None)
                 select_dsa_topk_for_next_step = True
+            else:
+                dsa_topk = self._select_dsa_decode_topk(dsa_topk, gather_ids)
         else:
             dsa_topk = (None, None)
         self._attach_dsa_topk(ctx, dsa_topk)
