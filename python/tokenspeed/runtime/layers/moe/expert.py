@@ -26,7 +26,11 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.layers.activation import SwigluArg
-from tokenspeed.runtime.layers.moe.topk import TopKOutput, TopKOutputFormat
+from tokenspeed.runtime.layers.moe.topk import (
+    BackendRoutingConfig,
+    TopKOutput,
+    TopKOutputFormat,
+)
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.utils import (
     RoutingMethodType,
@@ -61,7 +65,7 @@ class MoELayer(torch.nn.Module):
         swiglu_beta: float | None = None,
         w13_input_layout: str = "concatenated",
         with_bias=False,
-        routing_config: dict = {},
+        routing_config: dict | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -125,9 +129,12 @@ class MoELayer(torch.nn.Module):
         )
 
         # Routing config
-        self.routing_config = routing_config
-        self._correction_bias = routing_config.get("correction_bias", None)
-        self._routing_method_type = routing_config.get(
+        self.routing_config = dict(routing_config or {})
+        self.backend_routing_config = BackendRoutingConfig.from_dict(
+            self.routing_config.get("backend_routing")
+        )
+        self._correction_bias = self.routing_config.get("correction_bias", None)
+        self._routing_method_type = self.routing_config.get(
             "routing_method_type", RoutingMethodType.DeepSeekV3
         )
         self._routing_logits_dtype = torch.bfloat16
@@ -136,9 +143,11 @@ class MoELayer(torch.nn.Module):
             RoutingMethodType.MiniMax2,
         ):
             self._routing_logits_dtype = torch.float32
-        self._n_group = routing_config.get("n_group", 0)
-        self._topk_group = routing_config.get("topk_group", 0)
-        self._routed_scaling_factor = routing_config.get("routed_scaling_factor", 1.0)
+        self._n_group = self.routing_config.get("n_group", 0)
+        self._topk_group = self.routing_config.get("topk_group", 0)
+        self._routed_scaling_factor = self.routing_config.get(
+            "routed_scaling_factor", 1.0
+        )
 
         # Quantization config
         self._quant_kind = "unquant"
@@ -173,19 +182,36 @@ class MoELayer(torch.nn.Module):
         # Moe Backend plan
         moe_backend = get_moe_backend().value
         moe_backend = None if moe_backend == "auto" else moe_backend
-        self.plan = tokenspeed_kernel.moe_plan(
-            self._quant_kind,
-            input_dtype=input_dtype,
-            activation=self.activation,
-            a2a_backend=self._spec.a2a_backend,
-            ep_size=self.ep_size,
-            ispp=self.intermediate_size // self.tp_size,
-            fp8_scale_block_shape=fp8_scale_block_shape,
-            internal_activation_dtype=internal_activation_dtype,
-            with_bias=with_bias,
-            deepep_group=deepep_group,
-            solution=moe_backend,
-        )
+        plan_kwargs = {
+            "input_dtype": input_dtype,
+            "activation": self.activation,
+            "a2a_backend": self._spec.a2a_backend,
+            "ep_size": self.ep_size,
+            "ispp": self.intermediate_size // self.tp_size,
+            "fp8_scale_block_shape": fp8_scale_block_shape,
+            "internal_activation_dtype": internal_activation_dtype,
+            "with_bias": with_bias,
+            "deepep_group": deepep_group,
+            "solution": moe_backend,
+        }
+        if self.backend_routing_config is not None:
+            try:
+                self.plan = tokenspeed_kernel.moe_plan(
+                    self._quant_kind,
+                    routing_config=self.backend_routing_config.as_kernel_config(),
+                    **plan_kwargs,
+                )
+            except tokenspeed_kernel.NoKernelFoundError:
+                self.backend_routing_config = None
+                self.plan = tokenspeed_kernel.moe_plan(
+                    self._quant_kind,
+                    **plan_kwargs,
+                )
+        else:
+            self.plan = tokenspeed_kernel.moe_plan(
+                self._quant_kind,
+                **plan_kwargs,
+            )
 
         create_layer_weights(
             self._spec,
@@ -210,6 +236,8 @@ class MoELayer(torch.nn.Module):
 
     @property
     def topk_output_format(self):
+        if self.backend_routing_config is not None:
+            return TopKOutputFormat.ROUTER_LOGITS
         if self.support_routing:
             return TopKOutputFormat.BYPASSED
         return TopKOutputFormat.STANDARD
@@ -247,6 +275,12 @@ class MoELayer(torch.nn.Module):
                 hidden_states,
                 self,
                 topk_output.router_logits,
+                num_token_non_padded=getattr(
+                    topk_output, "num_token_non_padded", None
+                ),
+                expert_location_dispatch_info=getattr(
+                    topk_output, "expert_location_dispatch_info", None
+                ),
                 num_tokens_global=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 do_finalize=do_finalize,

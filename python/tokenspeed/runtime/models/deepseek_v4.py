@@ -2470,6 +2470,35 @@ class DeepseekV4MoE(nn.Module):
                 ignored_layers=quant_config.ignored_layers,
                 is_checkpoint_mxfp4_serialized=True,
             )
+            backend_routing = None
+            if self.gate.tid2eid is None:
+                backend_routing = {
+                    "kernel_feature": "backend_routing:deepseek_v4",
+                    "routing_method_type": RoutingMethodType.Renormalize,
+                    "top_k": config.num_experts_per_tok,
+                    "renormalize": config.norm_topk_prob,
+                    "score_function": "sqrtsoftplus",
+                    "choice_score_function": (
+                        "sqrtsoftplus_plus_correction_bias"
+                        if self.gate.e_score_correction_bias is not None
+                        else "sqrtsoftplus"
+                    ),
+                    "group_score_function": "none",
+                    "num_expert_group": getattr(config, "n_group", 1),
+                    "topk_group": getattr(config, "topk_group", 1),
+                    "routed_scaling_factor": self.routed_scaling_factor,
+                    "applies_routed_scaling": False,
+                    "correction_bias": self.gate.e_score_correction_bias,
+                    "correction_bias_for_choice_only": (
+                        self.gate.e_score_correction_bias is not None
+                    ),
+                    "supports_hash_indices": False,
+                    "logical_to_physical_mapping": (
+                        mapping.moe.ep_size > 1
+                        or bool(global_server_args_dict["ep_num_redundant_experts"])
+                    ),
+                    "topk_indices_dtype": torch.int32,
+                }
             self.experts = MoELayer(
                 top_k=config.num_experts_per_tok,
                 num_experts=config.n_routed_experts
@@ -2490,6 +2519,7 @@ class DeepseekV4MoE(nn.Module):
                     "routed_scaling_factor": self.routed_scaling_factor,
                     "correction_bias": self.gate.e_score_correction_bias,
                     "routing_method_type": RoutingMethodType.Renormalize,
+                    "backend_routing": backend_routing,
                 },
             )
             self.topk = TopK(
@@ -2498,6 +2528,7 @@ class DeepseekV4MoE(nn.Module):
                 correction_bias=self.gate.e_score_correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
                 output_format=self.experts.topk_output_format,
+                backend_routing_config=self.experts.backend_routing_config,
             )
 
     def _select_experts(
@@ -2507,7 +2538,7 @@ class DeepseekV4MoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = self.gate(hidden_states)
         fmt = getattr(self.experts, "topk_output_format", None)
-        need_scores = fmt is not None and not fmt.is_bypassed()
+        need_scores = fmt is not None and fmt.is_standard()
         return deepseek_v4_select_experts(
             router_logits,
             self.config.num_experts_per_tok,
@@ -2604,14 +2635,18 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
-        with nvtx_range("moe_select_experts"):
-            topk_weights, topk_ids, router_scores = self._select_experts(
-                hidden_states, input_ids
-            )
-        with nvtx_range("moe_make_topk_output"):
-            topk_output = self._make_topk_output(
-                hidden_states, topk_weights, topk_ids, router_scores
-            )
+        if self.experts.topk_output_format.is_router_logits():
+            with nvtx_range("moe_router_logits"):
+                topk_output = self.topk(hidden_states, self.gate(hidden_states))
+        else:
+            with nvtx_range("moe_select_experts"):
+                topk_weights, topk_ids, router_scores = self._select_experts(
+                    hidden_states, input_ids
+                )
+            with nvtx_range("moe_make_topk_output"):
+                topk_output = self._make_topk_output(
+                    hidden_states, topk_weights, topk_ids, router_scores
+                )
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with nvtx_range("moe_experts"):
@@ -2621,7 +2656,12 @@ class DeepseekV4MoE(nn.Module):
                     num_global_tokens=num_global_tokens,
                     max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 )
-                if self.routed_scaling_factor != 1.0:
+                backend_routing = self.experts.plan.get("backend_routing_config")
+                applies_scale = (
+                    backend_routing is not None
+                    and backend_routing.get("applies_routed_scaling", False)
+                )
+                if self.routed_scaling_factor != 1.0 and not applies_scale:
                     routed *= self.routed_scaling_factor
             with fork.branch():
                 shared = self._forward_shared_experts(hidden_states)

@@ -60,8 +60,9 @@ from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_u
 from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
-from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.registry import KernelRegistry, Priority, register_kernel
 from tokenspeed_kernel.selection import SelectedKernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _RELOAD_MODULES = [
     # Attention registration modules.
@@ -633,6 +634,113 @@ def _moe_apply_mxfp4_precomputed_ep() -> object:
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
+
+
+def test_moe_plan_backend_routing_requires_kernel_feature() -> None:
+    routing_config = {
+        "kernel_feature": "backend_routing:test_missing",
+        "top_k": 8,
+    }
+
+    with pytest.raises(tokenspeed_kernel.NoKernelFoundError):
+        tokenspeed_kernel.moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="swiglu",
+            ispp=128,
+            internal_activation_dtype="input",
+            with_bias=True,
+            routing_config=routing_config,
+        )
+
+
+def test_moe_plan_selects_feature_gated_backend_routing_kernel() -> None:
+    routing_config = {
+        "kernel_feature": "backend_routing:deepseek_v4",
+        "routing_method_type": 1,
+        "top_k": 8,
+        "score_function": "sqrtsoftplus",
+    }
+
+    @register_kernel(
+        "moe",
+        "process_weights",
+        name="test_backend_routing_moe_process_weights",
+        solution="test_backend_routing",
+        signatures={format_signature()},
+        traits={"weight_dtype": frozenset({"mxfp4"})},
+        priority=Priority.PLUGIN,
+    )
+    def _process_weights(*, plan, w):
+        return plan, w
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="test_backend_routing_moe_apply",
+        features={"backend_routing:deepseek_v4"},
+        solution="test_backend_routing",
+        signatures={format_signature(x=dense_tensor_format(torch.bfloat16))},
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"swiglu"}),
+            "routing_mode": frozenset({"kernel_routing"}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({True}),
+            "ispp_alignment": frozenset({1}),
+        },
+        priority=Priority.PLUGIN,
+    )
+    def _apply(
+        *,
+        routing_config=None,
+        num_token_non_padded=None,
+        expert_location_dispatch_info=None,
+        **kwargs,
+    ):
+        return {
+            "routing_config": routing_config,
+            "num_token_non_padded": num_token_non_padded,
+            "expert_location_dispatch_info": expert_location_dispatch_info,
+            "topk_weights": kwargs["topk_weights"],
+            "topk_ids": kwargs["topk_ids"],
+        }
+
+    plan = tokenspeed_kernel.moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        ispp=128,
+        internal_activation_dtype="input",
+        with_bias=True,
+        routing_config=routing_config,
+    )
+
+    assert plan["apply_kernel_name"] == "test_backend_routing_moe_apply"
+    assert plan["process_weights_kernel_name"] == (
+        "test_backend_routing_moe_process_weights"
+    )
+    assert plan["support_routing"] is True
+    assert plan["backend_routing_config"] is routing_config
+
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    num_token_non_padded = torch.tensor(3, dtype=torch.int32)
+    dispatch_info = object()
+    out = tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        num_token_non_padded=num_token_non_padded,
+        expert_location_dispatch_info=dispatch_info,
+    )
+
+    assert out["routing_config"] is routing_config
+    assert out["num_token_non_padded"] is num_token_non_padded
+    assert out["expert_location_dispatch_info"] is dispatch_info
+    assert out["topk_weights"] is None
+    assert out["topk_ids"] is None
 
 
 def test_mxfp4_ep_topk_localization_masks_remote_experts() -> None:

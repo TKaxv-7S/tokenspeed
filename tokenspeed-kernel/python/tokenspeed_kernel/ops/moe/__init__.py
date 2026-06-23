@@ -87,6 +87,18 @@ def _build_traits(
     return traits
 
 
+def _routing_features(
+    routing_config: dict[str, Any] | None,
+) -> frozenset[str] | None:
+    if routing_config is None:
+        return None
+
+    kernel_feature = routing_config.get("kernel_feature")
+    if not kernel_feature:
+        raise ValueError("backend routing config requires a kernel_feature")
+    return frozenset({str(kernel_feature)})
+
+
 def moe_plan(
     weight_dtype: str,
     input_dtype: torch.dtype = torch.bfloat16,
@@ -100,6 +112,7 @@ def moe_plan(
     with_bias: bool = False,
     deepep_group: object | None = None,
     solution: str | None = None,
+    routing_config: dict[str, Any] | None = None,
 ) -> dict:
     """Create a MoE execution plan.
 
@@ -121,6 +134,11 @@ def moe_plan(
         deepep_group: Runtime-created process group used by DeepEP plans.
         solution: Optional kernel solution to force through normal selection.
             None leaves the concrete kernel choice to the registry.
+        routing_config: Optional backend-owned routing contract. When present,
+            selection requires the apply kernel to advertise the requested
+            ``kernel_feature``. This avoids selecting a kernel that only has a
+            generic ``kernel_routing`` trait but does not implement the model's
+            exact top-k semantics.
 
     The selected apply kernel owns plan metadata. A plan with support_routing
     false requires precomputed top-k ids and weights when calling moe_apply.
@@ -143,11 +161,14 @@ def moe_plan(
         internal_activation_dtype=internal_activation_dtype,
         with_bias=with_bias,
     )
+    if routing_config is not None:
+        traits["routing_mode"] = "kernel_routing"
 
     kernel = select_kernel(
         "moe",
         "apply",
         format_signature(x=dense_tensor_format(input_dtype)),
+        features=_routing_features(routing_config),
         traits=traits,
         solution=solution,
     )
@@ -184,6 +205,7 @@ def moe_plan(
         "supports_deferred_finalize": supports_deferred_finalize,
         "solution": apply_spec.solution,
         "internal_activation_dtype": internal_activation_dtype,
+        "backend_routing_config": routing_config,
     }
 
 
@@ -214,6 +236,8 @@ def moe_apply(
     topk_weights: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
     # token length
+    num_token_non_padded: torch.Tensor | None = None,
+    expert_location_dispatch_info: object | None = None,
     num_tokens_global: int | None = None,
     max_num_tokens_per_gpu: int | None = None,
     do_finalize: bool = True,
@@ -231,6 +255,9 @@ def moe_apply(
             [tokens, top_k]. Required when plan support_routing is false.
         topk_ids: Optional precomputed expert ids with shape [tokens, top_k].
             Required when plan support_routing is false.
+        num_token_non_padded: Optional unpadded token count for backend routing.
+        expert_location_dispatch_info: Optional logical/physical expert mapping
+            metadata for backend routing.
         num_tokens_global: Optional global token count for distributed MoE.
         max_num_tokens_per_gpu: Optional per-GPU token capacity hint.
 
@@ -242,15 +269,20 @@ def moe_apply(
         format_signature(x=dense_tensor_format(x.dtype)),
         override=plan["apply_kernel_name"],
     )
-    return kernel(
-        plan=plan,
-        x=x,
-        w=w,
-        router_logits=router_logits,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        num_tokens_global=num_tokens_global,
-        max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-        do_finalize=do_finalize,
-        enable_pdl=enable_pdl,
-    )
+    kwargs = {
+        "plan": plan,
+        "x": x,
+        "w": w,
+        "router_logits": router_logits,
+        "topk_weights": topk_weights,
+        "topk_ids": topk_ids,
+        "num_tokens_global": num_tokens_global,
+        "max_num_tokens_per_gpu": max_num_tokens_per_gpu,
+        "do_finalize": do_finalize,
+        "enable_pdl": enable_pdl,
+    }
+    if plan.get("backend_routing_config") is not None:
+        kwargs["routing_config"] = plan["backend_routing_config"]
+        kwargs["num_token_non_padded"] = num_token_non_padded
+        kwargs["expert_location_dispatch_info"] = expert_location_dispatch_info
+    return kernel(**kwargs)

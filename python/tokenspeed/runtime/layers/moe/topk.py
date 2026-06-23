@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from __future__ import annotations
+
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -36,12 +38,109 @@ from tokenspeed.runtime.moe.distribution_recorder import (
 class TopKOutputFormat(Enum):
     STANDARD = auto()
     BYPASSED = auto()
+    ROUTER_LOGITS = auto()
 
     def is_standard(self) -> bool:
         return self == TopKOutputFormat.STANDARD
 
     def is_bypassed(self) -> bool:
         return self == TopKOutputFormat.BYPASSED
+
+    def is_router_logits(self) -> bool:
+        return self == TopKOutputFormat.ROUTER_LOGITS
+
+
+@dataclass
+class BackendRoutingConfig:
+    """Routing semantics a backend must support before receiving raw logits."""
+
+    kernel_feature: str
+    routing_method_type: int
+    top_k: int
+    renormalize: bool
+    score_function: str
+    choice_score_function: str
+    group_score_function: str = "none"
+    num_expert_group: int | None = None
+    topk_group: int | None = None
+    routed_scaling_factor: float | None = None
+    applies_routed_scaling: bool = False
+    correction_bias: torch.Tensor | None = None
+    correction_bias_for_choice_only: bool = False
+    supports_hash_indices: bool = False
+    logical_to_physical_mapping: bool = False
+    topk_indices_dtype: torch.dtype | None = torch.int32
+
+    @classmethod
+    def from_dict(cls, value: dict | "BackendRoutingConfig" | None):
+        if value is None or isinstance(value, BackendRoutingConfig):
+            return value
+        required = (
+            "kernel_feature",
+            "routing_method_type",
+            "top_k",
+            "renormalize",
+            "score_function",
+            "choice_score_function",
+        )
+        missing = [key for key in required if key not in value]
+        if missing:
+            raise ValueError(
+                "backend routing config is missing required field(s): "
+                + ", ".join(missing)
+            )
+        return cls(
+            kernel_feature=str(value["kernel_feature"]),
+            routing_method_type=int(value["routing_method_type"]),
+            top_k=int(value["top_k"]),
+            renormalize=bool(value["renormalize"]),
+            score_function=str(value["score_function"]),
+            choice_score_function=str(value["choice_score_function"]),
+            group_score_function=str(value.get("group_score_function", "none")),
+            num_expert_group=(
+                None
+                if value.get("num_expert_group") is None
+                else int(value["num_expert_group"])
+            ),
+            topk_group=(
+                None if value.get("topk_group") is None else int(value["topk_group"])
+            ),
+            routed_scaling_factor=(
+                None
+                if value.get("routed_scaling_factor") is None
+                else float(value["routed_scaling_factor"])
+            ),
+            applies_routed_scaling=bool(value.get("applies_routed_scaling", False)),
+            correction_bias=value.get("correction_bias"),
+            correction_bias_for_choice_only=bool(
+                value.get("correction_bias_for_choice_only", False)
+            ),
+            supports_hash_indices=bool(value.get("supports_hash_indices", False)),
+            logical_to_physical_mapping=bool(
+                value.get("logical_to_physical_mapping", False)
+            ),
+            topk_indices_dtype=value.get("topk_indices_dtype", torch.int32),
+        )
+
+    def as_kernel_config(self) -> dict[str, Any]:
+        return {
+            "kernel_feature": self.kernel_feature,
+            "routing_method_type": self.routing_method_type,
+            "top_k": self.top_k,
+            "renormalize": self.renormalize,
+            "score_function": self.score_function,
+            "choice_score_function": self.choice_score_function,
+            "group_score_function": self.group_score_function,
+            "num_expert_group": self.num_expert_group,
+            "topk_group": self.topk_group,
+            "routed_scaling_factor": self.routed_scaling_factor,
+            "applies_routed_scaling": self.applies_routed_scaling,
+            "correction_bias": self.correction_bias,
+            "correction_bias_for_choice_only": self.correction_bias_for_choice_only,
+            "supports_hash_indices": self.supports_hash_indices,
+            "logical_to_physical_mapping": self.logical_to_physical_mapping,
+            "topk_indices_dtype": self.topk_indices_dtype,
+        }
 
 
 @dataclass
@@ -291,6 +390,7 @@ class TopKConfig:
     output_format: TopKOutputFormat | None = None
     zero_expert_num: int | None = 0
     topk_indices_dtype: torch.dtype | None = torch.int32
+    backend_routing_config: BackendRoutingConfig | None = None
 
 
 class StandardTopKOutput(NamedTuple):
@@ -317,6 +417,21 @@ class BypassedTopKOutput(NamedTuple):
     @property
     def format(self) -> TopKOutputFormat:
         return TopKOutputFormat.BYPASSED
+
+
+class RouterLogitsTopKOutput(NamedTuple):
+    """Raw router-logits output for backends that own expert selection."""
+
+    hidden_states: torch.Tensor
+    router_logits: torch.Tensor
+    topk_config: TopKConfig
+    backend_routing_config: BackendRoutingConfig
+    num_token_non_padded: torch.Tensor | None = None
+    expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None
+
+    @property
+    def format(self) -> TopKOutputFormat:
+        return TopKOutputFormat.ROUTER_LOGITS
 
 
 @runtime_checkable
@@ -346,6 +461,7 @@ class TopK(torch.nn.Module):
         output_format: TopKOutputFormat | None = None,
         zero_expert_num: int | None = 0,
         topk_indices_dtype=torch.int32,
+        backend_routing_config: BackendRoutingConfig | None = None,
     ):
         super().__init__()
 
@@ -365,6 +481,7 @@ class TopK(torch.nn.Module):
             output_format=output_format,
             zero_expert_num=zero_expert_num,
             topk_indices_dtype=topk_indices_dtype,
+            backend_routing_config=backend_routing_config,
         )
 
     def forward(
@@ -385,6 +502,19 @@ class TopK(torch.nn.Module):
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 topk_config=self.topk_config,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+            )
+        if output_format == TopKOutputFormat.ROUTER_LOGITS:
+            if self.topk_config.backend_routing_config is None:
+                raise ValueError(
+                    "ROUTER_LOGITS top-k output requires backend_routing_config"
+                )
+            return RouterLogitsTopKOutput(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk_config=self.topk_config,
+                backend_routing_config=self.topk_config.backend_routing_config,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
             )
@@ -415,6 +545,21 @@ class TopK(torch.nn.Module):
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 topk_config=self.topk_config,
+            )
+        if output_format.is_router_logits():
+            if self.topk_config.backend_routing_config is None:
+                raise ValueError(
+                    "ROUTER_LOGITS top-k output requires backend_routing_config"
+                )
+            if hidden_states is None:
+                hidden_states = torch.empty((0, 0), dtype=torch.float32, device=device)
+            if router_logits is None:
+                router_logits = torch.empty((0, 0), dtype=torch.float32, device=device)
+            return RouterLogitsTopKOutput(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk_config=self.topk_config,
+                backend_routing_config=self.topk_config.backend_routing_config,
             )
 
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
