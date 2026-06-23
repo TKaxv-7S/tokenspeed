@@ -594,6 +594,7 @@ def _routing_from_topk_medium_m(
     topk_ids: torch.Tensor,
     num_experts: int,
     dtype: torch.dtype | None = None,
+    schedule_block16_only: bool = False,
 ) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor] | None:
     if not _medium_m_topk_routing_supported(topk_weights, topk_ids, num_experts):
         return None
@@ -617,6 +618,7 @@ def _routing_from_topk_medium_m(
         gate_dtype=dtype,
         num_block_sizes=len(RaggedTensorMetadata.block_sizes()),
         max_num_blocks=max_num_blocks,
+        schedule_block16_only=schedule_block16_only,
     )
     ragged_metadata = RaggedTensorMetadata(
         slice_sizes,
@@ -634,6 +636,7 @@ def _routing_from_local_topk(
     num_experts: int,
     dtype: torch.dtype,
     ep_size: int,
+    schedule_block16_only: bool = False,
 ) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
     routed = None
     if ep_size <= 1:
@@ -649,6 +652,7 @@ def _routing_from_local_topk(
                 topk_ids,
                 num_experts=num_experts,
                 dtype=dtype,
+                schedule_block16_only=schedule_block16_only,
             )
     if routed is None:
         routed = _routing_from_topk(
@@ -950,6 +954,10 @@ def triton_mxfp4_moe_apply(
 
     top_k = getattr(w, "top_k")
     n_tokens = router_logits.shape[0]
+    use_dynamic_mxfp4 = _uses_dynamic_mxfp4_activations(w)
+    use_dynamic_block16_metadata = use_dynamic_mxfp4 and int(
+        getattr(w, "ep_size", 1)
+    ) <= 1
 
     if routing_config is not None:
         topk_weights, topk_ids = _deepseek_v4_topk_from_logits(
@@ -968,6 +976,7 @@ def triton_mxfp4_moe_apply(
                 num_experts=num_experts,
                 dtype=router_logits.dtype,
                 ep_size=int(getattr(w, "ep_size", 1)),
+                schedule_block16_only=use_dynamic_block16_metadata,
             )
         )
     elif topk_weights is not None or topk_ids is not None:
@@ -985,6 +994,7 @@ def triton_mxfp4_moe_apply(
                 num_experts=num_experts,
                 dtype=router_logits.dtype,
                 ep_size=int(getattr(w, "ep_size", 1)),
+                schedule_block16_only=use_dynamic_block16_metadata,
             )
         )
     else:
@@ -1006,7 +1016,6 @@ def triton_mxfp4_moe_apply(
     if swiglu_arg is not None:
         act = _swiglu_activation_for_weights(w, swiglu_arg)
 
-    use_dynamic_mxfp4 = _uses_dynamic_mxfp4_activations(w)
     use_dynamic_mxfp4_tile_policy = use_dynamic_mxfp4 and int(
         getattr(w, "ep_size", 1)
     ) <= 1

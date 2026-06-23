@@ -213,6 +213,70 @@ def test_medium_m_routing_from_topk_matches_reference_metadata(
     )
 
 
+def test_medium_m_routing_can_schedule_only_block16(device: str) -> None:
+    topk_weights, topk_ids = _make_topk(
+        num_tokens=128,
+        num_experts=384,
+        topk=8,
+        device=device,
+    )
+
+    actual = _routing_from_topk_medium_m(
+        topk_weights,
+        topk_ids,
+        num_experts=384,
+        dtype=torch.float32,
+        schedule_block16_only=True,
+    )
+    assert actual is not None
+    expected = _routing_from_topk(
+        topk_weights,
+        topk_ids,
+        num_experts=384,
+        dtype=torch.float32,
+    )
+    torch.cuda.synchronize()
+
+    actual_metadata, *_ = actual
+    expected_metadata, *_ = expected
+    torch.testing.assert_close(
+        actual_metadata.slice_sizes,
+        expected_metadata.slice_sizes,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        actual_metadata.slice_offs,
+        expected_metadata.slice_offs,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        actual_metadata.block_offs_data,
+        expected_metadata.block_offs_data,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        actual_metadata.block_schedule(16),
+        expected_metadata.block_schedule(16),
+        rtol=0.0,
+        atol=0.0,
+    )
+    for block_size in actual_metadata.block_sizes()[1:]:
+        assert torch.equal(
+            actual_metadata.block_schedule(block_size),
+            torch.full_like(actual_metadata.block_schedule(block_size), -1),
+        )
+    _assert_valid_routing_permutation(
+        actual,
+        topk_weights,
+        topk_ids,
+        384,
+        torch.float32,
+    )
+
+
 def test_small_m_routing_from_topk_rejects_large_work(device: str) -> None:
     topk_weights, topk_ids = _make_topk(
         num_tokens=17,

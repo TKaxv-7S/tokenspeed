@@ -726,6 +726,7 @@ def moe_routing_from_topk_medium_m(
     gate_dtype: torch.dtype,
     num_block_sizes: int,
     max_num_blocks: int,
+    schedule_block16_only: bool = False,
 ):
     if topk_ids.ndim != 2:
         raise ValueError(f"topk_ids must be rank-2, got {tuple(topk_ids.shape)}")
@@ -815,7 +816,8 @@ def moe_routing_from_topk_medium_m(
         BLOCK_B=block_b,
         num_warps=1,
     )
-    _moe_topk_routing_medium_schedule_kernel[(num_experts, num_block_sizes)](
+    scheduled_block_sizes = 1 if schedule_block16_only else num_block_sizes
+    _moe_topk_routing_medium_schedule_kernel[(num_experts, scheduled_block_sizes)](
         slice_sizes,
         block_offs_data,
         block_schedule_data,
