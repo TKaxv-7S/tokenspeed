@@ -153,6 +153,30 @@ def _maybe_lds_guard(x, w, precision_config):
         yield
 
 
+def _dynamic_mxfp4_constraints(n_tokens: int) -> dict[str, int] | None:
+    if scoped_opt_flags_constraints is None:
+        return None
+    if not current_platform().is_cdna4:
+        return None
+    if n_tokens >= 1024:
+        return {"block_m": 64, "block_n": 128, "block_k": 256}
+    if n_tokens >= 16:
+        return {"block_m": 16, "block_n": 128, "block_k": 256}
+    if n_tokens >= 8:
+        return {"block_m": 32, "block_n": 128, "block_k": 256}
+    return None
+
+
+@contextmanager
+def _maybe_dynamic_mxfp4_guard(enabled: bool, n_tokens: int):
+    constraints = _dynamic_mxfp4_constraints(n_tokens) if enabled else None
+    if constraints is None:
+        yield
+        return
+    with scoped_opt_flags_constraints(constraints):
+        yield
+
+
 def _routing(
     logits: torch.Tensor,
     n_expts_act: int,
@@ -691,6 +715,9 @@ def triton_mxfp4_moe_apply(
         )
 
     use_dynamic_mxfp4 = _uses_dynamic_mxfp4_activations(w)
+    use_dynamic_mxfp4_tile_policy = use_dynamic_mxfp4 and int(
+        getattr(w, "ep_size", 1)
+    ) <= 1
     if hasattr(w, "w13_act_scale"):
         gemm1_input = fp8_quantize(x, scale=w.w13_act_scale)
     elif use_dynamic_mxfp4:
@@ -702,7 +729,10 @@ def triton_mxfp4_moe_apply(
     else:
         gemm1_input = x
 
-    with _maybe_lds_guard(gemm1_input, w13_weight, w13_pc):
+    with _maybe_lds_guard(gemm1_input, w13_weight, w13_pc), _maybe_dynamic_mxfp4_guard(
+        use_dynamic_mxfp4_tile_policy,
+        n_tokens,
+    ):
         intermediate_cache = matmul(
             gemm1_input,
             w13_weight,
@@ -729,7 +759,10 @@ def triton_mxfp4_moe_apply(
     else:
         gemm2_input = intermediate_cache
 
-    with _maybe_lds_guard(gemm2_input, w2_weight, w2_pc):
+    with _maybe_lds_guard(gemm2_input, w2_weight, w2_pc), _maybe_dynamic_mxfp4_guard(
+        use_dynamic_mxfp4_tile_policy,
+        n_tokens,
+    ):
         output = matmul(
             gemm2_input,
             w2_weight,
