@@ -141,6 +141,8 @@ class Eagle(BaseDrafter):
         # Drafter-owned alias source for the draft attn backend; advanced in
         # place during multi-step decode.
         self.draft_seq_lens_buf = torch.zeros_like(self.input_buffers.seq_lens_buf)
+        self.draft_cache_start_buf = torch.empty_like(self.input_buffers.seq_lens_buf)
+        self.draft_positions_buf = torch.empty_like(self.input_buffers.seq_lens_buf)
 
         # Persistent output buffer for the draft step's compute_out_cache_loc.
         self.draft_out_cache_loc_buf = torch.empty(
@@ -190,6 +192,23 @@ class Eagle(BaseDrafter):
         if not self._dsa_reuse_mtp_topk:
             return dsa_topk
         return ctx.dsa_prefill_topk, ctx.dsa_decode_topk
+
+    def _get_draft_seq_workspace(
+        self,
+        attr_name: str,
+        like: torch.Tensor,
+        bs: int,
+    ) -> torch.Tensor:
+        buffer = getattr(self, attr_name, None)
+        if (
+            buffer is None
+            or buffer.device != like.device
+            or buffer.dtype != like.dtype
+            or buffer.numel() < bs
+        ):
+            buffer = torch.empty_like(like)
+            setattr(self, attr_name, buffer)
+        return buffer[:bs]
 
     def _select_dsa_decode_topk(
         self,
@@ -410,7 +429,12 @@ class Eagle(BaseDrafter):
         num_extends = draft_input.num_extends
         num_decodes = bs - num_extends
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-        cache_start = self.input_buffers.seq_lens_buf[:bs].clone()
+        cache_start = self._get_draft_seq_workspace(
+            "draft_cache_start_buf",
+            self.input_buffers.seq_lens_buf,
+            bs,
+        )
+        cache_start.copy_(self.input_buffers.seq_lens_buf[:bs])
         # Step 1's write position uses vc+accept_length after target verify so
         # rotary/cache metadata stay on the accepted prefix, not rejected tail.
         if num_decodes > 0:
@@ -436,7 +460,12 @@ class Eagle(BaseDrafter):
         draft_seq_lens = self.draft_seq_lens_buf[:bs]
         torch.add(cache_start, 1, out=draft_seq_lens)
 
-        positions = cache_start.clone()
+        positions = self._get_draft_seq_workspace(
+            "draft_positions_buf",
+            cache_start,
+            bs,
+        )
+        positions.copy_(cache_start)
 
         for i in range(1, self.spec_num_steps):
             # make a ctx every time model runner forward

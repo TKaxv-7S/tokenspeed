@@ -45,7 +45,8 @@ indexer top-k and only reuses the gathered draft-produced top-k rows across
 later MTP iterations, mapping mixed prefill rows back to decode-ready KV slots;
 the mixed selector splits prefill and decode rows directly, and the shared
 padding-preserving workspace-to-slot mapping stays capture-friendly without
-importing the DSA backend into generic drafter startup. The draft MoE path is
+importing the DSA backend into generic drafter startup. Draft catch-up cache and
+position metadata reuse persistent drafter workspaces. The draft MoE path is
 also excluded from expert-distribution recording. The GLM DSA decode top-k
 schedule cache is refreshed against the current MTP query width and visible
 lengths, and DSA prefill top-k uses scheduler CPU length mirrors for scalar

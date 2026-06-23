@@ -1002,6 +1002,7 @@ def test_eagle_multi_step_starts_from_accepted_prefix(monkeypatch):
         captured["req_pool_indices"] = req_pool_indices.clone()
         captured["uniform_input_length"] = uniform_input_length
         captured["cache_start"] = cache_start.clone()
+        captured["cache_start_ptr"] = cache_start.data_ptr()
         captured["page_size"] = page_size
         out_cache_loc_ptr.copy_(torch.tensor([11, 12, 21, 22], dtype=torch.int32))
 
@@ -1033,6 +1034,7 @@ def test_eagle_multi_step_starts_from_accepted_prefix(monkeypatch):
                     "ctx": kwargs["ctx"],
                     "input_ids": kwargs["input_ids"].clone(),
                     "positions": kwargs["positions"].clone(),
+                    "positions_ptr": kwargs["positions"].data_ptr(),
                     "out_cache_loc": kwargs["out_cache_loc"].clone(),
                     "spec_step_idx": kwargs["spec_step_idx"],
                 }
@@ -1056,6 +1058,8 @@ def test_eagle_multi_step_starts_from_accepted_prefix(monkeypatch):
     eagle._dsa_reuse_mtp_topk = False
     eagle.draft_out_cache_loc_buf = torch.empty(4, dtype=torch.int32)
     eagle.draft_seq_lens_buf = torch.zeros(2, dtype=torch.int32)
+    eagle.draft_cache_start_buf = torch.empty(2, dtype=torch.int32)
+    eagle.draft_positions_buf = torch.empty(2, dtype=torch.int32)
     eagle.input_buffers = SimpleNamespace(
         req_pool_indices_buf=torch.tensor([4, 7], dtype=torch.int64),
         seq_lens_buf=torch.tensor([106, 206], dtype=torch.int32),
@@ -1090,10 +1094,14 @@ def test_eagle_multi_step_starts_from_accepted_prefix(monkeypatch):
     assert captured["req_pool_indices"].tolist() == [4, 7]
     assert captured["uniform_input_length"] == 2
     assert captured["cache_start"].tolist() == [102, 205]
+    assert captured["cache_start_ptr"] == eagle.draft_cache_start_buf.data_ptr()
     assert captured["page_size"] == 16
     assert [x.tolist() for x in backend.advanced] == [[103, 206], [104, 207]]
     assert [call["spec_step_idx"] for call in calls] == [1, 2]
     assert [call["positions"].tolist() for call in calls] == [[102, 205], [103, 206]]
+    assert {call["positions_ptr"] for call in calls} == {
+        eagle.draft_positions_buf.data_ptr()
+    }
     assert [call["out_cache_loc"].tolist() for call in calls] == [[11, 21], [12, 22]]
     assert calls[0]["input_ids"].tolist() == [8, 9]
     assert calls[1]["input_ids"].tolist() == [1, 1]
