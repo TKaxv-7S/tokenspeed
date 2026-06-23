@@ -43,7 +43,8 @@ the real position-0 prompt embedding in the draft KV path to match the checkpoin
 semantics used by SGLang. For DSA MTP, the first draft step computes NextN's own
 indexer top-k and only reuses the gathered draft-produced top-k rows across
 later MTP iterations; the draft MoE path is also excluded from
-expert-distribution recording.
+expert-distribution recording. The GLM DSA decode top-k schedule cache is
+refreshed when MTP verify and draft paths use different per-request query widths.
 
 ```bash
 tokenspeed serve zai-org/GLM-5.2-FP8 \

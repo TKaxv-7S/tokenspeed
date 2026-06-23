@@ -16,6 +16,7 @@ from tokenspeed.runtime.execution.drafter.eagle import (
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from tokenspeed.runtime.models import glm5 as glm5_module
 from tokenspeed.runtime.models.extensible import ExtensibleLM
 from tokenspeed.runtime.models.glm5 import (
     GlmDsaDecodeTopK,
@@ -494,6 +495,161 @@ def test_glm_dsa_decode_seq_lens_distinguish_full_window_and_catchup():
         210,
         211,
     ]
+
+
+def test_glm_dsa_decode_topk_schedule_rebuilds_when_q_len_changes(monkeypatch):
+    schedule_calls = []
+
+    class FakeDeepGemm:
+        @staticmethod
+        def get_num_sms():
+            return 1
+
+        @staticmethod
+        def get_paged_mqa_logits_metadata(seq_lens_2d, page_size, num_sms):
+            schedule_calls.append(
+                {
+                    "shape": tuple(seq_lens_2d.shape),
+                    "seq_lens": seq_lens_2d.clone(),
+                    "page_size": page_size,
+                    "num_sms": num_sms,
+                }
+            )
+            return torch.full((1,), len(schedule_calls), dtype=torch.int32)
+
+        @staticmethod
+        def fp8_paged_mqa_logits(
+            q_fp8,
+            kv_cache,
+            weights,
+            seq_lens_2d,
+            block_tables,
+            schedule_metadata,
+            max_seq_len,
+            clean_logits=False,
+        ):
+            del kv_cache, weights, block_tables, schedule_metadata, max_seq_len
+            del clean_logits
+            return torch.zeros(
+                (q_fp8.shape[0] * q_fp8.shape[1], int(seq_lens_2d.max().item())),
+                dtype=torch.float32,
+            )
+
+    def fake_quantize_fp8_with_scale(q_2d, **kwargs):
+        del kwargs
+        return q_2d, torch.ones((q_2d.shape[0], 1), dtype=torch.float32)
+
+    def fake_deterministic_decode_topk(logits, local_topk_offsets, topk):
+        del topk
+        local_topk_offsets.copy_(
+            torch.arange(
+                local_topk_offsets.shape[1],
+                dtype=local_topk_offsets.dtype,
+            ).expand_as(local_topk_offsets)
+        )
+
+    def fake_local_topk_to_global_slots(**kwargs):
+        kwargs["out"].copy_(kwargs["local_topk_offsets"].to(torch.int32))
+        kwargs["lens_out"].copy_(kwargs["seq_lens"].to(torch.int32))
+
+    monkeypatch.setattr(glm5_module, "deep_gemm", FakeDeepGemm)
+    monkeypatch.setattr(
+        glm5_module,
+        "quantize_fp8_with_scale",
+        fake_quantize_fp8_with_scale,
+    )
+    monkeypatch.setattr(
+        glm5_module,
+        "deterministic_decode_topk",
+        fake_deterministic_decode_topk,
+    )
+    monkeypatch.setattr(glm5_module, "has_deterministic_decode_topk", lambda: True)
+    monkeypatch.setattr(
+        glm5_module,
+        "local_topk_to_global_slots",
+        fake_local_topk_to_global_slots,
+    )
+
+    attn = GlmMoeDsaAttention.__new__(GlmMoeDsaAttention)
+    attn.index_topk = 512
+    attn.indexer = SimpleNamespace(
+        index_head_dim=128,
+        index_n_heads=1,
+        softmax_scale=1.0,
+    )
+    attn.attn_mqa = SimpleNamespace(layer_id=0)
+    attn._decode_topk_indices_buffer = None
+    attn._decode_local_topk_offsets_buffer = None
+    attn._decode_topk_lens_buffer = None
+    attn._decode_topk_arange_buffer = None
+
+    metadata = SimpleNamespace(
+        num_extends=0,
+        seq_lens_k=torch.tensor([64, 65], dtype=torch.int32),
+        block_kv_indices=torch.zeros((2, 8), dtype=torch.int32),
+    )
+
+    class TokenPool:
+        page_size = 64
+
+        @staticmethod
+        def has_index_k_with_scale_buffer():
+            return True
+
+        @staticmethod
+        def get_index_k_with_scale_buffer(layer_id):
+            del layer_id
+            return torch.empty((512, 1, 128), dtype=torch.float32)
+
+    ctx = ForwardContext(
+        attn_backend=SimpleNamespace(
+            forward_decode_metadata=metadata,
+            spec_num_tokens=2,
+        ),
+        token_to_kv_pool=TokenPool(),
+        bs=2,
+        num_extends=0,
+        input_num_tokens=4,
+        forward_mode=ForwardMode.DECODE,
+    )
+
+    first_output = SimpleNamespace(
+        query=torch.zeros((4, 1, 128), dtype=torch.float32),
+        weights=torch.ones((4, 1), dtype=torch.float32),
+    )
+    attn._compute_decode_topk_indices_deepgemm(
+        indexer_output=first_output,
+        ctx=ctx,
+        seq_lens_per_token=torch.tensor([63, 64, 64, 65], dtype=torch.int32),
+        block_tables=metadata.block_kv_indices,
+        block_tables_per_token=metadata.block_kv_indices.repeat_interleave(2, dim=0),
+        q_len_per_req=2,
+        decode_start=0,
+        num_tokens=4,
+        num_decode_tokens=4,
+        topk=512,
+    )
+
+    second_output = SimpleNamespace(
+        query=torch.zeros((2, 1, 128), dtype=torch.float32),
+        weights=torch.ones((2, 1), dtype=torch.float32),
+    )
+    attn._compute_decode_topk_indices_deepgemm(
+        indexer_output=second_output,
+        ctx=ctx,
+        seq_lens_per_token=torch.tensor([64, 65], dtype=torch.int32),
+        block_tables=metadata.block_kv_indices,
+        block_tables_per_token=metadata.block_kv_indices,
+        q_len_per_req=1,
+        decode_start=0,
+        num_tokens=2,
+        num_decode_tokens=2,
+        topk=512,
+    )
+
+    assert [call["shape"] for call in schedule_calls] == [(2, 2), (2, 1)]
+    assert metadata._dsa_paged_mqa_schedule_q_len == 1
+    assert metadata._dsa_paged_mqa_schedule_shape == (2, 1)
 
 
 def test_glm_nextn_decode_first_step_keeps_full_verify_window():

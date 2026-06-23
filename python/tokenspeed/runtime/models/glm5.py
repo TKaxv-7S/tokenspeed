@@ -1097,7 +1097,22 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 None,
             )
         )
-        if schedule_metadata is None:
+        schedule_shape = tuple(seq_lens_2d.shape)
+        schedule_q_len = (
+            None
+            if decode_metadata is None
+            else getattr(decode_metadata, "_dsa_paged_mqa_schedule_q_len", None)
+        )
+        schedule_cached_shape = (
+            None
+            if decode_metadata is None
+            else getattr(decode_metadata, "_dsa_paged_mqa_schedule_shape", None)
+        )
+        if (
+            schedule_metadata is None
+            or schedule_q_len != q_len_per_req
+            or schedule_cached_shape != schedule_shape
+        ):
             schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                 seq_lens_2d,
                 page_size,
@@ -1113,6 +1128,11 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                     decode_metadata,
                     "_dsa_paged_mqa_schedule_q_len",
                     q_len_per_req,
+                )
+                setattr(
+                    decode_metadata,
+                    "_dsa_paged_mqa_schedule_shape",
+                    schedule_shape,
                 )
         index_k_with_scale_cache = ctx.token_to_kv_pool.get_index_k_with_scale_buffer(
             self.attn_mqa.layer_id

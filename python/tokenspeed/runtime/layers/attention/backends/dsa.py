@@ -339,6 +339,7 @@ class DSABackend(AttentionBackend):
             )
         with torch.inference_mode():
             schedule_metadata.copy_(refreshed)
+        setattr(metadata, "_dsa_paged_mqa_schedule_shape", tuple(seq_lens.shape))
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self._dense_backend.get_cuda_graph_seq_len_fill_value()
