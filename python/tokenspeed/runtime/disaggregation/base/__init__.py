@@ -18,16 +18,21 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVBootstrapServer
-from tokenspeed.runtime.pd.mooncake.decode import (
-    MooncakeKVManagerDecode,
-)
-from tokenspeed.runtime.pd.mooncake.prefill import (
-    MooncakeKVManagerPrefill,
-)
-from tokenspeed.runtime.pd.mooncake.receiver import (
-    MooncakeKVReceiver,
-)
-from tokenspeed.runtime.pd.mooncake.sender import (
-    MooncakeKVSender,
-)
+"""Role-neutral transport substrate shared by the disaggregation transfer roles.
+
+Both the KV (prefill->decode) and the embedding (encode->prefill) paths ship
+bytes over the same Mooncake RDMA engine and rendezvous through the same HTTP
+bootstrap protocol, so the mechanical (semantics-free) plumbing lives here once
+and both roles compose it:
+
+    :mod:`poll`       the :class:`TransferPoll` transfer-status FSM constants
+    :mod:`manager`    :class:`DisaggManagerBase` -- engine + ZMQ control socket
+                      + room-keyed monotonic, Failed-sticky status tracking
+    :mod:`bootstrap`  :class:`DisaggBootstrapServer` -- the aiohttp rendezvous
+                      server (PUT register / GET lookup + dp-group sharding)
+
+The role-specific *semantics* (the buffer/arg shapes, the wire frames, the
+senders/receivers) stay in :mod:`...kv` and :mod:`...embedding`; this layer
+carries no KV/MLA/embedding fields, so the two paths still evolve independently.
+Import entry points from the submodules directly.
+"""
