@@ -190,7 +190,8 @@ class DisaggEncodeExecutor:
         if nbytes > self._ring_bytes:
             raise RuntimeError(
                 f"EPD encode embedding {nbytes} B exceeds ring slot "
-                f"{self._ring_bytes} B; raise EncodeExecutor._ring_bytes"
+                f"{self._ring_bytes} B; raise TOKENSPEED_EPD_ENCODE_RING_SLOT_MB "
+                "or the ring_bytes constructor argument"
             )
         buf = ring[slot]
         buf[:nbytes].view(src.dtype).copy_(src.reshape(-1))

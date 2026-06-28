@@ -38,9 +38,9 @@ drains them into ``EncodeWorker.submit`` and runs ``step`` to encode + transfer.
 TP: the vision tower is TP-sharded, so all encode ranks run each batch in lockstep
 -- rank 0 owns the gateway ZMQ and broadcasts every batch to the TP group. The
 embedding transport is a 1->N broadcast: prefill_tp must be a multiple of
-encode_tp (encode_tp=1 scales horizontally via multiple independent encode
-processes = DP); dp_size == 1 on both embedding endpoints (this is process-DP,
-not dp_attention).
+encode_tp. Data-parallel encode workers inside one server are not supported;
+horizontal scale comes from multiple independent encode servers selected by the
+gateway.
 """
 
 import os
@@ -108,16 +108,26 @@ def _make_embedding_cache(l1_bytes: int, l2_bytes: int, device: str):
 
 
 def _build_manager_args(server_args, mapping):
-    """EmbeddingManagerArgs for the encode Mooncake endpoint. Forced to dp_size=1 /
-    enable_dp_attention=False (the base manager hard-rejects otherwise; embedding
-    transport allows prefill_tp = any multiple of encode_tp, dp_size==1 = process-DP).
+    """EmbeddingManagerArgs for the encode Mooncake endpoint.
+
+    EPD embedding transfer currently supports TP only. Horizontal scale is via
+    separate encode servers selected by the gateway; attention DP inside one
+    encode server is rejected so it cannot be accidentally advertised as TP.
     """
     from tokenspeed.runtime.disaggregation.embedding.conn import EmbeddingManagerArgs
 
+    if mapping.attn.dp_size != 1:
+        raise ValueError(
+            "disaggregation_mode=encode currently supports encode "
+            f"data_parallel_size == 1, got {mapping.attn.dp_size}"
+        )
+    bootstrap_host = None
+    if server_args.dist_init_addr:
+        bootstrap_host = server_args.dist_init_addr.split(":", 1)[0]
     return EmbeddingManagerArgs(
         bootstrap_port=server_args.disaggregation_bootstrap_port,
-        world_size=server_args.world_size or mapping.world_size,
-        dp_size=1,
+        tp_size=mapping.attn.tp_size,
+        bootstrap_host=bootstrap_host,
     )
 
 
@@ -214,9 +224,9 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
     # The encode worker is the Mooncake data source: it hosts its own bootstrap
     # server (prefill workers discover it via the handshake the gateway injects).
     # At TP>1 only rank 0 binds the port; every rank still registers its own
-    # rank_ip/rank_port to it (same-host PUT), so each prefill rank can look up
-    # the encode rank it pairs with (contiguous blocks of prefill ranks share one
-    # encode rank; encode_tp=1 -> all prefill ranks pair encode rank 0).
+    # rank_ip/rank_port to the rank-0 bootstrap host, so each prefill rank can
+    # look up the encode rank it pairs with (contiguous blocks of prefill ranks
+    # share one encode rank; encode_tp=1 -> all prefill ranks pair encode rank 0).
     if attn_tp_rank == 0:
         EmbeddingBootstrapServer(server_args.disaggregation_bootstrap_port)
     manager = MooncakeEmbeddingManagerEncode(manager_args, embedding_args)

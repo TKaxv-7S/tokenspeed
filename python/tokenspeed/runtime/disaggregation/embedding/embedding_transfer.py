@@ -493,6 +493,7 @@ class MooncakeEmbeddingManagerEncode(EmbeddingManagerBase):
 
     def _register_to_bootstrap(self):
         ip = get_local_ip_by_remote()
+        bootstrap_host = self.args.bootstrap_host or ip
         payload = {
             "role": "Prefill",  # bootstrap-server role string for "discoverable data source"
             "world_size": self.world_size,
@@ -501,7 +502,7 @@ class MooncakeEmbeddingManagerEncode(EmbeddingManagerBase):
             "rank_port": self.rank_port,
             "engine_rank": self.embedding_args.engine_rank,
         }
-        url = f"http://{ip}:{self.bootstrap_port}/route"
+        url = f"http://{bootstrap_host}:{self.bootstrap_port}/route"
         # The bootstrap HTTP server starts concurrently with this call, so the
         # first PUTs can race it and hit connection-refused. A dropped
         # registration leaves /route's parallel-info null and the encode silently

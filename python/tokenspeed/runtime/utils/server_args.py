@@ -589,6 +589,12 @@ class ServerArgs:
         elif self.disaggregation_mode == "encode":
             # Encode server: vision tower only, no LM / KV pool / prefix cache.
             # enforce_eager left as-is (the vision tower keeps its own CUDA graph).
+            if self.mapping.has_attn_dp:
+                raise ValueError(
+                    "disaggregation_mode=encode currently supports "
+                    "data_parallel_size == 1 inside one encode server; run "
+                    "multiple independent encode servers for horizontal scale."
+                )
             self.enable_prefix_caching = False
 
         # Prefill graph disable logic is handled by AttnInitializer.modify_args

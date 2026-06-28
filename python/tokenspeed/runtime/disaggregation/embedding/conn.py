@@ -49,13 +49,14 @@ class EmbeddingTransferError(Exception):
 class EmbeddingManagerArgs:
     """Connection config for the embedding Mooncake endpoint.
 
-    The encode role owns no KV pool / MLA / metrics, so this carries only the
-    transport fields the manager base reads.
+    Embedding transfer has a single DP group today. ``tp_size`` is the number
+    of encode/prefill endpoint ranks that participate in that group; the shared
+    bootstrap layer still receives it as ``world_size`` with ``dp_size=1``.
     """
 
     bootstrap_port: int
-    world_size: int
-    dp_size: int
+    tp_size: int
+    bootstrap_host: str | None = None
 
 
 class EmbeddingManagerBase(DisaggManagerBase):
@@ -74,8 +75,8 @@ class EmbeddingManagerBase(DisaggManagerBase):
         self.embedding_args = embedding_args
         self.disaggregation_mode = disaggregation_mode
         self.bootstrap_port = args.bootstrap_port
-        self.world_size = args.world_size
-        self.dp_size = args.dp_size
+        self.world_size = args.tp_size
+        self.dp_size = 1
         # Vendor binding stays out of the neutral base. embedding_args must be
         # set above before super().__init__, which calls register_buffer_to_engine.
         engine = MooncakeTransferEngine(

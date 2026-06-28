@@ -22,6 +22,9 @@
 
 The encode role runs the vision tower only and ships image embeddings over the
 Mooncake RDMA engine; the prefill role receives them and skips the tower. The
+embedding transport supports TP fanout only inside one server; encode DP scale is
+provided by running multiple independent encode servers rather than by attention
+DP in one process group. The
 role-neutral transport substrate (the :class:`...base.poll.TransferPoll` status FSM, the
 manager base, the bootstrap server) is shared from :mod:`...disaggregation.base`;
 :mod:`conn` layers the embedding buffer args onto it and :mod:`embedding_transfer`

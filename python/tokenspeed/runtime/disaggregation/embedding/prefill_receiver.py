@@ -805,16 +805,14 @@ def receive_encoded_embeddings(
         time.sleep(0.0005)
 
 
-def build_prefill_embedding_manager(
-    server_args, world_size, global_rank, is_multimodal_active
-):
+def build_prefill_embedding_manager(server_args, global_rank, is_multimodal_active):
     """Stand up the EPD encode->prefill embedding sink, if applicable.
 
     Only a multimodal *prefill* node receives embeddings from encode workers. Built
-    dp_size=1 (the embedding transport allows prefill_tp = any multiple of
-    encode_tp) with no fixed base buffer (receive buffers are allocated per image at
-    receive time). Construction spawns a daemon status thread, so build it exactly
-    once per rank. Returns None for decode/encode/text-only nodes.
+    as one TP group (the embedding transport allows prefill_tp = any multiple of
+    encode_tp) with no fixed base buffer (receive buffers are allocated per image
+    at receive time). Construction spawns a daemon status thread, so build it
+    exactly once per rank. Returns None for decode/encode/text-only nodes.
     """
     if server_args.disaggregation_mode != "prefill" or not is_multimodal_active:
         return None
@@ -827,8 +825,7 @@ def build_prefill_embedding_manager(
 
     emb_mgr_args = EmbeddingManagerArgs(
         bootstrap_port=server_args.disaggregation_bootstrap_port,
-        world_size=world_size,
-        dp_size=1,
+        tp_size=server_args.mapping.attn.tp_size,
     )
     emb_args = EmbeddingArgs(
         engine_rank=global_rank,
@@ -1033,9 +1030,8 @@ def make_epd_prefill_admission(
 
     Returns None unless this is a multimodal *prefill* node (the only node that
     receives encode->prefill embeddings)."""
-    world_size = server_args.world_size or mapping.world_size
     manager = build_prefill_embedding_manager(
-        server_args, world_size, global_rank, model_config.is_multimodal_active
+        server_args, global_rank, model_config.is_multimodal_active
     )
     if manager is None:
         return None
