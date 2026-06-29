@@ -18,8 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
-
 """Encode-worker control loop for EPD (Python orchestration).
 
 This is the body the engine's encode event loop drives: it sits between request
@@ -33,6 +31,8 @@ The model load, mooncake manager construction, request transport and the
 event-loop wiring are supplied by the engine integration; this class only
 orchestrates them, so it is unit-testable with fakes.
 """
+
+from __future__ import annotations
 
 import dataclasses
 from typing import List, Union

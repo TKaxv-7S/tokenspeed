@@ -18,8 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
-
 """Embedding-role transport substrate for EPD (encode -> prefill).
 
 The mechanical plumbing (the Mooncake engine + ZMQ control socket + room-keyed
@@ -29,6 +27,8 @@ buffer args onto it. The embedding-specific *semantics* -- the wire frames and
 the senders/receivers -- live in :mod:`embedding_transfer`; nothing here carries
 any KV/MLA/metrics state.
 """
+
+from __future__ import annotations
 
 import dataclasses
 

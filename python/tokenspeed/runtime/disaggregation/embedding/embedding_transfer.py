@@ -18,8 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
-
 """Mooncake transport for EPD encode->prefill image-embedding transfer.
 
 The encode (vision-tower-only) server is the data source: it calls
@@ -32,6 +30,8 @@ Each frame dataclass owns its byte layout via ``to_zmq()``/``from_zmq()``. The
 wire-frame dataclasses are pure data plus codecs and import no torch, so the
 protocol contract stays importable and unit-testable on CPU.
 """
+
+from __future__ import annotations
 
 import concurrent.futures
 import dataclasses

@@ -18,8 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
-
 """Vision-embedding cache for the EPD encode stage.
 
 The encode server runs the vision tower only; a cache lets duplicate images
@@ -32,6 +30,8 @@ Two interchangeable implementations share a ``get`` / ``put`` surface:
 framework-agnostic and unit-testable without a GPU -- the caller supplies byte
 sizes and the device<->host copies are injectable.
 """
+
+from __future__ import annotations
 
 import collections
 from typing import Callable, Hashable, Optional, Tuple

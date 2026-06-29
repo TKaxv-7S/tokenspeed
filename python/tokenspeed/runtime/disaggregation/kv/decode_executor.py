@@ -214,7 +214,7 @@ class DisaggDecodeExecutor:
             # so without explicit pop these dicts would grow unbounded across
             # failed requests. NOTE: _remote_spec_candidate_ids must NOT be
             # popped here — its consumer pop_remote_spec_candidate_ids runs
-            # later inside event_loop._process_pd_events, after we return.
+            # later inside event_loop._process_kv_transfer_events, after we return.
             # That dict is small (one tuple per Success request, between
             # generate_events emitting RemotePrefillDoneEvent and event_loop
             # consuming it) and is naturally drained by the pop path; an

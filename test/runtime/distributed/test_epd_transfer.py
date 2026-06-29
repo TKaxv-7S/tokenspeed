@@ -54,7 +54,7 @@ from tokenspeed.runtime.multimodal.inputs import (
 )
 
 # Each merged concern keeps its own per-test setup (the shard
-# pointer-math tests need the legacy EPD_RECV_POOL_SLOTS=0 path, the
+# pointer-math tests need the TOKENSPEED_EPD_RECV_POOL_SLOTS=0 path, the
 # receive tests need a small pool); route by test name.
 _RECV_TESTS = {
     "test_receive_sizes_buffers_per_item_no_deepstack",
@@ -63,11 +63,12 @@ _RECV_TESTS = {
 }
 
 
-def setup_function(function):
-    if function.__name__ in _RECV_TESTS:
-        _recv_setup(function)
+@pytest.fixture(autouse=True)
+def _epd_transfer_env(request, monkeypatch):
+    if request.node.name in _RECV_TESTS:
+        _recv_setup(monkeypatch)
     else:
-        _shard_setup(function)
+        _shard_setup(monkeypatch)
 
 
 # A high device VA to catch any 32-bit truncation / wrong struct format.
@@ -353,9 +354,7 @@ class _ShardReceiver:
         self.pre_alloc_kwargs = kwargs
 
 
-def _shard_setup(_):
-    import os
-
+def _shard_setup(monkeypatch):
     import tokenspeed.runtime.disaggregation.embedding.prefill_receiver as er
 
     _ShardReceiver.created.clear()
@@ -363,7 +362,7 @@ def _shard_setup(_):
     # compare pre_alloc destinations against item.encoded, which on the pooled
     # path is a post-DONE CLONE at a different address. Pool+shard interplay is
     # covered separately by test_pool_shard_reassembles_into_published_clone.
-    os.environ["EPD_RECV_POOL_SLOTS"] = "0"
+    monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOTS", "0")
     er._POOLS.clear()
 
 
@@ -499,17 +498,15 @@ def _epd(item: MultimodalDataItem, *, room: int, host: str, port: int):
     return item
 
 
-def _recv_setup(_):
-    import os
-
+def _recv_setup(monkeypatch):
     import tokenspeed.runtime.disaggregation.embedding.prefill_receiver as er
 
     _FakeReceiver.created.clear()
     # Small pool defaults so each test's fresh fake engine doesn't allocate
     # the production 16x256MB region; pools are keyed by engine identity, so
     # clear them (and the lazy-dereg queue) between tests.
-    os.environ["EPD_RECV_POOL_SLOTS"] = "4"
-    os.environ["EPD_RECV_POOL_SLOT_MB"] = "1"
+    monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOTS", "4")
+    monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOT_MB", "1")
     er._POOLS.clear()
     er._pending_dereg.clear()
 

@@ -18,14 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
-
 """Disaggregation-wide neutral utilities shared by all roles (kv + embedding).
 
 These carry no KV/embedding-specific or backend-specific state, so they live at
 the disaggregation root rather than inside any role package: the role/mode enum
 and a small blocking queue used by the transfer workers.
 """
+
+from __future__ import annotations
 
 import threading
 from collections import deque

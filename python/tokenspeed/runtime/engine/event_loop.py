@@ -595,11 +595,12 @@ class EventLoop:
         for rid in failed_ids:
             spec, state, bootstrap = self._epd_staged.pop(rid)
             # Signal the dual-dispatched decode that this request failed so its KV
-            # receiver fails (FailedEvent -> _process_pd_events abort) instead of
-            # waiting forever for KV the prefill will never send. The prefill never
-            # registered a P->D sender (deferred to admission), so the decode has no
-            # other reliable way to learn (heartbeat only trips on a dead prefill
-            # /health). Best-effort: only reaches decodes that already pre-allocated.
+            # receiver fails (FailedEvent -> _process_kv_transfer_events abort)
+            # instead of waiting forever for KV the prefill will never send. The
+            # prefill never registered a P->D sender (deferred to admission), so the
+            # decode has no other reliable way to learn (heartbeat only trips on a
+            # dead prefill /health). Best-effort: only reaches decodes that already
+            # pre-allocated.
             if (
                 isinstance(self.kv_transfer, DisaggPrefillExecutor)
                 and bootstrap is not None
@@ -1266,9 +1267,9 @@ class EventLoop:
             return None
         return forward_ops[0]
 
-    def _process_pd_events(self, pd_events: list) -> list:
+    def _process_kv_transfer_events(self, kv_transfer_events: list) -> list:
         processed = []
-        for event in pd_events:
+        for event in kv_transfer_events:
             processed.append(event)
             if isinstance(event, PD.SucceededEvent) and isinstance(
                 self.kv_transfer, DisaggPrefillExecutor
@@ -1530,8 +1531,10 @@ class EventLoop:
                     )
 
             if self.kv_transfer is not None:
-                pd_events = self.kv_transfer.generate_events()
-                request_changes.extend(self._process_pd_events(pd_events))
+                kv_transfer_events = self.kv_transfer.generate_events()
+                request_changes.extend(
+                    self._process_kv_transfer_events(kv_transfer_events)
+                )
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
@@ -1723,10 +1726,12 @@ class EventLoop:
                     self._commit_forward_results(prev_forward_op, prev_results)
                 )
 
-            # ---- collect PD events ----
+            # ---- collect KV transfer events ----
             if self.kv_transfer is not None:
-                pd_events = self.kv_transfer.generate_events()
-                request_changes.extend(self._process_pd_events(pd_events))
+                kv_transfer_events = self.kv_transfer.generate_events()
+                request_changes.extend(
+                    self._process_kv_transfer_events(kv_transfer_events)
+                )
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)

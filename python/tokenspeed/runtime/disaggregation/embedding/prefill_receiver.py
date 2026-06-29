@@ -18,8 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
-
 """EPD prefill-side receive glue: fill each multimodal item's ``encoded``
 tensor from the Mooncake transfer instead of running the vision tower.
 
@@ -45,8 +43,9 @@ scheduler holds the job and does not admit the request to a prefill forward unti
 synchronous callers and the CPU tests.
 """
 
+from __future__ import annotations
+
 import logging
-import os
 import time
 from collections import deque
 from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple
@@ -62,6 +61,7 @@ from tokenspeed.runtime.disaggregation.embedding.embedding_transfer import (
 )
 from tokenspeed.runtime.multimodal.embedder import _item_token_count
 from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
+from tokenspeed.runtime.utils.env import envs
 
 # (manager, bootstrap_addr, bootstrap_room) -> receiver. Defaults to the real
 # MooncakeEmbeddingReceiver; overridden in tests with a fake.
@@ -79,7 +79,8 @@ FAILED = "failed"
 # So deregistration is DEFERRED: entries hold the tensor ref (the allocator
 # cannot reuse a still-registered address -- the no-double-register invariant)
 # and are swept after a grace period, on the scheduler loop (no thread, no lock).
-_DEREG_DELAY_S = float(os.environ.get("EPD_RECV_DEREG_DELAY_S", "0.5"))
+_DEREG_DELAY_S = 0.5
+_RECV_POOL_QUARANTINE_S = 10.0
 # (due_monotonic, engine, [(tensor, ptr), ...]) in due order (delay is constant).
 _pending_dereg: deque = deque()
 
@@ -114,7 +115,7 @@ class _RecvBufferPool:
     Failure path: a FAILED job may still have an in-flight remote write targeting
     its slot, which under a single lifetime MR would land SILENTLY in the next
     tenant's data, so failed slots sit in quarantine until the transfer layer's
-    timeouts have expired (EPD_RECV_POOL_QUARANTINE_S).
+    timeouts have expired.
 
     Single-threaded by design: all callers run on the scheduler loop (no locks).
     """
@@ -154,8 +155,8 @@ def _get_pool(engine: Any, device: Any) -> Optional[_RecvBufferPool]:
     key = (id(engine), str(device))
     pool = _POOLS.get(key)
     if pool is None:
-        n_slots = int(os.environ.get("EPD_RECV_POOL_SLOTS", "16"))
-        slot_mb = int(os.environ.get("EPD_RECV_POOL_SLOT_MB", "256"))
+        n_slots = envs.TOKENSPEED_EPD_RECV_POOL_SLOTS.get()
+        slot_mb = envs.TOKENSPEED_EPD_RECV_POOL_SLOT_MB.get()
         if n_slots <= 0 or slot_mb <= 0:
             pool = False
         else:
@@ -275,7 +276,7 @@ class EmbeddingReceiveJob:
     lifetime-registered :class:`_RecvBufferPool`; on DONE the landed rows are
     cloned onto ``item.encoded`` and the slot returns immediately (no MR churn,
     see the pool docstring). Deepstack models, oversized items, pool
-    exhaustion, or ``EPD_RECV_POOL_SLOTS=0`` fall back to a per-request
+    exhaustion, or ``TOKENSPEED_EPD_RECV_POOL_SLOTS=0`` fall back to a per-request
     buffer registered on start and lazily deregistered after publish. The GPU
     cost per request is roughly ``n_tokens * hidden * dtype.itemsize`` (plus
     ``* (1 + num_deepstack)`` with deepstack); the caller should cap the
@@ -645,8 +646,6 @@ class EmbeddingReceiveJob:
         """
         if self._shard_size <= 1 or self._status is not DONE:
             return
-        import torch.distributed as dist
-
         for it in self._items:
             main = it.item.encoded
             deep = it.item.encoded_deepstack
@@ -691,10 +690,9 @@ class EmbeddingReceiveJob:
         ``item.encoded`` is left unset -- the request is being failed, not
         served.
         """
-        quarantine_s = float(os.environ.get("EPD_RECV_POOL_QUARANTINE_S", "10"))
         for it in self._items:
             if it.pool is not None:
-                it.pool.quarantine(it.pool_slot, quarantine_s)
+                it.pool.quarantine(it.pool_slot, _RECV_POOL_QUARANTINE_S)
             else:
                 pairs = [(it.recv_main, it.recv_main.data_ptr())]
                 if it.recv_deepstack is not None:
@@ -866,8 +864,6 @@ class EpdPrefillAdmission:
         attn_tp_group,
         pg_manager,
     ):
-        from tokenspeed.runtime.utils.env import envs as _envs
-
         self._manager = manager
         self._device = device
         self._hidden = hidden
@@ -888,7 +884,7 @@ class EpdPrefillAdmission:
         # embedding transfer is the direct analog of the decode waiting on the
         # prefill->decode KV transfer, so one operator knob covers both.
         self._embed_timeout: float = float(
-            _envs.TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT.get()
+            envs.TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT.get()
         )
 
         # EPD embedding row-sharding: each attn-TP rank receives only 1/N of every
@@ -902,7 +898,7 @@ class EpdPrefillAdmission:
         self._group_ranks = tuple(attn_tp_group)
         shard_flag = False
         if attn_tp_size > 1:
-            shard_flag = bool(_envs.TOKENSPEED_EPD_EMBEDDING_SHARD.get())
+            shard_flag = bool(envs.TOKENSPEED_EPD_EMBEDDING_SHARD.get())
             # The flag is a per-process env read but gates a GROUP collective:
             # torn across ranks (e.g. set on one node of a multi-node prefill),
             # flag-on ranks would join the warmup broadcast below while flag-off

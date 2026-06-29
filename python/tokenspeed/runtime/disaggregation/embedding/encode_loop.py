@@ -18,8 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
-
 """EPD encode-worker loop: a lightweight, LM-free scheduler subprocess.
 
 The encode role runs the vision tower and ships image embeddings to prefill
@@ -43,7 +41,8 @@ horizontal scale comes from multiple independent encode servers selected by the
 gateway.
 """
 
-import os
+from __future__ import annotations
+
 import time
 
 import zmq
@@ -59,33 +58,22 @@ from tokenspeed.runtime.utils.env import envs
 
 logger = get_colorful_logger(__name__)
 
+
 # Vision-embedding cache capacity. L1 lives in GPU VRAM; the optional L2 lives in
 # host DRAM and catches L1 evictions so duplicate images skip the tower even past
 # the VRAM working set. Both are whole-MiB env overrides. L2 defaults to 0
 # (disabled): the host tier is opt-in. NOTE both knobs are PER ENCODE PROCESS (per
 # TP rank): at encode TP>1, every co-located rank allocates its own L1+L2, so
 # budget host DRAM as tp_size * EMBED_CACHE_DRAM_MB.
-_DEFAULT_EMBEDDING_CACHE_L1_MB = 4096  # 4 GiB
-_DEFAULT_EMBEDDING_CACHE_L2_MB = 0  # host-DRAM tier off unless opted in
+def _embedding_cache_bytes(env_field) -> int:
+    """Whole-MiB env field -> bytes.
 
-
-def _embedding_cache_bytes(env_name: str, default_mb: int) -> int:
-    """Whole-MiB env override -> bytes (unset/empty keeps ``default_mb``).
-
-    Rejects negative / non-integer values with an env-named error so a mis-set
-    knob fails fast and legibly.
+    EnvField handles parsing and defaults; negative capacities are rejected here
+    with an env-named error.
     """
-    raw = os.environ.get(env_name)
-    if not raw:
-        return default_mb * 1024 * 1024
-    try:
-        mb = int(raw)
-    except ValueError:
-        raise ValueError(
-            f"{env_name} must be a whole number of MiB, got {raw!r}"
-        ) from None
+    mb = env_field.get()
     if mb < 0:
-        raise ValueError(f"{env_name} must be >= 0 MiB, got {mb}")
+        raise ValueError(f"{env_field.name} must be >= 0 MiB, got {mb}")
     return mb * 1024 * 1024
 
 
@@ -232,12 +220,8 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
     manager = MooncakeEmbeddingManagerEncode(manager_args, embedding_args)
     executor = DisaggEncodeExecutor(manager, model, device=device)
 
-    l1_bytes = _embedding_cache_bytes(
-        "TOKENSPEED_EPD_ENCODE_EMBED_CACHE_MB", _DEFAULT_EMBEDDING_CACHE_L1_MB
-    )
-    l2_bytes = _embedding_cache_bytes(
-        "TOKENSPEED_EPD_ENCODE_EMBED_CACHE_DRAM_MB", _DEFAULT_EMBEDDING_CACHE_L2_MB
-    )
+    l1_bytes = _embedding_cache_bytes(envs.TOKENSPEED_EPD_ENCODE_EMBED_CACHE_MB)
+    l2_bytes = _embedding_cache_bytes(envs.TOKENSPEED_EPD_ENCODE_EMBED_CACHE_DRAM_MB)
     cache = _make_embedding_cache(l1_bytes, l2_bytes, device)
     scheduler = EncodeScheduler(
         max_tokens_per_batch=server_args.chunked_prefill_size or 8192,

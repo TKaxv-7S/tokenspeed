@@ -25,7 +25,6 @@ from tokenspeed.runtime.disaggregation.kv.mooncake.entities import ManagerArgs
 from tokenspeed.runtime.disaggregation.kv.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.disaggregation.kv.types import KVArgs
 from tokenspeed.runtime.disaggregation.kv.utils import TransferBackend
-from tokenspeed.runtime.disaggregation.utils import DisaggregationMode
 
 
 def _get_contiguous_buf_unit_lens(pool, item_lens):
@@ -127,7 +126,7 @@ def get_kv_args(
 
 
 def create_kv_transfer(
-    mode: DisaggregationMode,
+    mode: str,
     backend: TransferBackend,
     args: ManagerArgs,
     kv_args: KVArgs,

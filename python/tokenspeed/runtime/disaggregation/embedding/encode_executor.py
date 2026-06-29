@@ -18,18 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
-
 """EPD encode-worker execution: run the vision tower, scatter its output back
 onto each item, and hand the contiguous embeddings to the Mooncake sender.
 """
+
+from __future__ import annotations
 
 import logging
 from typing import List, Tuple
 
 import torch
-
-logger = logging.getLogger(__name__)
 
 from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
 from tokenspeed.runtime.disaggregation.embedding.embedding_transfer import (
@@ -37,6 +35,9 @@ from tokenspeed.runtime.disaggregation.embedding.embedding_transfer import (
 )
 from tokenspeed.runtime.multimodal.embedder import _item_token_count
 from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
+from tokenspeed.runtime.utils.env import envs
+
+logger = logging.getLogger(__name__)
 
 
 def assign_encoded_embeddings(
@@ -117,16 +118,12 @@ class DisaggEncodeExecutor:
         # env-tunable; total reservation is slots * slot_bytes PER ring (main, plus
         # deepstack if present), so depth and per-slot bytes must be sized to the
         # model and peak concurrency.
-        import os as _os
-
         self._ring_slots = int(
-            _os.environ.get("TOKENSPEED_EPD_ENCODE_RING_SLOTS", ring_slots)
+            envs.TOKENSPEED_EPD_ENCODE_RING_SLOTS.get_set_value_or(ring_slots)
         )
-        _slot_mb_env = _os.environ.get("TOKENSPEED_EPD_ENCODE_RING_SLOT_MB")
+        slot_mb = envs.TOKENSPEED_EPD_ENCODE_RING_SLOT_MB.get()
         # Env override is in whole MiB; unset -> keep the exact ``ring_bytes`` arg.
-        self._ring_bytes = (
-            int(_slot_mb_env) * 1024 * 1024 if _slot_mb_env else ring_bytes
-        )
+        self._ring_bytes = slot_mb * 1024 * 1024 if slot_mb else ring_bytes
         self._main_ring = None  # lazily allocated on first send (device live by then)
         self._deep_ring = None
         self._ring_idx = 0
@@ -206,8 +203,6 @@ class DisaggEncodeExecutor:
         A slot is reusable once the room it last staged is TERMINAL (Success,
         Failed, or None=already reaped) AND no parked chunk still holds its
         pointer -- the overwrite-safety invariant."""
-        from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
-
         mgr = self.manager
         n = self._ring_slots
         for _ in range(n):

@@ -473,22 +473,21 @@ def test_scheduler_rejects_bad_budgets():
         EncodeScheduler(max_tokens_per_batch=1, max_items_per_batch=0)
 
 
-_ENV = "TOKENSPEED_EPD_ENCODE_TEST_CACHE_MB"
-
-
 # --------------------------------------------------------------------------- #
 # _embedding_cache_bytes
 # --------------------------------------------------------------------------- #
 def test_bytes_override(monkeypatch):
-    monkeypatch.setenv(_ENV, "8")
-    assert _embedding_cache_bytes(_ENV, 4096) == 8 * 1024 * 1024
+    env_field = encode_loop.envs.TOKENSPEED_EPD_ENCODE_EMBED_CACHE_MB
+    monkeypatch.setenv(env_field.name, "8")
+    assert _embedding_cache_bytes(env_field) == 8 * 1024 * 1024
 
 
 def test_bytes_negative_raises_with_env_name(monkeypatch):
-    monkeypatch.setenv(_ENV, "-5")
+    env_field = encode_loop.envs.TOKENSPEED_EPD_ENCODE_EMBED_CACHE_MB
+    monkeypatch.setenv(env_field.name, "-5")
     with pytest.raises(ValueError) as exc:
-        _embedding_cache_bytes(_ENV, 4096)
-    assert _ENV in str(exc.value)
+        _embedding_cache_bytes(env_field)
+    assert env_field.name in str(exc.value)
 
 
 # --------------------------------------------------------------------------- #

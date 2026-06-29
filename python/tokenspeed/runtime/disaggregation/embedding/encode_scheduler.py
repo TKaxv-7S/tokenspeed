@@ -18,8 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
-
 """Encode-stage batching for EPD disaggregation.
 
 The encode server runs the vision tower only, orchestrated in Python rather
@@ -32,6 +30,8 @@ The duplicate-image cache lives in
 encode loop checks the cache on arrival and feeds only *misses* to the
 scheduler.
 """
+
+from __future__ import annotations
 
 import dataclasses
 from typing import Dict, List, Tuple
