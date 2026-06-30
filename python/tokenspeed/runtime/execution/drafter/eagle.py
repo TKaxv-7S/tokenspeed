@@ -24,7 +24,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
-from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from typing_extensions import override
 
 from tokenspeed.runtime.execution.cache_loc_kernel import (
@@ -72,6 +71,7 @@ class EagleDraftInput:
     global_num_tokens: list[int] | None = None
     global_bs: list[int] | None = None
     all_decode_or_idle: bool = False
+    dsa_topk: DsaTopKState = (None, None)
 
 
 class Eagle(BaseDrafter):
@@ -243,21 +243,19 @@ class Eagle(BaseDrafter):
             draft_input, bs, draft_input.input_num_tokens
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
-        # Llama Eagle3 and Qwen3.5 NextN narrow for any non-idle catch-up
-        # (EXTEND/MIXED/TARGET_VERIFY/DECODE); DeepSeek keeps is_decode() only.
+        draft_model = self.draft_model_runner.model
+        # These draft models run first-step catch-up on the full input window,
+        # then narrow to one row per request for sampling and later MTP steps.
+        reduce_first_step_catchup = bool(
+            getattr(draft_model, "draft_first_step_reduce_for_catchup", False)
+        ) or isinstance(
+            draft_model,
+            (LlamaForCausalLMEagle3, Qwen3_5ForConditionalGenerationNextN),
+        )
         draft_first_step_reduce = forward_mode.is_decode() or (
-            isinstance(
-                self.draft_model_runner.model,
-                (LlamaForCausalLMEagle3, Qwen3_5ForConditionalGenerationNextN),
-            )
-            and not forward_mode.is_idle()
+            reduce_first_step_catchup and not forward_mode.is_idle()
         )
-
-        draft_first_mode = (
-            ForwardMode.DRAFT_EXTEND
-            if forward_mode.is_target_verify()
-            else forward_mode
-        )
+        input_num_tokens = draft_input.input_num_tokens
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
@@ -265,8 +263,8 @@ class Eagle(BaseDrafter):
             req_to_page=self.req_to_page,
             bs=bs,
             num_extends=draft_input.num_extends,
-            input_num_tokens=draft_input.input_num_tokens,
-            forward_mode=draft_first_mode,
+            input_num_tokens=input_num_tokens,
+            forward_mode=forward_mode,
             capture_hidden_mode=CaptureHiddenMode.LAST,
             gather_ids=gather_ids,
             global_num_tokens=draft_input.global_num_tokens,
@@ -277,15 +275,36 @@ class Eagle(BaseDrafter):
             accept_lengths=draft_input.accept_lengths,
         )
 
+        dsa_topk = draft_input.dsa_topk
+        prepare_dsa_topk = getattr(draft_model, "prepare_dsa_topk_for_mtp_decode", None)
+        compute_dsa_topk_first_step = bool(
+            getattr(draft_model, "compute_dsa_topk_first_step", False)
+        )
+        if compute_dsa_topk_first_step:
+            # GLM NextN has its own indexer weights. Compute first-step top-k
+            # in the draft model, then select rows used by later MTP steps.
+            dsa_topk = (None, None)
+        elif draft_input.num_extends == 0 and prepare_dsa_topk is not None:
+            dsa_topk = prepare_dsa_topk(dsa_topk, gather_ids)
+        else:
+            dsa_topk = (None, None)
+        self._attach_dsa_topk(ctx, dsa_topk)
+
         logits_output = self.draft_model_runner.forward(
             ctx=ctx,
             input_ids=input_ids,
-            positions=buffers.positions_buf[: draft_input.input_num_tokens],
-            out_cache_loc=buffers.out_cache_loc_buf[: draft_input.input_num_tokens],
+            positions=buffers.positions_buf[:input_num_tokens],
+            out_cache_loc=buffers.out_cache_loc_buf[:input_num_tokens],
             captured_hidden_states=draft_input.base_out_hidden_states,
             spec_step_idx=0,
         )
-        dsa_topk = self._extract_dsa_topk(ctx, (None, None))
+        dsa_topk = self._extract_dsa_topk(ctx, dsa_topk)
+        if compute_dsa_topk_first_step and prepare_dsa_topk is not None:
+            dsa_topk = prepare_dsa_topk(
+                dsa_topk,
+                gather_ids,
+                num_prefill_rows=draft_input.num_extends,
+            )
         return logits_output, dsa_topk
 
     @nvtx_range("draft_multi_step", color="purple")
@@ -362,7 +381,8 @@ class Eagle(BaseDrafter):
             # Keep attention metadata on the accepted prefix; rejected verify
             # tail slots may still contain stale draft KV.
             _advance_draft_forward_metadata_if_supported(
-                ctx.attn_backend, draft_seq_lens
+                ctx.attn_backend,
+                draft_seq_lens,
             )
 
             with nvtx_range("draft_forward", color="red"):
@@ -377,8 +397,7 @@ class Eagle(BaseDrafter):
                 dsa_topk = self._extract_dsa_topk(ctx, dsa_topk)
 
             with nvtx_range("draft_sample", color="yellow"):
-                draft_ids = sampling_argmax(logits_output.next_token_logits)
-                draft_ids.clamp_(min=0)
+                draft_ids = logits_output.next_token_ids
                 # Column 0 holds last_verified_ids; drafter writes step `i` into column `i + 1`.
                 next_tokens[:, i + 1] = self._map_hot(draft_ids)
                 if i + 1 < self.spec_num_steps:
@@ -449,17 +468,16 @@ class Eagle(BaseDrafter):
         # down to `[bs, ...]`, so logits/hidden_states arrive here already aligned to one row per request.
         logits_output, dsa_topk = self._run_first_step(bs, draft_input)
 
-        draft_ids = sampling_argmax(logits_output.next_token_logits)
-        draft_ids.clamp_(min=0)
+        draft_ids = logits_output.next_token_ids
         next_tokens[:, 1] = self._map_hot(draft_ids)
 
         if self.spec_num_steps <= 1:
             return next_tokens
 
         if self.input_buffers.all_extends_mid_chunk and self.dp_size == 1:
-            # Skip multi-step when the whole batch is mid-chunk EXTEND: no
-            # request transitions to target_verify after this forward, so
-            # any speculative tokens we draft would be discarded.
+            # Skip multi-step when the whole batch is mid-chunk EXTEND:
+            # no request completes a target-side speculative verification
+            # after this forward, so any speculative tokens would be discarded.
             #
             # In DP we still run, because peer ranks may have completing
             # extends or decodes; diverging here would desync the drafter's
@@ -502,6 +520,7 @@ class Eagle(BaseDrafter):
             global_num_tokens=base_ctx.global_num_tokens,
             global_bs=base_ctx.global_bs,
             all_decode_or_idle=base_ctx.all_decode_or_idle,
+            dsa_topk=(base_ctx.dsa_prefill_topk, base_ctx.dsa_decode_topk),
         )
 
         # next_tokens layout: column 0 = last verified id, columns 1.. = drafter tokens.

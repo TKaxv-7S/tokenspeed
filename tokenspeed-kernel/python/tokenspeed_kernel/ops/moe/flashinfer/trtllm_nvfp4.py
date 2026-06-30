@@ -27,7 +27,7 @@ from tokenspeed_kernel.platform import (
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signature, format_signatures
+from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length()
@@ -46,21 +46,7 @@ if platform.is_nvidia:
         get_w2_permute_indices_with_cache,
     )
 
-    @register_kernel(
-        "moe",
-        "process_weights",
-        name="flashinfer_trtllm_nvfp4_moe_process_weights",
-        solution="flashinfer_trtllm",
-        capability=CapabilityRequirement(
-            vendors=frozenset({"nvidia"}),
-            min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 3),
-        ),
-        signatures=frozenset({format_signature()}),
-        traits={"weight_dtype": frozenset({"nvfp4"})},
-        priority=Priority.SPECIALIZED,
-    )
-    def flashinfer_trtllm_nvfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
+    def flashinfer_trtllm_nvfp4_moe_weights(plan: dict, w: torch.nn.Module):
         _group_size = 16
         _correction_bias = getattr(w, "_correction_bias", None)
         _routing_logits_dtype = getattr(w, "_routing_logits_dtype", torch.bfloat16)
@@ -180,9 +166,15 @@ if platform.is_nvidia:
         del w.w13_weight_scale
         del w.w2_weight_scale
 
-        # Compute fused-kernel scales.
-        # Reduce w13_weight_scale_2: take per-expert value.
-        w13_ws2 = w.w13_weight_scale_2[:, 0]
+        # Compute fused-kernel scales. The trtllm SwiGLU MoE kernel dequantizes the GEMM1 gate
+        # (W1) and up (W3) halves with separate scalars, so feed each its own global scale_2
+        # (else non-uniform-W1/W3 checkpoints mis-scale the up-proj by up_s2/gate_s2).
+        ws2 = w.w13_weight_scale_2
+        if ws2.dim() == 2 and ws2.shape[1] == 2:
+            gate_ws2, up_ws2 = ws2[:, 0], ws2[:, 1]
+        else:
+            gate_ws2 = ws2.reshape(ws2.shape[0])
+            up_ws2 = gate_ws2
         # Input scales (max across shards) for alpha computation
         w13_input_scale = w.w13_input_scale.max().to(torch.float32)
         w2_input_scale = w.w2_input_scale.max().to(torch.float32)
@@ -194,16 +186,17 @@ if platform.is_nvidia:
         w.w13_input_scale_quant = torch.nn.Parameter(
             w13_input_scale_quant, requires_grad=False
         )
-        # Fused-kernel alphas: input_scale * weight_scale_2
+        # gate (W1) dequant alpha -> output1_scale_gate_scalar
         w.g1_alphas = torch.nn.Parameter(
-            (w13_input_scale * w13_ws2).to(torch.float32), requires_grad=False
+            (w13_input_scale * gate_ws2).to(torch.float32), requires_grad=False
         )
         w.g2_alphas = torch.nn.Parameter(
             (w2_input_scale * w.w2_weight_scale_2).to(torch.float32),
             requires_grad=False,
         )
+        # up (W3) dequant alpha folded with the GEMM2-input requant -> output1_scale_scalar
         w.g1_scale_c = torch.nn.Parameter(
-            (w2_input_scale_quant * w.g1_alphas).to(torch.float32),
+            w2_input_scale_quant * (w13_input_scale * up_ws2).to(torch.float32),
             requires_grad=False,
         )
         # Store intermediate_size_per_partition for the executor
@@ -226,6 +219,7 @@ if platform.is_nvidia:
         "apply",
         name="flashinfer_trtllm_nvfp4_moe_apply",
         solution="flashinfer_trtllm",
+        weight_preprocessor=flashinfer_trtllm_nvfp4_moe_weights,
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
