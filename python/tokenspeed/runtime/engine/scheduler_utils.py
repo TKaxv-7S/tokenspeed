@@ -326,6 +326,28 @@ def paged_cache_block_tables_from_forward_op(
     )
 
 
+def flat_block_tables_from_forward_op(
+    forward_op: Any,
+    device: "torch.device | str",
+    *,
+    num_reqs: int | None = None,
+) -> dict[str, torch.Tensor]:
+    """Bridge the flat KV-cache per-group block tables to GPU int32 tensors.
+
+    Mirrors ``paged_cache_block_tables_from_forward_op`` but reads the flat op's
+    ``flat_block_tables`` (absolute page indices, null hole = 0, no compaction).
+    The underlying converter is value-transparent, so a 0 hole is preserved and
+    only ragged-row padding uses -1 -- there is NO base-offset companion (the
+    flat path never compacts).
+    """
+    return _block_tables_from_forward_op(
+        forward_op,
+        attr="flat_block_tables",
+        device=device,
+        num_reqs=num_reqs,
+    )
+
+
 def paged_cache_block_table_base_offsets_from_forward_op(
     forward_op: Any,
     device: "torch.device | str",

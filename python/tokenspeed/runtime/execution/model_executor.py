@@ -29,6 +29,7 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.engine.scheduler_utils import (
+    flat_block_tables_from_forward_op,
     paged_cache_block_table_base_offsets_from_forward_op,
     paged_cache_block_tables_from_forward_op,
 )
@@ -1476,6 +1477,11 @@ class ModelExecutor:
                         device=self.device,
                         num_reqs=bs,
                     )
+                    flat_block_tables = flat_block_tables_from_forward_op(
+                        forward_op,
+                        device=self.device,
+                        num_reqs=bs,
+                    )
                     (
                         paged_cache_block_table_base_offsets,
                         _paged_cache_block_table_base_offset_max,
@@ -1507,6 +1513,7 @@ class ModelExecutor:
                         paged_cache_block_table_base_offsets=(
                             paged_cache_block_table_base_offsets
                         ),
+                        flat_block_tables=flat_block_tables,
                         **mamba_kwargs,
                     )
 

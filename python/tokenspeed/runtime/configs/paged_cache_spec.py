@@ -19,8 +19,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Literal, Optional, Sequence
 
-from tokenspeed.runtime.utils.common import ceil_div
-
 Retention = Literal["full_history", "sliding_window"]
 Family = Literal["history", "state"]
 
@@ -48,6 +46,10 @@ def compute_paged_cache_group_page_counts(
     max_context_len: int,
     safety_margin: int = 0,
 ) -> Dict[str, int]:
+    # Local import: keeps this module torch-free at import time so the pure
+    # spec dataclasses + group_specs_from_layer_types load without torch.
+    from tokenspeed.runtime.utils.common import ceil_div
+
     if max_live_requests < 0:
         raise ValueError(f"max_live_requests must be >= 0, got {max_live_requests}")
     if max_scheduled_tokens < 0:
@@ -106,8 +108,84 @@ def compute_paged_cache_group_page_counts(
     return counts
 
 
+# layer_type label -> retention. GPT-OSS uses these two; unknown labels raise.
+_LAYER_TYPE_RETENTION: Dict[str, Retention] = {
+    "full_attention": "full_history",
+    "sliding_attention": "sliding_window",
+}
+
+
+def group_specs_from_layer_types(
+    *,
+    layer_types: Sequence[str],
+    sliding_window_tokens: Optional[int],
+    page_size: int,
+) -> list[PagedCacheGroupSpec]:
+    """Derive paged-cache group specs from a model's per-layer attention types.
+
+    Mirrors vLLM's spec-value grouping: layers sharing an attention type
+    collapse into one group. Group order = first-appearance order of the layer
+    type. group_id is the layer-type label itself, so downstream
+    ``flat_block_tables`` keys line up with it.
+
+    Args:
+        layer_types: Per-layer attention-type labels (e.g. from
+            ``hf_config.layer_types``): ``"full_attention"`` /
+            ``"sliding_attention"``.
+        sliding_window_tokens: Window size for sliding layers; required (>0) when
+            any ``"sliding_attention"`` layer is present, else may be None.
+        page_size: Tokens per page; used as ``rows_per_page`` for every group
+            (uniform page size across groups).
+
+    Returns:
+        One ``PagedCacheGroupSpec`` per distinct attention type, in
+        first-appearance order.
+
+    Raises:
+        ValueError: on an unknown layer-type label, or a sliding layer without a
+            positive ``sliding_window_tokens``.
+    """
+    specs: list[PagedCacheGroupSpec] = []
+    seen: set[str] = set()
+    for label in layer_types:
+        if label in seen:
+            continue
+        retention = _LAYER_TYPE_RETENTION.get(label)
+        if retention is None:
+            raise ValueError(
+                f"group_specs_from_layer_types: unknown layer_type {label!r}; "
+                f"expected one of {sorted(_LAYER_TYPE_RETENTION)}"
+            )
+        window: Optional[int] = None
+        if retention == "sliding_window":
+            window = (
+                None
+                if sliding_window_tokens is None
+                else int(sliding_window_tokens)
+            )
+            if window is None or window <= 0:
+                raise ValueError(
+                    f"group_specs_from_layer_types: layer_type {label!r} is "
+                    "sliding but sliding_window_tokens is not a positive int "
+                    f"(got {sliding_window_tokens!r})"
+                )
+        seen.add(label)
+        specs.append(
+            PagedCacheGroupSpec(
+                group_id=label,
+                retention=retention,
+                rows_per_page=page_size,
+                entry_stride_tokens=1,
+                sliding_window_tokens=window,
+                family="history",
+            )
+        )
+    return specs
+
+
 __all__ = [
     "PagedCacheGroupSpec",
     "Retention",
     "compute_paged_cache_group_page_counts",
+    "group_specs_from_layer_types",
 ]

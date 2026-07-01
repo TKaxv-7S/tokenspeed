@@ -38,6 +38,11 @@ class AttentionBackend(ABC):
     """The base class of attention backends"""
 
     uses_paged_cache_groups: bool = False
+    # Flat KV-cache per-group block tables (absolute index, null hole = 0). A
+    # separate flag from uses_paged_cache_groups because the two mechanisms have
+    # different hole/index semantics; a group-aware flat backend (Phase 4) sets
+    # this True. Default False keeps every existing backend on today's path.
+    uses_flat_cache_groups: bool = False
     uses_padded_decode_token_mask: bool = False
 
     def __init__(self, config: BaseAttnConfig) -> None:

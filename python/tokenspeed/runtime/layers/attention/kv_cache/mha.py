@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from __future__ import annotations
 
 import numpy as np
 import torch
@@ -52,6 +53,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         max_context_len: int,
         page_size: int,
         rank: int,
+        layer_types: tuple[str, ...] = (),
+        sliding_window_tokens: int | None = None,
+        max_scheduled_tokens: int = 0,
         enable_kv_cache_copy: bool = False,
         enable_alt_stream: bool = True,
     ):
@@ -86,6 +90,32 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             "KV Cache is allocated. K size: %.2f GB, V size: %.2f GB.",
             k_size / GB,
             v_size / GB,
+        )
+
+        from tokenspeed.runtime.configs.paged_cache_spec import (
+            compute_paged_cache_group_page_counts,
+            group_specs_from_layer_types,
+        )
+
+        # Publish per-group specs so the C++ scheduler is configured multi-group
+        # for hybrid full/SWA models. Empty layer_types -> single full-history
+        # group (non-hybrid), preserving today's behavior.
+        effective_layer_types = layer_types or ("full_attention",)
+        self.paged_cache_group_specs = tuple(
+            group_specs_from_layer_types(
+                layer_types=effective_layer_types,
+                sliding_window_tokens=sliding_window_tokens,
+                page_size=page_size,
+            )
+        )
+        # Per-group page budgets, required by pool_to_paged_cache_groups. Mirrors
+        # DeepseekV4TokenToKVPool: size=total tokens, max_batch_size=live reqs.
+        self.paged_cache_group_page_counts = compute_paged_cache_group_page_counts(
+            self.paged_cache_group_specs,
+            max_live_requests=max_batch_size,
+            max_scheduled_tokens=max(0, int(max_scheduled_tokens)),
+            max_total_tokens=size,
+            max_context_len=max_context_len,
         )
 
     def _get_page_size_bytes(self):

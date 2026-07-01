@@ -822,6 +822,9 @@ class CudaGraphWrapper:
         spec_info=None,
         paged_cache_block_tables: dict | None = None,
         paged_cache_block_table_base_offsets: dict | None = None,
+        # Eager path only; graph replay/capture for flat groups is deferred to a
+        # later phase, so this is intentionally not threaded into _init_replay_metadata.
+        flat_block_tables: dict | None = None,
     ):
         """
         Unified forward entry point.
@@ -948,6 +951,11 @@ class CudaGraphWrapper:
                 paged_cache_block_table_base_offsets=(
                     paged_cache_block_table_base_offsets
                     if self.attn_backend.uses_paged_cache_groups
+                    else None
+                ),
+                flat_block_tables=(
+                    flat_block_tables
+                    if self.attn_backend.uses_flat_cache_groups
                     else None
                 ),
                 **mamba_kwargs,

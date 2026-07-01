@@ -35,6 +35,13 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 @dataclass
 class MHAConfig(BaseAttnConfig):
+    # Per-layer attention-type labels + window, forwarded to the KV pool so it
+    # can publish paged_cache_group_specs (full-history + sliding-window). Empty
+    # tuple -> single full-history group (non-hybrid models).
+    layer_types: tuple[str, ...] = ()
+    sliding_window_tokens: int | None = None
+    max_scheduled_tokens: int = 0
+
     @classmethod
     def generate(
         cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
@@ -45,6 +52,9 @@ class MHAConfig(BaseAttnConfig):
                 speculative_num_steps=server_args.speculative_num_steps,
                 speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
             )
+        hf_config = model_config.hf_config
+        layer_types = tuple(getattr(hf_config, "layer_types", None) or ())
+        sliding_window_tokens = getattr(hf_config, "sliding_window", None)
         return cls(
             device=server_args.device,
             context_len=model_config.context_len,
@@ -65,6 +75,9 @@ class MHAConfig(BaseAttnConfig):
             max_graph_bs=server_args.max_cudagraph_capture_size,
             kv_cache_quant_method=server_args.kv_cache_quant_method,
             is_draft=is_draft,
+            layer_types=layer_types,
+            sliding_window_tokens=sliding_window_tokens,
+            max_scheduled_tokens=server_args.chunked_prefill_size,
             **kwargs,
         )
 
@@ -97,4 +110,7 @@ class MHAConfig(BaseAttnConfig):
             max_context_len=self.context_len,
             page_size=self.page_size,
             rank=rank,
+            layer_types=self.layer_types,
+            sliding_window_tokens=self.sliding_window_tokens,
+            max_scheduled_tokens=self.max_scheduled_tokens,
         )
