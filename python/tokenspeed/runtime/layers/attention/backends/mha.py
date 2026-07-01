@@ -71,6 +71,10 @@ class MHAPrefillMetadata:
     cu_extend_seq_lens_cpu: list[int]
     max_extend_seq_len: int
     max_extend_prefix_len: int = 0
+    # Flat KV-cache per-group page tables (group_id -> [num_reqs, max_pages]).
+    # None on the single-table path. TODO(radix-removal): drop with the single
+    # page_table field once flat is the only path.
+    page_tables: dict[str, torch.Tensor] | None = None
 
 
 @dataclass(kw_only=True)
@@ -79,10 +83,17 @@ class MHADecodeMetadata:
     page_table: torch.Tensor
     seq_lens: torch.Tensor
     scheduler_metadata: torch.Tensor | None = None
+    page_tables: dict[str, torch.Tensor] | None = None
 
 
 class MHAAttnBackend(AttentionBackend):
     """Standard MHA backend that routes through tokenspeed_kernel attention APIs."""
+
+    # Consume flat per-group page tables when the scheduler delivers them. The
+    # flag is unconditional; safety is via (a) the wrapper only forwarding a
+    # non-empty flat_block_tables and (b) _select_page_table's single-table
+    # fallback. TODO(radix-removal): unconditional once radix is gone.
+    uses_flat_cache_groups: bool = True
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
@@ -140,6 +151,12 @@ class MHAAttnBackend(AttentionBackend):
             self.max_context_len,
         )
 
+        # Flat per-group tables (Phase 3 delivered them already bridged to GPU
+        # tensors). Present only when uses_flat_cache_groups AND the op carried a
+        # non-empty flat_block_tables (the wrapper gates on the flag). None -> the
+        # single-table path below is unchanged.
+        flat_page_tables = kwargs.get("flat_block_tables") or None
+
         if forward_mode.is_extend_or_mixed():
             extend_seq_lens = extend_seq_lens[:bs]
             extend_seq_lens_cpu = [int(x) for x in extend_seq_lens_cpu[:bs].tolist()]
@@ -161,6 +178,7 @@ class MHAAttnBackend(AttentionBackend):
                 cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
                 max_extend_seq_len=max_extend_seq_len,
                 max_extend_prefix_len=max_extend_prefix_len,
+                page_tables=flat_page_tables,
             )
 
             # Drafter: also fill decode_metadata so step 1+ multi-step has
@@ -170,6 +188,7 @@ class MHAAttnBackend(AttentionBackend):
                 self.forward_decode_metadata = MHADecodeMetadata(
                     page_table=page_table,
                     seq_lens=seq_lens,
+                    page_tables=flat_page_tables,
                 )
         else:
             if self.spec_num_tokens > 1:
@@ -177,6 +196,7 @@ class MHAAttnBackend(AttentionBackend):
                     self.forward_decode_metadata = MHADecodeMetadata(
                         page_table=page_table,
                         seq_lens=seq_lens,
+                        page_tables=flat_page_tables,
                     )
                 else:
                     expanded_page_table, expanded_seq_lens = (
@@ -194,6 +214,7 @@ class MHAAttnBackend(AttentionBackend):
                     self.forward_decode_metadata = MHADecodeMetadata(
                         page_table=expanded_page_table,
                         seq_lens=expanded_seq_lens,
+                        page_tables=flat_page_tables,
                     )
             else:
                 scheduler_metadata = self._maybe_compute_scheduler_metadata(
@@ -204,6 +225,7 @@ class MHAAttnBackend(AttentionBackend):
                     page_table=page_table,
                     seq_lens=seq_lens,
                     scheduler_metadata=scheduler_metadata,
+                    page_tables=flat_page_tables,
                 )
 
     def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
@@ -381,6 +403,28 @@ class MHAAttnBackend(AttentionBackend):
             kwargs.get("sinks"),
         )
 
+    def _select_page_table(self, layer, metadata):
+        """Pick this layer's page table: its group's table on the flat path,
+        else the single shared table.
+
+        TODO(radix-removal): the empty-group_id / single-table fallbacks exist to
+        keep non-group-aware layers and single-group models working while radix
+        coexists. Once flat is the only path and every KV layer carries a
+        group_id, this collapses to `metadata.page_tables[layer.group_id]`.
+        """
+        if metadata.page_tables is None:
+            return metadata.page_table
+        group_id = getattr(layer, "group_id", "")
+        tables = metadata.page_tables
+        if not group_id or group_id not in tables:
+            if len(tables) == 1:
+                return next(iter(tables.values()))
+            raise KeyError(
+                f"_select_page_table: layer group_id={group_id!r} not in "
+                f"flat_block_tables keys {sorted(tables)}"
+            )
+        return tables[group_id]
+
     def _forward_prefill(
         self,
         q: torch.Tensor,
@@ -451,7 +495,7 @@ class MHAAttnBackend(AttentionBackend):
             cu_seqlens_q=metadata.cu_extend_seq_lens,
             k_cache=k_cache,
             v_cache=v_cache,
-            page_table=metadata.page_table,
+            page_table=self._select_page_table(layer, metadata),
             cache_seqlens=metadata.extend_prefix_lens,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
@@ -507,7 +551,7 @@ class MHAAttnBackend(AttentionBackend):
             cu_seqlens_q=metadata.cu_extend_seq_lens,
             k_cache=k_cache,
             v_cache=v_cache,
-            page_table=metadata.page_table,
+            page_table=self._select_page_table(layer, metadata),
             cache_seqlens=metadata.seq_lens,
             is_causal=True,
             window_left=layer.sliding_window_size,
@@ -547,7 +591,7 @@ class MHAAttnBackend(AttentionBackend):
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
-            page_table=metadata.page_table,
+            page_table=self._select_page_table(layer, metadata),
             cache_seqlens=metadata.seq_lens,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,

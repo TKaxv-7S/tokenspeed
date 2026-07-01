@@ -41,6 +41,7 @@ class PagedAttention(nn.Module):
         logit_cap: float = 0.0,
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
+        group_id: str = "",
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -53,6 +54,11 @@ class PagedAttention(nn.Module):
         self.layer_id = layer_id
         self.logit_cap = logit_cap
         self.sliding_window_size = sliding_window_size or -1
+        # Flat KV-cache group this layer's KV belongs to (e.g. "full_attention" /
+        # "sliding_attention"). "" for non-group-aware layers; the backend falls
+        # back to the single table then. TODO(radix-removal): once flat is the only
+        # path and every KV layer carries a group_id, "" and the fallback go away.
+        self.group_id = group_id
         self.k_scale = None
         self.v_scale = None
 

@@ -207,6 +207,7 @@ class GptOssAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=(sliding_window_size if use_sliding_window else -1),
+            group_id=layer_type,
         )
         self.layer_id = layer_id
 
