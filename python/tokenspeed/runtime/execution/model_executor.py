@@ -405,6 +405,20 @@ class ModelExecutor:
         self._active_multimodal_context = None
         self._active_positions_override = None
 
+        # Eagerly initialize distributed_argmax state for the drafter's
+        # LogitsProcessor before CUDAGraph capture. This ensures symm_mem
+        # rendezvous, CuTe kernel compilation, and output buffer allocation
+        # happen outside the capture stream.
+        if self.drafter is not None and draft_model_runner is not None:
+            draft_model = draft_model_runner.model
+            if hasattr(draft_model, "logits_processor"):
+                lp = draft_model.logits_processor
+                if hasattr(lp, "warmup_for_cuda_graph"):
+                    _, head = draft_model.get_embed_and_head()
+                    import types
+
+                    lp.warmup_for_cuda_graph(types.SimpleNamespace(weight=head))
+
         self.forward_step = CudaGraphWrapper(
             forward_func=self._forward_step,
             attn_backend=attn_backend,
