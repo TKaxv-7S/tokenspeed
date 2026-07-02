@@ -572,12 +572,13 @@ class LogitsProcessor(nn.Module):
                 if self._dist_argmax_state is self._LOGITS_DIST_ARGMAX_UNINITIALIZED:
                     self._dist_argmax_state = self._init_dist_argmax_state(lm_head)
 
-                if (
-                    self._dist_argmax_state is not None
-                    and not self.final_logit_softcapping
-                    and logits.size(0) <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
-                ):
-                    return logits
+                # DEBUG: skip early return so logits go through all_gather
+                # if (
+                #     self._dist_argmax_state is not None
+                #     and not self.final_logit_softcapping
+                #     and logits.size(0) <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
+                # ):
+                #     return logits
 
             if self._all_gather_state is self._LOGITS_AG_STATE_UNINITIALIZED:
                 self._all_gather_state = self._init_all_gather_state(lm_head)
@@ -619,16 +620,8 @@ class LogitsProcessor(nn.Module):
         return logits
 
     def _argmax(self, logits: torch.Tensor) -> torch.Tensor:
-        if (
-            self._dist_argmax_state
-            not in (self._LOGITS_DIST_ARGMAX_UNINITIALIZED, None)
-            and not self.final_logit_softcapping
-            and logits.size(0) <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
-        ):
-            _, idx = distributed_argmax(self._dist_argmax_state, logits)
-            return idx
-        else:
-            return sampling_argmax(logits)
+        # DEBUG: bypass distributed_argmax to verify if it causes CUDAGraph IMA
+        return sampling_argmax(logits)
 
     @staticmethod
     def get_top_logprobs(all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata):
