@@ -42,7 +42,13 @@ on:
 env:
   PIP_BREAK_SYSTEM_PACKAGES: 1
   CUDA_VERSION: 13.0.1
-  TOKENSPEED_B200_RUNNER_LABEL: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}
+  # DEBUG BRANCH OVERRIDE: pin the runner label to `b200` instead of
+  # reading `vars.TOKENSPEED_B200_RUNNER_LABEL`, which currently points
+  # to `b200-v2` on this repo. The IMA we are chasing reproduces on the
+  # non-v2 b200 runners, so we want scan-generated matrix entries to
+  # target `b200-8gpu` / `b200-1gpu` here. Restore
+  # `${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}` before merging.
+  TOKENSPEED_B200_RUNNER_LABEL: b200
 
 concurrency:
   group: pr-test-nvidia-${{ github.event.pull_request.number || github.ref }}
