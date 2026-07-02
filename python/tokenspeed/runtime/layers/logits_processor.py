@@ -327,43 +327,6 @@ class LogitsProcessor(nn.Module):
 
         return self._LOGITS_DIST_ARGMAX_STATES[key]
 
-    def warmup_for_cuda_graph(self, lm_head: "VocabParallelEmbedding") -> None:
-        """Eagerly initialize distributed_argmax state and compile its kernel.
-
-        Must be called before CUDAGraph capture so that no lazy init
-        (symm_mem.rendezvous, dist.barrier, cute.compile, torch.empty)
-        happens inside the capture stream.
-        """
-        if not self.do_argmax:
-            return
-        if self._dist_argmax_state is self._LOGITS_DIST_ARGMAX_UNINITIALIZED:
-            self._dist_argmax_state = self._init_dist_argmax_state(lm_head)
-        if self._dist_argmax_state is None:
-            return
-
-        state = self._dist_argmax_state
-        vocab_per_rank = lm_head.weight.size(0)
-        dummy_logits = torch.zeros(
-            (1, vocab_per_rank), dtype=state.dtype, device=state.device
-        )
-        self._dist_argmax_out_max = torch.empty(
-            (self._LOGITS_DIST_ARGMAX_MAX_TOKENS,),
-            dtype=state.dtype,
-            device=state.device,
-        )
-        self._dist_argmax_out_idx = torch.empty(
-            (self._LOGITS_DIST_ARGMAX_MAX_TOKENS,),
-            dtype=torch.int64,
-            device=state.device,
-        )
-        distributed_argmax(
-            state,
-            dummy_logits,
-            out_max=self._dist_argmax_out_max[:1],
-            out_idx=self._dist_argmax_out_idx[:1],
-        )
-        torch.cuda.synchronize()
-
     def forward(
         self,
         input_ids,
@@ -662,18 +625,7 @@ class LogitsProcessor(nn.Module):
             and not self.final_logit_softcapping
             and logits.size(0) <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
         ):
-            M = logits.size(0)
-            out_max = getattr(self, "_dist_argmax_out_max", None)
-            out_idx = getattr(self, "_dist_argmax_out_idx", None)
-            if out_max is not None and out_idx is not None:
-                _, idx = distributed_argmax(
-                    self._dist_argmax_state,
-                    logits,
-                    out_max=out_max[:M],
-                    out_idx=out_idx[:M],
-                )
-            else:
-                _, idx = distributed_argmax(self._dist_argmax_state, logits)
+            _, idx = distributed_argmax(self._dist_argmax_state, logits)
             return idx
         else:
             return sampling_argmax(logits)
