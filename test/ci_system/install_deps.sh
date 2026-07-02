@@ -30,6 +30,7 @@ export CPLUS_INCLUDE_PATH="/usr/local/cuda/include/cccl"
 export C_INCLUDE_PATH="/usr/local/cuda/include/cccl"
 
 WORKSPACE=${WORKSPACE:-$(pwd)}
+CUDA_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda.txt"
 
 # Wrap pip install in a retry loop. PyPI's CDN occasionally returns a
 # bad Content-Type for /simple/<pkg>/ pages (most recently observed for
@@ -53,6 +54,30 @@ pip_install_with_retry() {
         attempt=$((attempt + 1))
         delay=$((delay * 2))
     done
+}
+
+ensure_flashinfer_jit_cache_matches() {
+    # The preinstalled runner image ships a flashinfer-jit-cache wheel
+    # that may not match the flashinfer-python version pinned in
+    # cuda.txt. Importing flashinfer with a mismatched jit-cache raises
+    # RuntimeError at collection time. When the versions disagree,
+    # force-reinstall the matching jit-cache wheel from the flashinfer
+    # release. See PRs #567/#570 for the original gb200 fix; b200
+    # runners exhibit the same drift.
+    if [ ! -f "${CUDA_REQ}" ]; then
+        return 0
+    fi
+
+    local wheel_url
+    wheel_url="$(python3 "${SCRIPT_DIR}/flashinfer_jit_cache_installer.py" \
+        --requirements "${CUDA_REQ}" \
+        --cuda-index "${CUINDEX}")"
+    if [ -z "${wheel_url}" ]; then
+        return 0
+    fi
+
+    pip_install_with_retry pip3 install --break-system-packages \
+        --force-reinstall --no-deps "${wheel_url}"
 }
 
 echo "=========================================="
@@ -138,6 +163,12 @@ echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
 python3 -m pip install --upgrade pip setuptools wheel
 
 # ============================================================
+# Step 2b: Ensure flashinfer-jit-cache matches pinned flashinfer
+# ============================================================
+echo "=== Step 2b: Sync flashinfer-jit-cache with pinned flashinfer ==="
+ensure_flashinfer_jit_cache_matches
+
+# ============================================================
 # Step 3: Install tokenspeed-kernel
 # ============================================================
 echo "=== Step 3: Install tokenspeed-kernel ==="
@@ -182,7 +213,6 @@ fi
 # Step 7: Pin critical kernel deps to exact versions
 # ============================================================
 echo "=== Step 7: Pin critical kernel deps ==="
-CUDA_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda.txt"
 pin_version() {
     # Extract "<pkg>==<version>" for an exact-pinned package in cuda.txt.
     local pkg="$1"
