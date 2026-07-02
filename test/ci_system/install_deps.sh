@@ -76,8 +76,35 @@ ensure_flashinfer_jit_cache_matches() {
         return 0
     fi
 
+    # The wheel is ~1.9GB and pip's built-in downloader has been
+    # timing out on b200 runners (only ~100MB fetched before the
+    # socket goes silent). Fetch with curl instead so we can resume
+    # across many attempts, then hand the on-disk wheel to pip.
+    local wheel_name wheel_path
+    wheel_name="$(basename "${wheel_url}")"
+    wheel_path="/tmp/${wheel_name}"
+    rm -f "${wheel_path}" "${wheel_path}.part" 2>/dev/null || true
+
+    local attempt=1 max_attempts=8
+    while [ "${attempt}" -le "${max_attempts}" ]; do
+        if curl -fL --retry 5 --retry-delay 10 --retry-connrefused \
+            --connect-timeout 30 --continue-at - \
+            --output "${wheel_path}.part" "${wheel_url}"; then
+            mv "${wheel_path}.part" "${wheel_path}"
+            break
+        fi
+        if [ "${attempt}" -eq "${max_attempts}" ]; then
+            echo "curl download failed after ${max_attempts} attempts: ${wheel_url}" >&2
+            return 1
+        fi
+        echo "curl attempt ${attempt}/${max_attempts} failed; retrying..." >&2
+        attempt=$((attempt + 1))
+        sleep 10
+    done
+
     pip_install_with_retry pip3 install --break-system-packages \
-        --force-reinstall --no-deps "${wheel_url}"
+        --force-reinstall --no-deps "${wheel_path}"
+    rm -f "${wheel_path}" 2>/dev/null || true
 }
 
 echo "=========================================="
