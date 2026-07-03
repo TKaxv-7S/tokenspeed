@@ -70,10 +70,12 @@ def _cuda_graph_replay_wrapper(
     wrapper.attn_backend = SimpleNamespace(uses_paged_cache_groups=False)
     wrapper.draft_attn_backend = None
     wrapper.drafter = None
+    wrapper.sampling_backend = None
     wrapper.deepep_adapter = SimpleNamespace(replay=lambda: None)
-    wrapper.graphs = {4: SimpleNamespace(replay=lambda: None)}
+    graph_key = ("default", 4)
+    wrapper.graphs = {graph_key: SimpleNamespace(replay=lambda: None)}
     wrapper.output_buffers = {
-        4: (
+        graph_key: (
             torch.zeros(16, dtype=torch.int32),
             torch.zeros(4, dtype=torch.int32),
             None,

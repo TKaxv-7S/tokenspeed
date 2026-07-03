@@ -50,7 +50,7 @@ class _RecordingAttentionBackend:
         )
 
 
-def test_mixed_batch_resets_prefill_and_retracted_decode_lengths(monkeypatch):
+def test_mixed_batch_resets_retracted_decode_lengths(monkeypatch):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cpu"
     executor.execution_stream = _ExecutionStream()
@@ -77,7 +77,9 @@ def test_mixed_batch_resets_prefill_and_retracted_decode_lengths(monkeypatch):
 
     executor.reset_valid_cache_length(forward_op)
 
-    assert executor.runtime_states.valid_cache_lengths[2].item() == 10
+    # The prefill row is reset by InputBuffers.fill_input_buffers before its
+    # cache-length read. This helper only owns decode retraction recovery.
+    assert executor.runtime_states.valid_cache_lengths[2].item() == 2
     assert executor.runtime_states.valid_cache_lengths[3].item() == 3
     assert executor.runtime_states.valid_cache_lengths[4].item() == 7
 

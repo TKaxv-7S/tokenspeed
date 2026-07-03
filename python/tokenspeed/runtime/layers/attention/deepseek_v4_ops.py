@@ -58,13 +58,13 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     write_deepseek_v4_indexer_mxfp4_cache_cuda as _triton_write_indexer_mxfp4_cache_cuda,
 )
-from tokenspeed_kernel.ops.transform import hadamard_transform
 from tokenspeed_kernel.ops.attention.trtllm.deepseek_v4 import (
     supports_trtllm_deepseek_v4_indexer_q_prepare as _supports_trtllm_indexer_q_prepare,
 )
 from tokenspeed_kernel.ops.attention.trtllm.deepseek_v4 import (
     trtllm_deepseek_v4_indexer_q_prepare_mxfp4 as _trtllm_indexer_q_prepare_mxfp4,
 )
+from tokenspeed_kernel.ops.transform import hadamard_transform
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     DEEPSEEK_V4_FP8_MAX,
