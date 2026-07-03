@@ -485,6 +485,31 @@ class CudaGraphWrapper:
             )
         return out
 
+    def _capture_flat_block_tables(self, bs: int, pool) -> dict | None:
+        """Capture-time shape placeholders for flat per-group page tables.
+
+        Real tables arrive at replay (absolute pages, 0=hole, -1=pad, no base
+        offsets), so unlike the radix variant there is no per-group logical
+        sizing: one zero [bs, max_num_pages] table per group is enough to tell
+        the backend which groups need persistent CUDA-graph buffers.
+        """
+        if not getattr(self.attn_backend, "uses_flat_cache_groups", False):
+            return None
+        specs = tuple(pool.paged_cache_group_specs)
+        if not specs:
+            return None
+        # Placeholder width; only the dict *keys* matter to the backend at
+        # capture, so any flat-capable backend must expose max_num_pages.
+        max_pages = self.attn_backend.max_num_pages
+        return {
+            str(spec.group_id): torch.zeros(
+                (bs, max_pages),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            for spec in specs
+        }
+
     def _init_capture_metadata(self, bs: int):
         capture_kwargs = {}
         if self.input_buffers.has_mamba:
@@ -500,6 +525,12 @@ class CudaGraphWrapper:
             and self.attn_backend.uses_paged_cache_groups
         ):
             capture_kwargs["paged_cache_block_tables"] = paged_cache_block_tables
+        flat_block_tables = self._capture_flat_block_tables(
+            bs,
+            self.token_to_kv_pool,
+        )
+        if flat_block_tables:
+            capture_kwargs["flat_block_tables"] = flat_block_tables
         self.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             self.input_buffers.req_pool_indices_buf[:bs],
@@ -601,6 +632,7 @@ class CudaGraphWrapper:
         paged_cache_block_table_base_offsets = kwargs.pop(
             "paged_cache_block_table_base_offsets", None
         )
+        flat_block_tables = kwargs.pop("flat_block_tables", None)
         target_uses_paged_groups = getattr(
             self.attn_backend,
             "uses_paged_cache_groups",
@@ -637,6 +669,24 @@ class CudaGraphWrapper:
                     kwargs["paged_cache_block_table_base_offsets"] = (
                         paged_cache_block_table_base_offsets
                     )
+        if flat_block_tables is not None and getattr(
+            self.attn_backend, "uses_flat_cache_groups", False
+        ):
+            # Backend replay copy_ expects >= padded_bs rows; pad value -1
+            # matches the flat pad sentinel.
+            flat_table_bs = next(
+                (
+                    int(table.shape[0])
+                    for table in flat_block_tables.values()
+                    if isinstance(table, torch.Tensor)
+                ),
+                int(req_pool_indices.shape[0]),
+            )
+            kwargs["flat_block_tables"] = self._pad_block_tables_to_padded_bs(
+                flat_block_tables,
+                actual_bs=flat_table_bs,
+                padded_bs=padded_bs,
+            )
         if self.attn_backend.uses_padded_decode_token_mask:
             kwargs["actual_bs"] = actual_bs
         if target_uses_paged_groups and forward_mode.is_speculative():
@@ -822,8 +872,8 @@ class CudaGraphWrapper:
         spec_info=None,
         paged_cache_block_tables: dict | None = None,
         paged_cache_block_table_base_offsets: dict | None = None,
-        # Eager path only; graph replay/capture for flat groups is deferred to a
-        # later phase, so this is intentionally not threaded into _init_replay_metadata.
+        # Threaded into both the eager path and _init_replay_metadata for flat
+        # per-group CUDA-graph capture/replay support (M10).
         flat_block_tables: dict | None = None,
     ):
         """
@@ -887,6 +937,10 @@ class CudaGraphWrapper:
                     padded_bs,
                     self.token_to_kv_pool,
                 )
+            # No flat analogue for the bs==0 idle graph: an empty/None
+            # flat_block_tables makes the backend skip the copy, and the
+            # persistent buffers keep previously valid absolute pages while
+            # dummy-row outputs are discarded.
             self._init_replay_metadata(
                 padded_bs,
                 bs,
@@ -899,6 +953,7 @@ class CudaGraphWrapper:
                 paged_cache_block_table_base_offsets=(
                     paged_cache_block_table_base_offsets
                 ),
+                flat_block_tables=flat_block_tables,
                 **mamba_kwargs,
             )
 

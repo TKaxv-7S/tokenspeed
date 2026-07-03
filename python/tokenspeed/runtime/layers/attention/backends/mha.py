@@ -254,20 +254,53 @@ class MHAAttnBackend(AttentionBackend):
             )
             self.cuda_graph_seq_lens = seq_lens_buf
 
+        # Flat per-group CUDA-graph buffers (gid -> [max_bs, max_num_pages]),
+        # lazily allocated on first capture keyed by the flat dict's groups.
+        # TODO(radix-removal): parallels cuda_graph_page_table for the flat path.
+        self.cuda_graph_flat_page_tables: dict[str, torch.Tensor] = {}
+        self._cuda_graph_max_bs = max_bs
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
+        **kwargs,
     ):
         assert not forward_mode.is_extend_or_mixed()
+
+        # Flat per-group tables: lazily allocate persistent buffers keyed by the
+        # flat dict's groups and hand metadata slices into them, so replay can
+        # copy_ into the same addresses the graph recorded. None when the flat
+        # path is off — single-table behavior is unchanged.
+        flat_block_tables = kwargs.get("flat_block_tables") or None
+        page_tables = None
+        if flat_block_tables:
+            # Flat + spec-decode is out of scope for M10: the per-group views
+            # below are bs rows while spec buffers are expanded to
+            # bs * spec_num_tokens rows (gpt-oss does not use spec decode).
+            assert not (self.spec_num_tokens > 1 and not self.is_draft), (
+                "flat_block_tables is unsupported with spec_num_tokens > 1"
+            )
+            page_tables = {}
+            for gid in flat_block_tables:
+                buf = self.cuda_graph_flat_page_tables.get(gid)
+                if buf is None:
+                    buf = torch.zeros(
+                        (self._cuda_graph_max_bs, self.max_num_pages),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    self.cuda_graph_flat_page_tables[gid] = buf
+                page_tables[gid] = buf[:bs, :]
 
         if self.spec_num_tokens > 1 and not self.is_draft:
             expanded_bs = bs * self.spec_num_tokens
             metadata = MHADecodeMetadata(
                 page_table=self.cuda_graph_page_table[:expanded_bs, :],
                 seq_lens=self.cuda_graph_seq_lens[:expanded_bs],
+                page_tables=page_tables,
             )
             self._fill_spec_seq_lens(
                 metadata.seq_lens,
@@ -280,6 +313,7 @@ class MHAAttnBackend(AttentionBackend):
             metadata = MHADecodeMetadata(
                 page_table=self.cuda_graph_page_table[:bs, :],
                 seq_lens=seq_lens,
+                page_tables=page_tables,
             )
             self.cuda_graph_decode_metadata[bs] = metadata
             self.forward_decode_metadata = metadata
@@ -307,6 +341,30 @@ class MHAAttnBackend(AttentionBackend):
             self.cuda_graph_page_table[:bs, : self.max_num_pages].copy_(
                 req_to_page[req_pool_indices[:bs], : self.max_num_pages]
             )
+
+        # Flat per-group tables: copy_ into the persistent capture buffers so
+        # the graph-recorded addresses see the new pages (absolute pages, no
+        # base-offset math). The single-table update above still serves the
+        # radix/single-table path.
+        flat_block_tables = kwargs.get("flat_block_tables") or None
+        if flat_block_tables:
+            # Group set is fixed per model (from config.layer_types), so every
+            # captured group appears in every replay dict; no stale-group check.
+            for gid, src in flat_block_tables.items():
+                # Buffers exist: capture allocated them for these groups.
+                buf = self.cuda_graph_flat_page_tables[gid]
+                cols = src.shape[1]
+                assert cols <= buf.shape[1], (
+                    f"flat table for group {gid!r}: {cols} cols >"
+                    f" CUDA-graph buffer {buf.shape[1]}"
+                )
+                assert src.shape[0] >= bs, (
+                    f"flat table for group {gid!r} has {src.shape[0]} rows"
+                    f" < padded bs {bs}"
+                )
+                buf[:bs, :cols].copy_(src[:bs, :])
+                if cols < buf.shape[1]:
+                    buf[:bs, cols:].fill_(-1)
 
         if bs in self.cuda_graph_decode_metadata:
             self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
