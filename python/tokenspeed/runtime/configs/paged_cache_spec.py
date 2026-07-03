@@ -37,6 +37,25 @@ class PagedCacheGroupSpec:
 _PAGED_CACHE_GROUP_DUMMY_PAGES = 1
 
 
+def scheduler_ext_flat_kvcache() -> bool:
+    """Whether the installed tokenspeed_scheduler ext is a flat-KV-cache build.
+
+    True iff the compiled extension was built with TOKENSPEED_FLAT_KVCACHE
+    (flat KvCacheCoordinator scheduler). Failure-tolerant probe: a missing
+    package, or an older / radix-built extension without the ``FLAT_KVCACHE``
+    attribute, reports False. False must keep paged-cache group publication
+    off — the radix scheduler never populates ``flat_block_tables``, so the
+    flat CUDA-graph capture path must stay inactive against it.
+    """
+    try:
+        # Local import: keeps this module importable without the compiled
+        # scheduler extension (pure-spec unit tests).
+        import tokenspeed_scheduler
+    except ImportError:
+        return False
+    return bool(getattr(tokenspeed_scheduler, "FLAT_KVCACHE", False))
+
+
 def compute_paged_cache_group_page_counts(
     specs: Sequence[PagedCacheGroupSpec],
     *,
@@ -188,4 +207,5 @@ __all__ = [
     "Retention",
     "compute_paged_cache_group_page_counts",
     "group_specs_from_layer_types",
+    "scheduler_ext_flat_kvcache",
 ]

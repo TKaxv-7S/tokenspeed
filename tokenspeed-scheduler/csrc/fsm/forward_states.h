@@ -125,7 +125,10 @@ public:
 
     std::int32_t TailPageAvailableTokens() const {
         if (!block_tables_.empty()) {
-            return block_tables_[0].TailAvailableTokens();  // flat: full group tail
+            // flat: any group works here. Every group Acquires the same token
+            // count each step (the coordinator fans out uniformly), so all
+            // groups always carry an identical tail_avail.
+            return block_tables_[0].TailAvailableTokens();
         }
         return local_kv_allocator_->TailPageAvailableTokens();  // radix
     }
@@ -178,9 +181,28 @@ struct ForwardState : public BaseState {
     std::unique_ptr<ReqPoolIndex> TakeReqPoolIndex() && { return std::move(req_pool_index_); }
     std::int32_t GetReqPoolIndex() const { return req_pool_index_ ? req_pool_index_->slot_ : -1; }
 
+    // Flat contract for this and GetLocalAllocatorPages below: group 0 = the
+    // FIRST CONFIGURED group, which need not be the full-attention one (group
+    // order follows first appearance in the model's layer_types; GPT-OSS lists
+    // sliding_attention first). Unlike tail_avail, page IDS genuinely differ
+    // per group (distinct physical pages; AdvanceWindow punches 0-holes into
+    // SWA tables), so this is a single-group SAMPLE.
+    // Count-only consumers are fine: applyPrefillEvent/applyDecodeEvent rely
+    // on the page COUNTS before/after an event (identical across groups) and
+    // ActiveKvPages is a one-group stat. BUT op.occupied_pages built from this
+    // ALSO feeds Python's req_to_page -> compute_out_cache_loc -- the SINGLE
+    // KV-WRITE address stream for every layer. With >1 group that is a
+    // CORRECTNESS BUG: all layers write into group 0's pages while non-group-0
+    // layers read their own (never-written) tables; on a fresh pool those
+    // reads are zeros, silently ablating those layers (masked GPT-OSS first
+    // light, 2026-07-03 investigation).
+    // TODO(flat-group-writes): per-group write addressing (per-group
+    // occupied_pages across the binding, or backend-side write locs from
+    // metadata.page_tables[group]) before multi-group flat is usable; until
+    // then this view is only correct for single-group configs.
     std::vector<std::int32_t> GetOccupiedPages() const {
         if (!block_tables_.empty()) {
-            return BlockTablePageIds(block_tables_[0]);  // flat: full group page ids
+            return BlockTablePageIds(block_tables_[0]);  // flat: first-group sample (see above)
         }
         return GetPageContainer().Pages();  // radix
     }
@@ -188,7 +210,7 @@ struct ForwardState : public BaseState {
     // Returns only the pages held by the local KV allocator (tail pages, not radix-tree prefix pages).
     std::vector<std::int32_t> GetLocalAllocatorPages() const {
         if (!block_tables_.empty()) {
-            return BlockTablePageIds(block_tables_[0]);  // flat: full group page ids
+            return BlockTablePageIds(block_tables_[0]);  // flat: first-group sample (see GetOccupiedPages)
         }
         return local_kv_allocator_->Pages();  // radix
     }

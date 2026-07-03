@@ -64,7 +64,7 @@ public:
     // ref) and append it to the table. null_block holes are appended as-is (they
     // keep logical-page alignment) but never touched -- the null block is not ref
     // counted. Must be called on a fresh table (prefill start) before any Acquire.
-    bool ClaimHitBlocks(BlockTable& table, const PrefixMatch& hit) {
+    void ClaimHitBlocks(BlockTable& table, const PrefixMatch& hit) {
         _assert(table.blocks_.empty(), "ClaimHitBlocks requires a fresh (empty) table");
         for (CacheBlock* block : hit.blocks) {
             if (!block->IsNull()) {
@@ -72,7 +72,6 @@ public:
             }
             table.blocks_.push_back(block);
         }
-        return true;
     }
 
     // Token-driven incremental allocation, mirroring LocalKVAllocator::Acquire.
@@ -131,6 +130,13 @@ public:
             pool_.CacheFullBlocks(block, block_hashes[i]);
         }
     }
+
+    // Advance the manager's retention window to num_computed_tokens, releasing
+    // whatever fell out of it. Full-history managers retain everything
+    // mid-sequence, so the default is a no-op; window-evicting managers
+    // (SwaManager, later MambaManager) override it. The coordinator fans this
+    // out to every group uniformly, like its other operations.
+    virtual void AdvanceWindow(BlockTable& /*table*/, std::int32_t /*num_computed_tokens*/) {}
 
     // Release every page the table holds (reverse-order via the pool) and reset
     // the table. Cached pages keep their hash on free, so they remain

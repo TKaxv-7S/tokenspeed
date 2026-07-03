@@ -485,32 +485,17 @@ class CudaGraphWrapper:
             )
         return out
 
-    def _capture_flat_block_tables(self, bs: int, pool) -> dict | None:
-        """Capture-time shape placeholders for flat per-group page tables.
+    def _flat_cache_group_ids(self, pool) -> tuple[str, ...]:
+        """Group ids for flat per-group CUDA-graph capture.
 
         Real tables arrive at replay (absolute pages, 0=hole/dummy-row pad,
-        -1=column pad, no base offsets), so unlike the radix variant there is
-        no per-group logical sizing: one zero [bs, max_num_pages] table per
-        group is enough to tell the backend which groups need persistent
-        CUDA-graph buffers. Zeros here match the dummy-row contract: page 0 is
-        the zero-initialized dummy page, safe for the warmup dereference.
+        -1=column pad, no base offsets); at capture the backend only needs the
+        group ids to allocate its persistent per-group buffers, so no
+        data-shaped placeholder tensors are fabricated here.
         """
         if not getattr(self.attn_backend, "uses_flat_cache_groups", False):
-            return None
-        specs = tuple(pool.paged_cache_group_specs)
-        if not specs:
-            return None
-        # Placeholder width; only the dict *keys* matter to the backend at
-        # capture, so any flat-capable backend must expose max_num_pages.
-        max_pages = self.attn_backend.max_num_pages
-        return {
-            str(spec.group_id): torch.zeros(
-                (bs, max_pages),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            for spec in specs
-        }
+            return ()
+        return tuple(str(spec.group_id) for spec in pool.paged_cache_group_specs)
 
     def _init_capture_metadata(self, bs: int):
         capture_kwargs = {}
@@ -518,21 +503,16 @@ class CudaGraphWrapper:
             capture_kwargs["mamba_pool_indices"] = (
                 self.input_buffers.mamba_pool_indices_buf[:bs]
             )
-        paged_cache_block_tables = self._capture_paged_cache_block_tables(
-            bs,
-            self.token_to_kv_pool,
-        )
-        if (
-            paged_cache_block_tables is not None
-            and self.attn_backend.uses_paged_cache_groups
-        ):
-            capture_kwargs["paged_cache_block_tables"] = paged_cache_block_tables
-        flat_block_tables = self._capture_flat_block_tables(
-            bs,
-            self.token_to_kv_pool,
-        )
-        if flat_block_tables:
-            capture_kwargs["flat_block_tables"] = flat_block_tables
+        if self.attn_backend.uses_paged_cache_groups:
+            paged_cache_block_tables = self._capture_paged_cache_block_tables(
+                bs,
+                self.token_to_kv_pool,
+            )
+            if paged_cache_block_tables is not None:
+                capture_kwargs["paged_cache_block_tables"] = paged_cache_block_tables
+        flat_cache_group_ids = self._flat_cache_group_ids(self.token_to_kv_pool)
+        if flat_cache_group_ids:
+            capture_kwargs["flat_cache_group_ids"] = flat_cache_group_ids
         self.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             self.input_buffers.req_pool_indices_buf[:bs],
@@ -546,15 +526,15 @@ class CudaGraphWrapper:
         )
         if self.draft_attn_backend is not None:
             draft_kwargs = {}
-            if self.draft_token_to_kv_pool is not None:
+            if (
+                self.draft_token_to_kv_pool is not None
+                and self.draft_attn_backend.uses_paged_cache_groups
+            ):
                 draft_paged_cache_block_tables = self._capture_paged_cache_block_tables(
                     bs,
                     self.draft_token_to_kv_pool,
                 )
-                if (
-                    draft_paged_cache_block_tables is not None
-                    and self.draft_attn_backend.uses_paged_cache_groups
-                ):
+                if draft_paged_cache_block_tables is not None:
                     draft_kwargs["paged_cache_block_tables"] = (
                         draft_paged_cache_block_tables
                     )
@@ -566,6 +546,17 @@ class CudaGraphWrapper:
                 _draft_decode_forward_mode(self.use_target_verify_forward_mode),
                 **draft_kwargs,
             )
+
+    def _idle_flat_block_tables(self, padded_bs: int) -> dict | None:
+        """Minimal per-group tables for the bs==0 idle replay of a
+        flat-captured graph: all rows are dummy rows, so a single column of
+        page-0 (the zero-initialized dummy page) entries per group is valid.
+        None when the pool publishes no groups (no flat buffers captured)."""
+        specs = tuple(self.token_to_kv_pool.paged_cache_group_specs)
+        if not specs:
+            return None
+        table = torch.zeros((padded_bs, 1), dtype=torch.int32, device=self.device)
+        return {str(spec.group_id): table for spec in specs}
 
     @staticmethod
     def _pad_block_tables_to_padded_bs(
@@ -953,11 +944,18 @@ class CudaGraphWrapper:
                     padded_bs,
                     self.token_to_kv_pool,
                 )
-            # No flat analogue for the bs==0 idle graph: an empty/None
-            # flat_block_tables makes the backend skip the copy, and the
-            # persistent buffers keep prior contents whose col-0 entries are
-            # always dereferenceable (capture zeros, real pages, or dummy-row
-            # pad 0 — never -1); dummy-row outputs are discarded.
+            # bs==0 idle graph on the flat path: a flat-captured graph replayed
+            # without tables raises in the backend (stale-table guard), so
+            # synthesize the minimal valid tables — every replay row is a dummy
+            # row (seq_lens=1), so one col-0 entry on the zero-initialized
+            # dummy page 0 per row suffices; the backend fills the column tail
+            # with -1 (never dereferenced past cache_seqlens).
+            if (
+                bs == 0
+                and not flat_block_tables
+                and getattr(self.attn_backend, "uses_flat_cache_groups", False)
+            ):
+                flat_block_tables = self._idle_flat_block_tables(padded_bs)
             self._init_replay_metadata(
                 padded_bs,
                 bs,

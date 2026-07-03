@@ -110,19 +110,6 @@ namespace tokenspeed::fsm {
 #if TOKENSPEED_FLAT_KVCACHE
 namespace {
 
-// Content hashes for the full pages covered by the processed window [0, window_end),
-// truncating any tail page past the window. Feeds the coordinator's prefix cache so
-// later requests can hit these pages.
-std::vector<std::string> FlatWindowPageHashes(const BaseState& state, std::int32_t window_begin,
-                                              std::int32_t window_size) {
-    auto paged_tokens = state.GetFullPagedTokens(false);
-    const std::int32_t end_of_window_pages = (window_begin + window_size) / state.GetPageSize();
-    if (end_of_window_pages < static_cast<std::int32_t>(paged_tokens.size())) {
-        paged_tokens.resize(end_of_window_pages);
-    }
-    return ComputePagedHashes(paged_tokens, "");
-}
-
 // The flat path does not yet support retract/writeback/loadback. Used to terminate
 // those transitions; the throw makes the call noreturn so callers with non-default-
 // constructible return types still compile.
@@ -173,6 +160,7 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
 // Submitted -> PrefillDone / Prefilling
 std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
+    _assert(coordinator_ != nullptr, "SchedulePrefillFirstChunkEvent: flat path requires a coordinator");
     TokenContainer* token_container = state.GetTokenContainer();
     std::vector<BlockTable> tables(coordinator_->NumGroups());
 
@@ -286,8 +274,11 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
 // Prefilling -> Prefilling / PrefillDone
 std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefilling&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
+    _assert(coordinator_ != nullptr, "SchedulePrefillEvent: flat path requires a coordinator");
     // Read state before taking the tables (use-after-move hygiene).
-    const std::vector<std::string> hashes = FlatWindowPageHashes(state, state.window.begin, state.window.size);
+    const std::vector<std::string> hashes =
+        FlatWindowPageHashes(state.GetFullPagedTokens(false), state.GetPageSize(), state.window.begin,
+                             state.window.size);
     const std::int32_t num_full_blocks = static_cast<std::int32_t>(hashes.size());
 
     auto tables = std::move(state).TakeBlockTables();
@@ -381,16 +372,16 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
 // PrefillDone -> Decoding: insert prefill pages into tree, then transition to decode.
 Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
+    _assert(coordinator_ != nullptr, "ScheduleDecodeEvent: flat path requires a coordinator");
     // Read state before taking the tables (use-after-move hygiene).
-    const std::vector<std::string> hashes = FlatWindowPageHashes(state, state.window.begin, state.window.size);
+    const std::vector<std::string> hashes =
+        FlatWindowPageHashes(state.GetFullPagedTokens(false), state.GetPageSize(), state.window.begin,
+                             state.window.size);
     const std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
 
     auto tables = std::move(state).TakeBlockTables();
     try {
-        // Register any remaining full prefill pages so later requests can prefix-hit.
-        coordinator_->CacheFullBlocks(tables, hashes, static_cast<std::int32_t>(hashes.size()));
-
-        if (!coordinator_->Acquire(tables, reserve)) {
+        if (!FinalizePrefillAndReserveDecode(*coordinator_, tables, hashes, reserve)) {
             _assert(false, "flat path: allocation failure unsupported in C slice");
         }
     } catch (...) {
@@ -444,6 +435,7 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
 // Decoding -> Decoding: allocate pages for next decode step.
 Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
+    _assert(coordinator_ != nullptr, "ScheduleDecodeEvent: flat path requires a coordinator");
     // Read state before taking the tables (use-after-move hygiene).
     const std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
     const std::int32_t num_computed_tokens = state.GetTokenContainer()->Size();
@@ -541,6 +533,7 @@ Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
 template <typename ForwardStateT>
 std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
+    _assert(coordinator_ != nullptr, "FinishEvent: flat path requires a coordinator");
     auto tables = std::move(state).TakeBlockTables();
     FreeRequest(*coordinator_, tables);
     return Finished{};
@@ -693,6 +686,7 @@ Aborting AbortEvent::operator()(Aborting&& state) {
 
 Finished AbortEvent::operator()(Prefilling&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
+    _assert(coordinator_ != nullptr, "AbortEvent: flat path requires a coordinator");
     auto tables = std::move(state).TakeBlockTables();
     FreeRequest(*coordinator_, tables);
 #else
@@ -703,6 +697,7 @@ Finished AbortEvent::operator()(Prefilling&& state) {
 
 Finished AbortEvent::operator()(PrefillDone&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
+    _assert(coordinator_ != nullptr, "AbortEvent: flat path requires a coordinator");
     auto tables = std::move(state).TakeBlockTables();
     FreeRequest(*coordinator_, tables);
 #else
@@ -713,6 +708,7 @@ Finished AbortEvent::operator()(PrefillDone&& state) {
 
 Finished AbortEvent::operator()(Decoding&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
+    _assert(coordinator_ != nullptr, "AbortEvent: flat path requires a coordinator");
     auto tables = std::move(state).TakeBlockTables();
     FreeRequest(*coordinator_, tables);
 #else

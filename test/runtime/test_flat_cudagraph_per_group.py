@@ -79,8 +79,8 @@ class PadBlockTablesTest(_TorchCase):
         self.assertIs(out["full_attention"], tables["full_attention"])
 
 
-class CaptureFlatBlockTablesTest(_TorchCase):
-    """Wrapper-side capture placeholders (keys from pool group specs)."""
+class FlatCacheGroupIdsTest(_TorchCase):
+    """Wrapper-side capture contract: group ids only, no fabricated tensors."""
 
     def setUp(self):
         super().setUp()
@@ -88,15 +88,11 @@ class CaptureFlatBlockTablesTest(_TorchCase):
             CudaGraphWrapper,
         )
 
-        self.capture = CudaGraphWrapper._capture_flat_block_tables
+        self.group_ids = CudaGraphWrapper._flat_cache_group_ids
 
     def _wrapper(self, uses_flat=True):
         return SimpleNamespace(
-            attn_backend=SimpleNamespace(
-                uses_flat_cache_groups=uses_flat,
-                max_num_pages=MAX_NUM_PAGES,
-            ),
-            device="cpu",
+            attn_backend=SimpleNamespace(uses_flat_cache_groups=uses_flat),
         )
 
     def _pool(self, group_ids):
@@ -106,25 +102,56 @@ class CaptureFlatBlockTablesTest(_TorchCase):
             )
         )
 
-    def test_keys_shape_dtype(self):
-        out = self.capture(
+    def test_ids_in_spec_order(self):
+        out = self.group_ids(
             self._wrapper(),
-            3,
             self._pool(["sliding_attention", "full_attention"]),
+        )
+        self.assertEqual(out, ("sliding_attention", "full_attention"))
+
+    def test_empty_without_specs(self):
+        self.assertEqual(self.group_ids(self._wrapper(), self._pool([])), ())
+
+    def test_empty_when_backend_not_flat(self):
+        out = self.group_ids(
+            self._wrapper(uses_flat=False), self._pool(["full_attention"])
+        )
+        self.assertEqual(out, ())
+
+
+class IdleFlatBlockTablesTest(_TorchCase):
+    """bs==0 idle replay tables: one col-0 page-0 entry per dummy row."""
+
+    def setUp(self):
+        super().setUp()
+        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+            CudaGraphWrapper,
+        )
+
+        self.idle = CudaGraphWrapper._idle_flat_block_tables
+
+    def _wrapper(self, group_ids):
+        return SimpleNamespace(
+            token_to_kv_pool=SimpleNamespace(
+                paged_cache_group_specs=tuple(
+                    SimpleNamespace(group_id=gid) for gid in group_ids
+                )
+            ),
+            device="cpu",
+        )
+
+    def test_page_zero_single_column_per_group(self):
+        out = self.idle(
+            self._wrapper(["sliding_attention", "full_attention"]), 3
         )
         self.assertEqual(set(out), {"sliding_attention", "full_attention"})
         for table in out.values():
-            self.assertEqual(tuple(table.shape), (3, MAX_NUM_PAGES))
+            self.assertEqual(tuple(table.shape), (3, 1))
             self.assertEqual(table.dtype, self.torch.int32)
+            self.assertTrue((table == 0).all())
 
     def test_none_without_specs(self):
-        self.assertIsNone(self.capture(self._wrapper(), 3, self._pool([])))
-
-    def test_none_when_backend_not_flat(self):
-        out = self.capture(
-            self._wrapper(uses_flat=False), 3, self._pool(["full_attention"])
-        )
-        self.assertIsNone(out)
+        self.assertIsNone(self.idle(self._wrapper([]), 3))
 
 
 class _BackendCase(_TorchCase):
@@ -153,17 +180,14 @@ class _BackendCase(_TorchCase):
         backend._cuda_graph_max_bs = MAX_BS
         self.backend = backend
 
-    def _capture(self, bs, flat_block_tables=None):
+    def _capture(self, bs, flat_cache_group_ids=()):
         torch = self.torch
-        kwargs = {}
-        if flat_block_tables is not None:
-            kwargs["flat_block_tables"] = flat_block_tables
         self.backend.init_forward_metadata_capture_cuda_graph(
             bs,
             torch.arange(bs, dtype=torch.int64),
             torch.ones(bs, dtype=torch.int32),
             _decode_forward_mode(),
-            **kwargs,
+            flat_cache_group_ids=flat_cache_group_ids,
         )
         return self.backend.cuda_graph_decode_metadata[bs]
 
@@ -182,26 +206,20 @@ class _BackendCase(_TorchCase):
         )
 
 
-class BackendCaptureFlatTest(_BackendCase):
-    def _placeholders(self, bs):
-        torch = self.torch
-        return {
-            gid: torch.zeros((bs, MAX_NUM_PAGES), dtype=torch.int32)
-            for gid in ("sliding_attention", "full_attention")
-        }
+_GROUP_IDS = ("sliding_attention", "full_attention")
 
-    def test_page_tables_none_without_flat_kwarg(self):
+
+class BackendCaptureFlatTest(_BackendCase):
+    def test_page_tables_none_without_group_ids(self):
         metadata = self._capture(2)
         self.assertIsNone(metadata.page_tables)
         self.assertEqual(self.backend.cuda_graph_flat_page_tables, {})
 
     def test_allocates_persistent_buffers_and_views(self):
         bs = 2
-        metadata = self._capture(bs, self._placeholders(bs))
+        metadata = self._capture(bs, _GROUP_IDS)
         bufs = self.backend.cuda_graph_flat_page_tables
-        self.assertEqual(
-            set(bufs), {"sliding_attention", "full_attention"}
-        )
+        self.assertEqual(set(bufs), set(_GROUP_IDS))
         for gid, buf in bufs.items():
             self.assertEqual(tuple(buf.shape), (MAX_BS, MAX_NUM_PAGES))
             self.assertEqual(buf.dtype, self.torch.int32)
@@ -211,9 +229,9 @@ class BackendCaptureFlatTest(_BackendCase):
             self.assertEqual(view.data_ptr(), buf.data_ptr())
 
     def test_second_capture_reuses_buffers(self):
-        first = self._capture(2, self._placeholders(2))
+        first = self._capture(2, _GROUP_IDS)
         bufs = dict(self.backend.cuda_graph_flat_page_tables)
-        second = self._capture(4, self._placeholders(4))
+        second = self._capture(4, _GROUP_IDS)
         self.assertEqual(
             {g: b.data_ptr() for g, b in bufs.items()},
             {
@@ -233,21 +251,14 @@ class BackendCaptureFlatTest(_BackendCase):
             MAX_BS * 2, dtype=torch.int32
         )
         with self.assertRaisesRegex(AssertionError, "spec_num_tokens"):
-            self._capture(2, self._placeholders(2))
+            self._capture(2, _GROUP_IDS)
 
 
 class BackendReplayFlatTest(_BackendCase):
     def setUp(self):
         super().setUp()
         # Capture first so persistent buffers exist (replay indexes them).
-        torch = self.torch
-        self._capture(
-            2,
-            {
-                gid: torch.zeros((2, MAX_NUM_PAGES), dtype=torch.int32)
-                for gid in ("sliding_attention", "full_attention")
-            },
-        )
+        self._capture(2, _GROUP_IDS)
 
     def test_copies_prefix_and_fills_tail_minus_one(self):
         torch = self.torch
@@ -322,14 +333,35 @@ class BackendReplayFlatTest(_BackendCase):
         with self.assertRaisesRegex(AssertionError, "rows"):
             self._replay(2, src)
 
-    def test_no_flat_kwarg_is_noop_on_buffers(self):
+    def test_missing_tables_with_flat_buffers_raises(self):
+        # A flat-captured graph replayed without tables must be loud, never
+        # silently compute over stale/zero page tables.
+        with self.assertRaisesRegex(RuntimeError, "stale"):
+            self._replay(2)
+
+    def test_missing_tables_empty_dict_raises(self):
+        with self.assertRaisesRegex(RuntimeError, "flat_block_tables"):
+            self._replay(2, {})
+
+    def test_bs_zero_missing_tables_skips(self):
+        # Documented bs==0 skip: buffers keep valid page-0/previous entries;
+        # outputs are discarded.
         before = {
             gid: buf.clone()
             for gid, buf in self.backend.cuda_graph_flat_page_tables.items()
         }
-        self._replay(2)
+        self._replay(0)
         for gid, buf in self.backend.cuda_graph_flat_page_tables.items():
             self.assertTrue((buf == before[gid]).all())
+
+
+class BackendReplayNoFlatBuffersTest(_BackendCase):
+    def test_replay_without_flat_capture_needs_no_tables(self):
+        # No flat buffers captured (radix/single-table path): replay without
+        # tables stays valid.
+        self._capture(2)
+        self._replay(2)
+        self.assertEqual(self.backend.cuda_graph_flat_page_tables, {})
 
 
 if __name__ == "__main__":

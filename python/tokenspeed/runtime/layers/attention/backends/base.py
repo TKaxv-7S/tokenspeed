@@ -95,8 +95,16 @@ class AttentionBackend(ABC):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
+        flat_cache_group_ids: tuple[str, ...] = (),
+        **kwargs,
     ):
-        """Init the metadata for a forward pass for capturing a cuda graph."""
+        """Init the metadata for a forward pass for capturing a cuda graph.
+
+        ``flat_cache_group_ids`` names the flat KV-cache groups whose page
+        tables arrive at replay; a flat-capable backend (uses_flat_cache_groups)
+        allocates its persistent per-group buffers from these ids — no table
+        data exists at capture time. Empty tuple for non-flat backends.
+        """
         raise NotImplementedError()
 
     def init_forward_metadata_replay_cuda_graph(
@@ -106,6 +114,7 @@ class AttentionBackend(ABC):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
         req_to_page: torch.Tensor = None,
+        flat_block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
         """Update pre-allocated CUDA-graph metadata buffers in-place before replay.
@@ -113,6 +122,9 @@ class AttentionBackend(ABC):
         Called instead of init_forward_metadata when use_cuda_graph=True, so
         that the captured kernels (which hold pointers into the pre-allocated
         buffers) see the current batch's data without any new allocations.
+        ``flat_block_tables`` carries the per-group flat page tables
+        (group_id -> [>=bs, cols]) for flat-capable backends; a backend that
+        captured flat buffers must be handed non-empty tables whenever bs > 0.
         Default: fall back to init_forward_metadata (correct but may not work
         for all backends that use separate cuda-graph buffer pools).
         """

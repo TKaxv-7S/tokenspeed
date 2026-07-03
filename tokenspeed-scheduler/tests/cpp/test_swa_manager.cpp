@@ -214,7 +214,7 @@ TEST(SwaManagerTest, ClaimHitBlocksSkipsNullHoles) {
     ASSERT_EQ(m.num_hit_blocks, 3);
 
     BlockTable table;
-    ASSERT_TRUE(mgr.ClaimHitBlocks(table, m));
+    mgr.ClaimHitBlocks(table, m);
 
     // Table keeps all 4 slots (hole preserved for logical-page alignment).
     EXPECT_EQ(table.NumBlocks(), 4);

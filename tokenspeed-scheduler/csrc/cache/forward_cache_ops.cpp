@@ -51,6 +51,12 @@ bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables
     return true;
 }
 
+bool FinalizePrefillAndReserveDecode(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
+                                     std::span<const std::string> content_hashes, std::int32_t reserve_tokens) {
+    coordinator.CacheFullBlocks(tables, content_hashes, static_cast<std::int32_t>(content_hashes.size()));
+    return coordinator.Acquire(tables, reserve_tokens);
+}
+
 std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
     std::vector<KvCacheSpec> specs;
     specs.reserve(config.paged_cache_groups.size());

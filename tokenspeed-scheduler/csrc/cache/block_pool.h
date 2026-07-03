@@ -66,16 +66,16 @@ public:
         --ref_cnt_;
     }
 
-    // Hash mutators are public but assertion-guarded: a block must be hashed at
-    // most once before being reset. Only BlockPool calls these in practice.
+private:
+    friend class BlockPool;
+
+    // Hash mutators, assertion-guarded: a block must be hashed at most once
+    // before being reset.
     void SetHash(std::string hash) {
         _assert(block_hash_.empty(), "block already has a hash");
         block_hash_ = std::move(hash);
     }
     void ResetHash() { block_hash_.clear(); }
-
-private:
-    friend class BlockPool;
 
     std::int32_t block_id_{0};
     std::int32_t ref_cnt_{0};

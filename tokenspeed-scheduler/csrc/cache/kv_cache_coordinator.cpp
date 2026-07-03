@@ -168,10 +168,7 @@ void KvCacheCoordinator::AdvanceWindow(std::span<BlockTable> tables, std::int32_
     _assert(static_cast<std::int32_t>(tables.size()) == NumGroups(),
             "AdvanceWindow: tables size must match group count");
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        if (groups_[i].Spec().kind == AttnKind::kSlidingWindow) {
-            auto& swa = static_cast<SwaManager&>(groups_[i].Manager());
-            swa.AdvanceWindow(tables[i], num_computed_tokens);
-        }
+        groups_[i].Manager().AdvanceWindow(tables[i], num_computed_tokens);
     }
 }
 

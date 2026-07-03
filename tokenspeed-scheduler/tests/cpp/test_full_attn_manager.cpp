@@ -117,7 +117,7 @@ TEST(FullAttnManagerTest, ClaimHitBlocksClaimsAndAppends) {
 
     PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0});
     BlockTable table;
-    ASSERT_TRUE(mgr.ClaimHitBlocks(table, m));
+    mgr.ClaimHitBlocks(table, m);
 
     EXPECT_EQ(table.NumBlocks(), 1);
     EXPECT_EQ(table.Blocks()[0]->BlockId(), a.front()->BlockId());
@@ -131,7 +131,7 @@ TEST(FullAttnManagerTest, ClaimNoHitsIsNoOp) {
     FullAttnManager mgr(pool, 4);
     BlockTable table;
     PrefixMatch empty;
-    EXPECT_TRUE(mgr.ClaimHitBlocks(table, empty));
+    mgr.ClaimHitBlocks(table, empty);
     EXPECT_EQ(table.NumBlocks(), 0);
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
 }
@@ -300,7 +300,7 @@ TEST(FullAttnManagerTest, EndToEndTwoRequestsSharePrefix) {
         PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0, k1});
         EXPECT_EQ(m.num_hit_blocks, 0);
         BlockTable a;
-        ASSERT_TRUE(mgr.ClaimHitBlocks(a, m));
+        mgr.ClaimHitBlocks(a, m);
         ASSERT_TRUE(mgr.Acquire(a, 8));
         mgr.CacheFullBlocks(a, std::vector<std::string>{k0, k1}, 2);
         mgr.Free(a);
@@ -311,7 +311,7 @@ TEST(FullAttnManagerTest, EndToEndTwoRequestsSharePrefix) {
         PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0, k1});
         EXPECT_EQ(m.num_hit_blocks, 2);
         BlockTable b;
-        ASSERT_TRUE(mgr.ClaimHitBlocks(b, m));
+        mgr.ClaimHitBlocks(b, m);
         EXPECT_EQ(b.NumBlocks(), 2);
         std::int32_t free_before = pool.NumFreeBlocks();
         ASSERT_TRUE(mgr.Acquire(b, 0));  // no new tokens beyond the hit prefix
@@ -348,7 +348,7 @@ TEST(FullAttnManagerTest, ClaimThenAcquireStartsFreshPage) {
 
     PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0});
     BlockTable table;
-    ASSERT_TRUE(mgr.ClaimHitBlocks(table, m));
+    mgr.ClaimHitBlocks(table, m);
     ASSERT_EQ(table.NumBlocks(), 1);
     ASSERT_EQ(table.TailAvailableTokens(), 0);
 

@@ -47,6 +47,9 @@ from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+from tokenspeed.runtime.layers.paged_attention import (
+    validate_paged_cache_group_ids,
+)
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeLimits,
@@ -310,6 +313,20 @@ class ModelExecutor:
             draft_attn_backend.configure_runtime(
                 sliding_window_size=model_runner.sliding_window_size,
                 req_to_page=self.req_to_page,
+            )
+
+        # Fail fast (before CUDA-graph capture runs the first forward): a
+        # multi-group KV pool requires every PagedAttention layer to route to
+        # its group's page table, so a missing/unknown group_id must surface
+        # here with a clear message, not as a KeyError mid-forward.
+        validate_paged_cache_group_ids(
+            model_runner.model,
+            token_to_kv_pool.paged_cache_group_specs,
+        )
+        if draft_model_runner is not None and draft_token_to_kv_pool is not None:
+            validate_paged_cache_group_ids(
+                draft_model_runner.model,
+                draft_token_to_kv_pool.paged_cache_group_specs,
             )
 
         processor = self.model_runner.model.logits_processor

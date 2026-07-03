@@ -20,6 +20,8 @@
 
 """Paged attention."""
 
+from collections.abc import Sequence
+
 import torch
 from torch import nn
 
@@ -94,3 +96,48 @@ class PagedAttention(nn.Module):
             save_kv_cache,
             **kwargs,
         )
+
+
+def validate_paged_cache_group_ids(
+    model: nn.Module,
+    paged_cache_group_specs: Sequence,
+) -> None:
+    """Fail fast when a multi-group paged cache meets group-unaware layers.
+
+    A pool publishing more than one paged-cache group delivers per-group flat
+    page tables keyed by group_id, so every PagedAttention layer must carry a
+    group_id from that set — otherwise the first forward dies with a KeyError
+    deep inside the backend's _select_page_table, possibly during CUDA-graph
+    capture. Single-group pools keep the documented empty-group_id fallback.
+
+    Args:
+        model: The loaded model whose PagedAttention layers to check.
+        paged_cache_group_specs: The KV pool's published group specs
+            (objects with a ``group_id`` attribute).
+
+    Raises:
+        ValueError: naming the model class and the offending layer when a
+            layer's group_id is empty or not among the published groups.
+    """
+    group_ids = {str(spec.group_id) for spec in paged_cache_group_specs}
+    if len(group_ids) <= 1:
+        return
+    model_name = type(model).__name__
+    for name, module in model.named_modules():
+        if not isinstance(module, PagedAttention):
+            continue
+        if not module.group_id:
+            raise ValueError(
+                f"{model_name}: attention layer {name!r} (layer_id="
+                f"{module.layer_id}) has empty group_id but the KV pool "
+                f"publishes {len(group_ids)} paged-cache groups "
+                f"{sorted(group_ids)}; pass group_id=<layer_type> to "
+                "PagedAttention (see gpt_oss.py)."
+            )
+        if module.group_id not in group_ids:
+            raise ValueError(
+                f"{model_name}: attention layer {name!r} (layer_id="
+                f"{module.layer_id}) has group_id={module.group_id!r} which "
+                "is not among the KV pool's paged-cache groups "
+                f"{sorted(group_ids)}."
+            )

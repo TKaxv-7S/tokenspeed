@@ -94,10 +94,10 @@ public:
                          std::int32_t num_full_blocks);
     void Free(std::span<BlockTable> tables);
 
-    // Fan out window-eviction to sliding-window groups only. Full-attention
-    // groups never evict mid-sequence, so they're skipped via the spec.kind
-    // gate. tables are aligned by group index (size must equal NumGroups()).
-    // Mirrors Acquire's per-group fan-out shape.
+    // Fan out window-eviction to every group, mirroring Acquire's per-group
+    // fan-out shape. Managers without a retention window (FullAttnManager)
+    // inherit KvCacheManager's no-op default, so only window-evicting managers
+    // do work. tables are aligned by group index (size must equal NumGroups()).
     void AdvanceWindow(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
 
 private:

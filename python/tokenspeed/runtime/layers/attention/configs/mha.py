@@ -42,9 +42,11 @@ class MHAConfig(BaseAttnConfig):
     sliding_window_tokens: int | None = None
     max_scheduled_tokens: int = 0
     # True iff server_args.speculative_algorithm is set. The pool publishes
-    # paged_cache_group_specs only when this is False: flat page tables are
-    # unsupported with spec-expanded metadata, and non-empty groups would
-    # disable the overlap scheduler under spec decode.
+    # paged_cache_group_specs only when this is False AND the scheduler ext is
+    # flat-built (see the publication rule in kv_cache/mha.py): flat page
+    # tables are unsupported with spec-expanded metadata, non-empty groups
+    # would disable the overlap scheduler under spec decode, and a radix-built
+    # ext never delivers flat tables at all.
     speculative_enabled: bool = False
 
     @classmethod

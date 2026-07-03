@@ -90,9 +90,14 @@ class MHAAttnBackend(AttentionBackend):
     """Standard MHA backend that routes through tokenspeed_kernel attention APIs."""
 
     # Consume flat per-group page tables when the scheduler delivers them. The
-    # flag is unconditional; safety is via (a) the wrapper only forwarding a
-    # non-empty flat_block_tables and (b) _select_page_table's single-table
-    # fallback. TODO(radix-removal): unconditional once radix is gone.
+    # flag is unconditional; safety comes from upstream gating plus a replay
+    # guard: (a) the pool publishes paged_cache_group_specs only when the
+    # tokenspeed_scheduler ext is flat-built and spec decode is off (see the
+    # publication rule in kv_cache/mha.py), so capture only allocates flat
+    # buffers when the scheduler will actually deliver tables, and (b)
+    # init_forward_metadata_replay_cuda_graph raises if a flat-captured graph
+    # would replay without fresh tables. TODO(radix-removal): unconditional
+    # once radix is gone.
     uses_flat_cache_groups: bool = True
 
     def support_kv_cache_prewrite(
@@ -139,6 +144,7 @@ class MHAAttnBackend(AttentionBackend):
         extend_seq_lens_cpu: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
+        flat_block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
         assert not forward_mode.is_mixed(), "mha backend does not support mixed batch"
@@ -155,7 +161,7 @@ class MHAAttnBackend(AttentionBackend):
         # tensors). Present only when uses_flat_cache_groups AND the op carried a
         # non-empty flat_block_tables (the wrapper gates on the flag). None -> the
         # single-table path below is unchanged.
-        flat_page_tables = kwargs.get("flat_block_tables") or None
+        flat_page_tables = flat_block_tables or None
 
         if forward_mode.is_extend_or_mixed():
             extend_seq_lens = extend_seq_lens[:bs]
@@ -266,25 +272,26 @@ class MHAAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
+        flat_cache_group_ids: tuple[str, ...] = (),
         **kwargs,
     ):
         assert not forward_mode.is_extend_or_mixed()
 
-        # Flat per-group tables: lazily allocate persistent buffers keyed by the
-        # flat dict's groups and hand metadata slices into them, so replay can
-        # copy_ into the same addresses the graph recorded. None when the flat
-        # path is off — single-table behavior is unchanged.
-        flat_block_tables = kwargs.get("flat_block_tables") or None
+        # Flat per-group tables: lazily allocate persistent buffers for the
+        # given group ids and hand metadata slices into them, so replay can
+        # copy_ into the same addresses the graph recorded. Real tables only
+        # arrive at replay, so capture needs nothing but the ids. Empty when
+        # the flat path is off — single-table behavior is unchanged.
         page_tables = None
-        if flat_block_tables:
+        if flat_cache_group_ids:
             # Flat + spec-decode is out of scope for M10: the per-group views
             # below are bs rows while spec buffers are expanded to
             # bs * spec_num_tokens rows (gpt-oss does not use spec decode).
             assert not (self.spec_num_tokens > 1 and not self.is_draft), (
-                "flat_block_tables is unsupported with spec_num_tokens > 1"
+                "flat_cache_group_ids is unsupported with spec_num_tokens > 1"
             )
             page_tables = {}
-            for gid in flat_block_tables:
+            for gid in flat_cache_group_ids:
                 buf = self.cuda_graph_flat_page_tables.get(gid)
                 if buf is None:
                     buf = torch.zeros(
@@ -325,9 +332,25 @@ class MHAAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
         forward_mode: ForwardMode,
+        flat_block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
         assert not forward_mode.is_extend_or_mixed()
+
+        # A flat-captured graph replayed without fresh tables would silently
+        # compute over stale/zero page tables — fail loudly instead. bs == 0
+        # keeps the documented skip: buffers hold valid col-0 entries (capture
+        # zeros, real pages, or dummy-row pad 0 — never -1) and outputs are
+        # discarded. The bs == 0 skip is only reachable from unit tests: the
+        # wrapper always replays with padded_bs >= 1 and synthesizes idle
+        # tables for the bs == 0 idle graph.
+        if self.cuda_graph_flat_page_tables and bs > 0 and not flat_block_tables:
+            raise RuntimeError(
+                "MHAAttnBackend replay: flat per-group CUDA-graph buffers "
+                f"exist for groups {sorted(self.cuda_graph_flat_page_tables)} "
+                f"but flat_block_tables is missing/empty at bs={bs}; the "
+                "captured graph would read stale page tables."
+            )
 
         if self.spec_num_tokens > 1 and not self.is_draft:
             base_page_table = req_to_page[req_pool_indices[:bs], : self.max_num_pages]
@@ -355,7 +378,6 @@ class MHAAttnBackend(AttentionBackend):
         # never dereferenced. The fill_(-1) below also hits dummy rows'
         # columns 1.. (giving [0, -1, ...]), which is fine: with seq_lens=1
         # nothing past col 0 is read for those rows.
-        flat_block_tables = kwargs.get("flat_block_tables") or None
         if flat_block_tables:
             # Group set is fixed per model (from config.layer_types), so every
             # captured group appears in every replay dict; no stale-group check.

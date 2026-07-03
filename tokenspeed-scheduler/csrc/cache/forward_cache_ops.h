@@ -55,6 +55,14 @@ bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tabl
 bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                 std::int32_t num_tokens, std::int32_t num_computed_tokens);
 
+// Prefill -> decode transition: register the remaining full prefill pages'
+// content hashes so later requests can prefix-hit them, then allocate the
+// pages reserved for the first decode step. Returns false if the shared pool
+// cannot supply the reservation (the hash registration has already happened;
+// nothing is allocated on failure).
+bool FinalizePrefillAndReserveDecode(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
+                                     std::span<const std::string> content_hashes, std::int32_t reserve_tokens);
+
 // Translate the Python-provided per-group cache config into KvCacheSpecs (one
 // per paged_cache_group, group_id = index). All groups share config.page_size.
 std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config);

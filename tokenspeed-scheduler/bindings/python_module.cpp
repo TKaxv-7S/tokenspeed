@@ -107,6 +107,17 @@ void BindCacheCommonFields(Cls& cls) {
 NB_MODULE(tokenspeed_scheduler_ext, m) {
     m.doc() = "TokenSpeed scheduler bindings";
 
+    // Build-time KV-cache path of this extension: true when compiled with
+    // TOKENSPEED_FLAT_KVCACHE (flat KvCacheCoordinator FSM path), false for the
+    // default radix LocalKVAllocator build. Python gates paged-cache group
+    // publication — and therefore the flat CUDA-graph capture path — on this
+    // flag; a radix build never populates flat_block_tables.
+#if TOKENSPEED_FLAT_KVCACHE
+    m.attr("FLAT_KVCACHE") = true;
+#else
+    m.attr("FLAT_KVCACHE") = false;
+#endif
+
     nb::class_<tokenspeed::SchedulerStats>(m, "SchedulerStats")
         .def(nb::init<>())
         .def_ro("total_batches", &tokenspeed::SchedulerStats::total_batches)

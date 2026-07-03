@@ -73,6 +73,10 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    MambaChunkAllocator* mamba_allocator = nullptr,
                                    std::vector<TreeNode*> mamba_loadback_nodes = {}
 #if TOKENSPEED_FLAT_KVCACHE
+                                   // coordinator keeps a nullptr default (here and in the events below)
+                                   // because radix-only call sites -- production and tests -- are compiled
+                                   // in flat builds too and legitimately construct events without one.
+                                   // Every flat transition body asserts coordinator_ != nullptr on entry.
                                    ,
                                    KvCacheCoordinator* coordinator = nullptr
 #endif

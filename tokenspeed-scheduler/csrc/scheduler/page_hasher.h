@@ -136,6 +136,21 @@ inline std::vector<std::string> ComputePagedHashes(
     return hashes;
 }
 
+// Content hashes for the full pages covered by the processed window
+// [0, window_begin + window_size), truncating any tail page past the window.
+// paged_tokens holds the request's full pages (partial tail already excluded).
+// Feeds the flat coordinator's prefix cache so later requests can hit these
+// pages.
+inline std::vector<std::string> FlatWindowPageHashes(std::vector<std::span<const std::int32_t>> paged_tokens,
+                                                     std::int32_t page_size, std::int32_t window_begin,
+                                                     std::int32_t window_size) {
+    const std::int32_t end_of_window_pages = (window_begin + window_size) / page_size;
+    if (end_of_window_pages < static_cast<std::int32_t>(paged_tokens.size())) {
+        paged_tokens.resize(end_of_window_pages);
+    }
+    return ComputePagedHashes(paged_tokens, "");
+}
+
 // ---- group_id packing / unpacking ----
 // cache group_id is NOT mixed into the SHA stream: it is not part of the page
 // content, it is the label for "which KV cache group this content belongs to".

@@ -72,15 +72,102 @@ class SelectPageTableTest(unittest.TestCase):
         out = self.backend._select_page_table(self._layer(""), meta)
         self.assertIs(out, only)
 
-    def test_unknown_group_id_multi_group_raises(self):
-        meta = self._decode_meta(
+    def _multi_group_meta(self):
+        return self._decode_meta(
             page_tables={
                 "full_attention": self.torch.zeros((1, 1), dtype=self.torch.int32),
                 "sliding_attention": self.torch.zeros((1, 1), dtype=self.torch.int32),
             }
         )
-        with self.assertRaises(KeyError):
-            self.backend._select_page_table(self._layer("nope"), meta)
+
+    def test_unknown_group_id_multi_group_raises(self):
+        # §F(ii): non-empty group_id absent from the dict -> clear error
+        # naming the group and the available keys.
+        with self.assertRaisesRegex(KeyError, "'nope'.*full_attention"):
+            self.backend._select_page_table(
+                self._layer("nope"), self._multi_group_meta()
+            )
+
+    def test_empty_group_id_multi_group_raises(self):
+        # §F(i): a group-unaware layer (group_id="") cannot pick between
+        # multiple published groups -> clear error, no silent fallback.
+        with self.assertRaisesRegex(KeyError, "group_id=''"):
+            self.backend._select_page_table(
+                self._layer(""), self._multi_group_meta()
+            )
+
+
+class ValidatePagedCacheGroupIdsTest(unittest.TestCase):
+    """Init-time fail-fast: multi-group pool requires labeled layers."""
+
+    def setUp(self):
+        try:
+            import torch  # noqa: F401
+            from torch import nn
+
+            from tokenspeed.runtime.layers.paged_attention import (
+                PagedAttention,
+                validate_paged_cache_group_ids,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch: {exc}")
+        self.nn = nn
+        self.PagedAttention = PagedAttention
+        self.validate = validate_paged_cache_group_ids
+
+    def _model(self, group_ids):
+        nn, PagedAttention = self.nn, self.PagedAttention
+
+        class TinyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attns = nn.ModuleList(
+                    PagedAttention(
+                        num_heads=1,
+                        head_dim=4,
+                        scaling=1.0,
+                        num_kv_heads=1,
+                        layer_id=i,
+                        group_id=gid,
+                    )
+                    for i, gid in enumerate(group_ids)
+                )
+
+        return TinyModel()
+
+    def _specs(self, group_ids):
+        from types import SimpleNamespace
+
+        return tuple(SimpleNamespace(group_id=gid) for gid in group_ids)
+
+    def test_multi_group_all_labeled_passes(self):
+        self.validate(
+            self._model(["full_attention", "sliding_attention"]),
+            self._specs(["full_attention", "sliding_attention"]),
+        )
+
+    def test_multi_group_empty_group_id_raises(self):
+        with self.assertRaisesRegex(
+            ValueError, r"TinyModel.*layer_id=1.*empty group_id"
+        ):
+            self.validate(
+                self._model(["full_attention", ""]),
+                self._specs(["full_attention", "sliding_attention"]),
+            )
+
+    def test_multi_group_unknown_group_id_raises(self):
+        with self.assertRaisesRegex(ValueError, r"TinyModel.*'nope'"):
+            self.validate(
+                self._model(["full_attention", "nope"]),
+                self._specs(["full_attention", "sliding_attention"]),
+            )
+
+    def test_single_group_empty_group_id_is_fine(self):
+        # Documented fallback: single-group pools serve group-unaware layers.
+        self.validate(self._model(["", ""]), self._specs(["full_attention"]))
+
+    def test_no_groups_is_fine(self):
+        self.validate(self._model(["", ""]), self._specs([]))
 
 
 class GptOssGroupIdTest(unittest.TestCase):

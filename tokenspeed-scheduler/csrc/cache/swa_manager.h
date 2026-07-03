@@ -89,7 +89,7 @@ public:
     // range right->left and stops at the first already-null slot (earlier slots
     // were punched by prior calls). Reverse-collect + direct FreeBlocks evicts
     // the first-slid-out page first (FIFO).
-    void AdvanceWindow(BlockTable& table, std::int32_t num_computed_tokens) {
+    void AdvanceWindow(BlockTable& table, std::int32_t num_computed_tokens) override {
         std::int32_t skipped = num_computed_tokens - sliding_window_ + 1;
         if (skipped <= 0) {
             return;  // all tokens still inside the window

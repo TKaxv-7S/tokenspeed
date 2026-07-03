@@ -96,6 +96,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         from tokenspeed.runtime.configs.paged_cache_spec import (
             compute_paged_cache_group_page_counts,
             group_specs_from_layer_types,
+            scheduler_ext_flat_kvcache,
         )
 
         # Publish per-group specs so the C++ scheduler is configured multi-group
@@ -103,15 +104,27 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         # full-history group, which the flat (TOKENSPEED_FLAT_KVCACHE) scheduler
         # build needs to allocate pages for plain non-hybrid MHA models.
         #
-        # Rule: publish groups iff speculative decoding is off. Flat page tables
-        # do not support spec-expanded metadata (backends/mha.py asserts on
-        # flat_block_tables with spec_num_tokens > 1), and non-empty groups turn
-        # off the overlap scheduler under spec decode
-        # (scheduler_utils.should_use_overlap_schedule), so spec runs keep the
-        # pre-group behavior: no specs, no flat capture kwarg, overlap schedule
-        # unaffected. TODO(flat+spec): publish under spec decode once the flat
-        # path supports spec-expanded metadata.
-        if speculative_enabled:
+        # Rule: publish groups iff (a) the scheduler ext is flat-built AND
+        # (b) speculative decoding is off. Publication is THE upstream signal:
+        # the C++ scheduler config, the CUDA-graph flat capture path, and the
+        # flat_block_tables bridge all key off it, so this single gate keeps
+        # every downstream consumer consistent.
+        # (a) Only a flat-built ext ever populates flat_block_tables; a
+        #     radix-built ext (default) never does (MaybeFillFlatBlockTables is
+        #     a no-op), so publishing against it would make CUDA-graph capture
+        #     bind the flat per-group buffers to tables that never arrive and
+        #     the replay guard (backends/mha.py) raise on the first graph
+        #     decode. Older exts without the FLAT_KVCACHE attribute report
+        #     False — the correct radix-safe default.
+        # (b) Flat page tables do not support spec-expanded metadata
+        #     (backends/mha.py asserts on flat_cache_group_ids with
+        #     spec_num_tokens > 1), and non-empty groups turn off the overlap
+        #     scheduler under spec decode
+        #     (scheduler_utils.should_use_overlap_schedule), so spec runs keep
+        #     the pre-group behavior: no specs, no flat capture kwarg, overlap
+        #     schedule unaffected. TODO(flat+spec): publish under spec decode
+        #     once the flat path supports spec-expanded metadata.
+        if speculative_enabled or not scheduler_ext_flat_kvcache():
             self.paged_cache_group_specs = ()
             self.paged_cache_group_page_counts = {}
         else:
