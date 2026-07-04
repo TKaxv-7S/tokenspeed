@@ -162,6 +162,15 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
 #if TOKENSPEED_FLAT_KVCACHE
     _assert(coordinator_ != nullptr, "SchedulePrefillFirstChunkEvent: flat path requires a coordinator");
     TokenContainer* token_container = state.GetTokenContainer();
+
+    // Allocate the request-pool slot BEFORE populating the tables: Allocate()
+    // throws on exhaustion, and doing it after PrefillFirstChunk would leak the
+    // freshly acquired pages (the throw would bypass the FreeRequest guard
+    // below). ReqPoolIndex is RAII, so if PrefillFirstChunk throws instead, the
+    // slot returns on unwind. Unreachable today via the AvailableSlots pre-gate
+    // in schedulePrefillFirstChunk, but the guard exists precisely for this.
+    auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
+
     std::vector<BlockTable> tables(coordinator_->NumGroups());
 
     // C slice: cross-request prefix claim deferred; pass empty hashes so only Acquire runs.
@@ -177,8 +186,6 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
         FreeRequest(*coordinator_, tables);
         throw;
     }
-
-    auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
 
     TokenContainer::Window window{.begin = 0, .size = tokens_this_round_};
     bool is_last_chunk = (window.begin + window.size) == token_container->PrefillSize();
@@ -280,10 +287,22 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
         FlatWindowPageHashes(state.GetFullPagedTokens(false), state.GetPageSize(), state.window.begin,
                              state.window.size);
     const std::int32_t num_full_blocks = static_cast<std::int32_t>(hashes.size());
+    // Tokens of the prior chunks 0..k-1 (state.window is the PREVIOUS chunk).
+    // Under overlap scheduling that chunk's forward may still be IN FLIGHT --
+    // the slide is safe not because its KV is written, but because (a) all
+    // forwards run on the single execution stream, so any reuse write of a
+    // freed page is enqueued after the in-flight kernels, and (b) the freed
+    // pages lie fully below every later batch's read window. Writes into
+    // re-acquired pages from OUTSIDE that stream (e.g. cache load-back H2D)
+    // must fence against it. PrefillChunk slides the SWA window to this
+    // position; schedulePrefill's admission gate credits the slide with the
+    // same value, so gate math and op math stay aligned.
+    const std::int32_t num_computed_tokens = state.window.begin + state.window.size;
 
     auto tables = std::move(state).TakeBlockTables();
     try {
-        if (!PrefillChunk(*coordinator_, tables, hashes, tokens_this_round_, num_full_blocks)) {
+        if (!PrefillChunk(*coordinator_, tables, hashes, tokens_this_round_, num_full_blocks,
+                          num_computed_tokens)) {
             _assert(false, "flat path: allocation failure unsupported in C slice");
         }
     } catch (...) {
@@ -378,10 +397,15 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
         FlatWindowPageHashes(state.GetFullPagedTokens(false), state.GetPageSize(), state.window.begin,
                              state.window.size);
     const std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
+    // All prefill tokens' KV is computed before the pending first decode step
+    // (window end == PrefillSize() by the is_last_chunk transition condition).
+    // Finalize slides to this position; scheduleDecode's PrefillDone gate
+    // credits the slide with PrefillSize(), the same value.
+    const std::int32_t num_computed_tokens = state.window.begin + state.window.size;
 
     auto tables = std::move(state).TakeBlockTables();
     try {
-        if (!FinalizePrefillAndReserveDecode(*coordinator_, tables, hashes, reserve)) {
+        if (!FinalizePrefillAndReserveDecode(*coordinator_, tables, hashes, reserve, num_computed_tokens)) {
             _assert(false, "flat path: allocation failure unsupported in C slice");
         }
     } catch (...) {
@@ -438,7 +462,16 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
     _assert(coordinator_ != nullptr, "ScheduleDecodeEvent: flat path requires a coordinator");
     // Read state before taking the tables (use-after-move hygiene).
     const std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
-    const std::int32_t num_computed_tokens = state.GetTokenContainer()->Size();
+    // Tokens whose KV is already computed BEFORE this round's forward. The
+    // container's Size() includes the decode_input_tokens_ tail the executor
+    // appended via ExtendResult, whose KV is computed by THIS round's
+    // still-pending forward -- pass Size() and the SWA slide runs one token
+    // ahead, freeing a page the pending query still reads (off-by-one: the
+    // query at position Size()-1 needs keys down to Size()-1-window+1, but the
+    // first kept token would become Size()-window+1). scheduleDecode's
+    // admission gate uses the same TokenSize() - decode_input_tokens value, so
+    // gate math and DecodeStep math stay aligned.
+    const std::int32_t num_computed_tokens = state.GetTokenContainer()->Size() - decode_input_tokens_;
 
     auto tables = std::move(state).TakeBlockTables();
     try {

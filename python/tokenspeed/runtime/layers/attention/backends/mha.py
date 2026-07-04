@@ -344,13 +344,25 @@ class MHAAttnBackend(AttentionBackend):
         # discarded. The bs == 0 skip is only reachable from unit tests: the
         # wrapper always replays with padded_bs >= 1 and synthesizes idle
         # tables for the bs == 0 idle graph.
-        if self.cuda_graph_flat_page_tables and bs > 0 and not flat_block_tables:
-            raise RuntimeError(
-                "MHAAttnBackend replay: flat per-group CUDA-graph buffers "
-                f"exist for groups {sorted(self.cuda_graph_flat_page_tables)} "
-                f"but flat_block_tables is missing/empty at bs={bs}; the "
-                "captured graph would read stale page tables."
-            )
+        if self.cuda_graph_flat_page_tables and bs > 0:
+            if not flat_block_tables:
+                raise RuntimeError(
+                    "MHAAttnBackend replay: flat per-group CUDA-graph buffers "
+                    f"exist for groups "
+                    f"{sorted(self.cuda_graph_flat_page_tables)} "
+                    f"but flat_block_tables is missing/empty at bs={bs}; the "
+                    "captured graph would read stale page tables."
+                )
+            # Per-group hole: a group silently absent from a non-empty dict
+            # (e.g. dropped upstream) would leave its captured buffer stale.
+            missing = set(self.cuda_graph_flat_page_tables) - set(flat_block_tables)
+            if missing:
+                raise RuntimeError(
+                    "MHAAttnBackend replay: flat_block_tables at bs="
+                    f"{bs} is missing captured groups {sorted(missing)} "
+                    f"(delivered: {sorted(flat_block_tables)}); the captured "
+                    "graph would read stale page tables for those groups."
+                )
 
         if self.spec_num_tokens > 1 and not self.is_draft:
             base_page_table = req_to_page[req_pool_indices[:bs], : self.max_num_pages]
@@ -379,8 +391,12 @@ class MHAAttnBackend(AttentionBackend):
         # columns 1.. (giving [0, -1, ...]), which is fine: with seq_lens=1
         # nothing past col 0 is read for those rows.
         if flat_block_tables:
-            # Group set is fixed per model (from config.layer_types), so every
-            # captured group appears in every replay dict; no stale-group check.
+            # The missing-groups guard above enforced that every captured
+            # group is present in this dict (the bridge also raises at the
+            # source when a group's row count disagrees with the batch, so a
+            # hole can only come from a future upstream change). Iterating
+            # the delivered dict, a group the graph never captured raises
+            # KeyError below — also loud.
             for gid, src in flat_block_tables.items():
                 # Buffers exist: capture allocated them for these groups.
                 buf = self.cuda_graph_flat_page_tables[gid]

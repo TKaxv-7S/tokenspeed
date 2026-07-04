@@ -85,6 +85,9 @@ public:
     std::int32_t GetRequestPagedCacheBaseLogicalPage(const std::string& request_id, const std::string& group_id) const;
 #if TOKENSPEED_FLAT_KVCACHE
     // Free physical pages in the flat shared BlockPool (flat path only).
+    // AvailableKvPages() reports the same value on flat builds (the Python
+    // binding redirects there; see scheduler.cpp); this int32 accessor stays
+    // for C++ tests.
     std::int32_t FlatPoolFreeBlocks() const { return block_pool_.NumFreeBlocks(); }
 #endif
 
@@ -172,6 +175,42 @@ private:
     // completion can still finish a request and free pool pages -- the flat
     // starvation-deadlock check keys off this (see newForwardOperation).
     std::unordered_map<std::string, std::int32_t> pending_forward_results_;
+    // Decode-reserve pages promised but not yet acquired, per request. A
+    // prefill-completing admission (first or final chunk) charges its gate
+    // chunk + decode reserve, but the reserve is only Acquired at the
+    // PrefillDone->Decoding transition -- between those rounds the promised
+    // pages still sit in the pool's free count. Entries record the exact page
+    // need (BlocksNeededFor on the post-prefill table shape, computed at
+    // admission time) so other candidates' gates can subtract them and not be
+    // admitted into promised pages. Inserted when the prefill-completing
+    // admission commits, erased when the PrefillDone->Decoding transition
+    // acquires the reserve, and on Finish/Abort/PD-success (no phantom
+    // reservation may outlive its request).
+    std::unordered_map<std::string, std::int32_t> flat_reserved_pages_;
+    // Consecutive fully-starved fused rounds (every candidate deferred, pool
+    // pages held, nothing in flight). The deadlock assert in
+    // newForwardOperation requires TWO such rounds: a single round can be a
+    // false positive when a pool-freeing Finish is queued between a request's
+    // ExtendResult (which empties pending_forward_results_) and its Finish
+    // (which frees the pages). Reset on any round that schedules ops or fails
+    // the starvation predicate. Residual risk (accepted for this fail-loud
+    // stopgap until TODO(flat-retract)): a Finish arriving two or more rounds
+    // after the last ExtendResult still trips the assert on a recoverable
+    // state.
+    std::int32_t flat_starved_rounds_{0};
+
+    // Sum of flat_reserved_pages_ excluding request_id's own entry: a request
+    // gating its own decode is the one consuming its reservation, so it must
+    // not be blocked by it.
+    std::int32_t flatReservedPagesExcept(const std::string& request_id) const {
+        std::int32_t total = 0;
+        for (const auto& [id, pages] : flat_reserved_pages_) {
+            if (id != request_id) {
+                total += pages;
+            }
+        }
+        return total;
+    }
 #endif
 
 private:

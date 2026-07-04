@@ -138,6 +138,17 @@ public:
     // out to every group uniformly, like its other operations.
     virtual void AdvanceWindow(BlockTable& /*table*/, std::int32_t /*num_computed_tokens*/) {}
 
+    // Pure query: how many pages would AdvanceWindow(table, num_computed_tokens)
+    // return to the pool, WITHOUT freeing or mutating anything. Full-history
+    // managers never evict mid-sequence, so the default is 0; window-evicting
+    // managers override it in lockstep with their AdvanceWindow. Used by the
+    // scheduler's decode admission gate to credit the slide DecodeStep performs
+    // before its Acquire.
+    virtual std::int32_t BlocksFreedByAdvanceWindow(const BlockTable& /*table*/,
+                                                    std::int32_t /*num_computed_tokens*/) const {
+        return 0;
+    }
+
     // Release every page the table holds (reverse-order via the pool) and reset
     // the table. Cached pages keep their hash on free, so they remain
     // prefix-reusable until evicted.

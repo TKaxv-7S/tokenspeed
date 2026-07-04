@@ -68,10 +68,40 @@ class FlatBlockTablesBridgeTest(unittest.TestCase):
         op = SimpleNamespace()
         self.assertEqual(self.bridge(op, device="cpu"), {})
 
+    def test_attribute_name_is_pinned(self):
+        # The bridge reads exactly `flat_block_tables`. An op carrying the
+        # payload under any other name (e.g. after a scheduler-side rename)
+        # yields {} — the same shape as a radix op, which legitimately has
+        # no flat_block_tables attribute. A rename must therefore be caught
+        # here, not by silent-{} in production.
+        from types import SimpleNamespace
+
+        renamed = SimpleNamespace(flat_page_tables={"full": [[1]]})
+        self.assertEqual(self.bridge(renamed, device="cpu", num_reqs=1), {})
+        op = self._make_op({"full": [[1]]})
+        out = self.bridge(op, device="cpu", num_reqs=1)
+        self.assertEqual(out["full"].tolist(), [[1]])
+
     def test_row_count_mismatch_raises(self):
         op = self._make_op({"full": [[1, 2]]})
         with self.assertRaises(ValueError):
             self.bridge(op, device="cpu", num_reqs=2)
+
+    def test_empty_rows_group_on_live_batch_raises(self):
+        # A group present on a live (num_reqs > 0) op must carry exactly
+        # num_reqs rows; an empty row list may not silently vanish from the
+        # dict — downstream replay would see a non-empty dict with a
+        # per-group hole over stale pages.
+        op = self._make_op({"full": [[1, 2], [3, 4]], "swa": []})
+        with self.assertRaisesRegex(ValueError, r"swa.*0 rows"):
+            self.bridge(op, device="cpu", num_reqs=2)
+
+    def test_empty_rows_group_on_zero_req_op_dropped(self):
+        # Zero-request op: empty groups are dropped and callers treat the
+        # resulting {} as "no tables" (bs==0 replay/idle paths).
+        op = self._make_op({"full": [], "swa": []})
+        self.assertEqual(self.bridge(op, device="cpu", num_reqs=0), {})
+        self.assertEqual(self.bridge(op, device="cpu"), {})
 
 
 class FlatFlagGatingTest(unittest.TestCase):

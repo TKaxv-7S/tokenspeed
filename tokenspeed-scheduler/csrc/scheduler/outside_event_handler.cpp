@@ -91,8 +91,10 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {}
 
 void Scheduler::handleEvent(const pd::SucceededEvent& event) {
 #if TOKENSPEED_FLAT_KVCACHE
-    // Terminal for this request's forward stream: drop any remaining result debt.
+    // Terminal for this request's forward stream: drop any remaining result debt
+    // and any decode reservation it never consumed.
     pending_forward_results_.erase(event.request_id);
+    flat_reserved_pages_.erase(event.request_id);
 #endif
     std::vector<std::string> page_hashes;
     requests_.at(event.request_id)
@@ -111,8 +113,10 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
 
 void Scheduler::handleEvent(const forward::Finish& event) {
 #if TOKENSPEED_FLAT_KVCACHE
-    // Terminal for this request's forward stream: drop any remaining result debt.
+    // Terminal for this request's forward stream: drop any remaining result debt
+    // and any decode reservation it never consumed (e.g. finished in PrefillDone).
     pending_forward_results_.erase(event.request_id);
+    flat_reserved_pages_.erase(event.request_id);
 #endif
     if (auto req = find_request(event.request_id)) {
         // except_last=true: exclude the tail page, matching FinishEvent's InsertDevice behavior
@@ -159,8 +163,12 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
 
 void Scheduler::handleEvent(const forward::Abort& event) {
 #if TOKENSPEED_FLAT_KVCACHE
-    // Terminal for this request's forward stream: drop any remaining result debt.
+    // Terminal for this request's forward stream: drop any remaining result debt
+    // and any decode reservation it never consumed -- an abort between the
+    // prefill-completing admission and the PrefillDone->Decoding transition must
+    // not leave a permanent phantom reservation deflating every later gate.
     pending_forward_results_.erase(event.request_id);
+    flat_reserved_pages_.erase(event.request_id);
 #endif
     auto iter = requests_.find(event.request_id);
     if (iter == requests_.end()) {

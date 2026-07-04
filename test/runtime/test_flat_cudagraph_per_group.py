@@ -119,6 +119,220 @@ class FlatCacheGroupIdsTest(_TorchCase):
         self.assertEqual(out, ())
 
 
+class WrapperReplayFlatTest(_TorchCase):
+    """Call-site wiring: the real _init_replay_metadata must row-pad flat
+    tables with 0 (not the -1 default) before handing them to the backend."""
+
+    def _run_replay(self, flat_block_tables, padded_bs, actual_bs):
+        torch = self.torch
+        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+            CudaGraphWrapper,
+        )
+
+        recorded = {}
+
+        def record(bs, req_pool_indices, seq_lens, **kwargs):
+            recorded["bs"] = bs
+            recorded.update(kwargs)
+
+        mock = SimpleNamespace(
+            attn_backend=SimpleNamespace(
+                uses_flat_cache_groups=True,
+                uses_paged_cache_groups=False,
+                uses_padded_decode_token_mask=False,
+                init_forward_metadata_replay_cuda_graph=record,
+            ),
+            draft_attn_backend=None,
+            # Real helper: the test pins the call site's pad_value, so the
+            # padding itself must be the production implementation.
+            _pad_block_tables_to_padded_bs=(
+                CudaGraphWrapper._pad_block_tables_to_padded_bs
+            ),
+        )
+        CudaGraphWrapper._init_replay_metadata(
+            mock,
+            padded_bs,
+            actual_bs,
+            torch.arange(padded_bs, dtype=torch.int64),
+            torch.ones(padded_bs, dtype=torch.int32),
+            torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
+            _decode_forward_mode(),
+            flat_block_tables=flat_block_tables,
+        )
+        return recorded
+
+    def test_flat_replay_path_pads_with_zero(self):
+        torch = self.torch
+        src = {
+            "sliding_attention": torch.tensor(
+                [[3, 4], [5, 6]], dtype=torch.int32
+            ),
+            "full_attention": torch.tensor(
+                [[7, 8], [9, 1]], dtype=torch.int32
+            ),
+        }
+        recorded = self._run_replay(src, padded_bs=4, actual_bs=2)
+        self.assertEqual(recorded["bs"], 4)
+        out = recorded["flat_block_tables"]
+        self.assertEqual(set(out), set(src))
+        for gid, table in out.items():
+            self.assertEqual(tuple(table.shape), (4, 2))
+            self.assertTrue((table[:2] == src[gid]).all())
+            # Dummy rows must land on the zero-init dummy page 0, never -1:
+            # they replay with seq_lens=1 and their col-0 IS dereferenced.
+            self.assertTrue((table[2:] == 0).all())
+
+    def test_flat_replay_path_noop_without_padding(self):
+        torch = self.torch
+        src = {"full_attention": torch.ones((2, 2), dtype=torch.int32)}
+        recorded = self._run_replay(src, padded_bs=2, actual_bs=2)
+        self.assertIs(
+            recorded["flat_block_tables"]["full_attention"],
+            src["full_attention"],
+        )
+
+
+class WrapperCaptureFlatGroupIdsTest(_TorchCase):
+    """Call-site wiring: the real _init_capture_metadata must derive
+    flat_cache_group_ids from the pool's published specs and pass them to
+    the backend capture hook."""
+
+    def _run_capture(self, bs, group_ids, uses_flat=True):
+        torch = self.torch
+        from types import MethodType
+
+        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+            CudaGraphWrapper,
+        )
+
+        recorded = {}
+
+        def record(bs, req_pool_indices, seq_lens, forward_mode, **kwargs):
+            recorded["bs"] = bs
+            recorded["kwargs"] = kwargs
+
+        mock = SimpleNamespace(
+            input_buffers=SimpleNamespace(
+                has_mamba=False,
+                req_pool_indices_buf=torch.arange(MAX_BS, dtype=torch.int64),
+                seq_lens_buf=torch.ones(MAX_BS, dtype=torch.int32),
+            ),
+            attn_backend=SimpleNamespace(
+                uses_paged_cache_groups=False,
+                uses_flat_cache_groups=uses_flat,
+                init_forward_metadata_capture_cuda_graph=record,
+            ),
+            token_to_kv_pool=SimpleNamespace(
+                paged_cache_group_specs=tuple(
+                    SimpleNamespace(group_id=gid) for gid in group_ids
+                )
+            ),
+            drafter=None,
+            use_target_verify_forward_mode=False,
+            draft_attn_backend=None,
+        )
+        mock._flat_cache_group_ids = MethodType(
+            CudaGraphWrapper._flat_cache_group_ids, mock
+        )
+        CudaGraphWrapper._init_capture_metadata(mock, bs)
+        return recorded
+
+    def test_capture_passes_group_ids_from_pool_specs(self):
+        recorded = self._run_capture(2, ["sliding_attention", "full_attention"])
+        self.assertEqual(recorded["bs"], 2)
+        self.assertEqual(
+            recorded["kwargs"]["flat_cache_group_ids"],
+            ("sliding_attention", "full_attention"),
+        )
+
+    def test_capture_omits_group_ids_when_backend_not_flat(self):
+        recorded = self._run_capture(
+            2, ["sliding_attention", "full_attention"], uses_flat=False
+        )
+        self.assertNotIn("flat_cache_group_ids", recorded["kwargs"])
+
+    def test_capture_omits_group_ids_without_specs(self):
+        recorded = self._run_capture(2, [])
+        self.assertNotIn("flat_cache_group_ids", recorded["kwargs"])
+
+
+class WrapperEagerFlatGuardTest(_TorchCase):
+    """Eager parity guard: a multi-group flat pool + flat-consuming backend
+    must not reach the backend's single-table fallback without tables."""
+
+    def _call(self, group_ids, flat_block_tables=None):
+        torch = self.torch
+        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+            CudaGraphWrapper,
+        )
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+        calls = {}
+
+        def init_forward_metadata(*args, **kwargs):
+            calls["init_kwargs"] = kwargs
+
+        mock = SimpleNamespace(
+            input_buffers=SimpleNamespace(
+                seq_lens_buf=torch.ones(MAX_BS, dtype=torch.int32),
+                req_pool_indices_buf=torch.arange(MAX_BS, dtype=torch.int64),
+            ),
+            config=SimpleNamespace(),
+            attn_backend=SimpleNamespace(
+                uses_flat_cache_groups=True,
+                uses_paged_cache_groups=False,
+            ),
+            token_to_kv_pool=SimpleNamespace(
+                paged_cache_group_specs=tuple(
+                    SimpleNamespace(group_id=gid) for gid in group_ids
+                )
+            ),
+            drafter=None,
+            _can_use_graph=lambda bs, ctx: False,
+            _init_forward_metadata=init_forward_metadata,
+            _forward_func=lambda **kwargs: (None, None, None),
+        )
+        ctx = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            num_extends=2,
+            global_num_tokens=None,
+            all_decode_or_idle=False,
+            capture_hidden_mode=None,
+        )
+        CudaGraphWrapper.__call__(
+            mock,
+            bs=2,
+            ctx=ctx,
+            sampling_info=None,
+            req_to_page=torch.zeros(
+                (MAX_BS, MAX_NUM_PAGES), dtype=torch.int32
+            ),
+            flat_block_tables=flat_block_tables,
+        )
+        return calls
+
+    def test_multi_group_eager_without_tables_raises(self):
+        with self.assertRaisesRegex(RuntimeError, "flat_block_tables"):
+            self._call(["sliding_attention", "full_attention"])
+
+    def test_multi_group_eager_with_tables_passes(self):
+        torch = self.torch
+        tables = {
+            "sliding_attention": torch.ones((2, 2), dtype=torch.int32),
+            "full_attention": torch.ones((2, 2), dtype=torch.int32),
+        }
+        calls = self._call(
+            ["sliding_attention", "full_attention"], flat_block_tables=tables
+        )
+        self.assertIs(calls["init_kwargs"]["flat_block_tables"], tables)
+
+    def test_single_group_eager_without_tables_falls_back(self):
+        # Documented fallback: with one published group the backend's single
+        # table IS that group's table, so no tables are required.
+        calls = self._call(["full_attention"])
+        self.assertIsNone(calls["init_kwargs"]["flat_block_tables"])
+
+
 class IdleFlatBlockTablesTest(_TorchCase):
     """bs==0 idle replay tables: one col-0 page-0 entry per dummy row."""
 
@@ -316,11 +530,14 @@ class BackendReplayFlatTest(_BackendCase):
             self.assertTrue((buf[:2] == 9).all())
 
     def test_overwide_src_asserts(self):
+        # Both captured groups delivered (the missing-group guard runs
+        # first); the overwide one trips the width assert.
         torch = self.torch
         src = {
             "sliding_attention": torch.ones(
                 (2, MAX_NUM_PAGES + 1), dtype=torch.int32
-            )
+            ),
+            "full_attention": torch.ones((2, 2), dtype=torch.int32),
         }
         with self.assertRaisesRegex(AssertionError, "cols"):
             self._replay(2, src)
@@ -328,7 +545,8 @@ class BackendReplayFlatTest(_BackendCase):
     def test_underpadded_rows_assert(self):
         torch = self.torch
         src = {
-            "sliding_attention": torch.ones((1, 2), dtype=torch.int32)
+            "sliding_attention": torch.ones((1, 2), dtype=torch.int32),
+            "full_attention": torch.ones((2, 2), dtype=torch.int32),
         }
         with self.assertRaisesRegex(AssertionError, "rows"):
             self._replay(2, src)
@@ -342,6 +560,14 @@ class BackendReplayFlatTest(_BackendCase):
     def test_missing_tables_empty_dict_raises(self):
         with self.assertRaisesRegex(RuntimeError, "flat_block_tables"):
             self._replay(2, {})
+
+    def test_missing_captured_group_raises(self):
+        # Per-group hole: a non-empty dict lacking one captured group would
+        # leave that group's buffer stale — must raise naming the group.
+        torch = self.torch
+        src = {"sliding_attention": torch.ones((2, 2), dtype=torch.int32)}
+        with self.assertRaisesRegex(RuntimeError, "full_attention"):
+            self._replay(2, src)
 
     def test_bs_zero_missing_tables_skips(self):
         # Documented bs==0 skip: buffers keep valid page-0/previous entries;

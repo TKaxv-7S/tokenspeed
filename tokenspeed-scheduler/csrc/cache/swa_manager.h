@@ -90,15 +90,7 @@ public:
     // were punched by prior calls). Reverse-collect + direct FreeBlocks evicts
     // the first-slid-out page first (FIFO).
     void AdvanceWindow(BlockTable& table, std::int32_t num_computed_tokens) override {
-        std::int32_t skipped = num_computed_tokens - sliding_window_ + 1;
-        if (skipped <= 0) {
-            return;  // all tokens still inside the window
-        }
-        std::int32_t skipped_blocks = skipped / page_size_;  // only fully-slid-out pages
-        // Safety net for inconsistent input: with FSM-consistent num_computed_tokens
-        // the cap never engages the tail page (a full tail leaves >=1 in-window
-        // page), but an arbitrary oversized value could -- cap keeps us in bounds.
-        skipped_blocks = std::min(skipped_blocks, table.NumBlocks());
+        std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
         std::vector<CacheBlock*> freed;
         for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
             CacheBlock* old = table.EvictToNull(i, pool_.NullBlock());
@@ -110,7 +102,45 @@ public:
         pool_.FreeBlocks(freed);
     }
 
+    // Pure query mirroring AdvanceWindow: how many pages would that call return
+    // to the shared pool right now? Same skip math (fullySlidOutBlocks), same
+    // right->left early stop on an already-null slot. Only blocks whose last
+    // reference is this table (RefCount()==1) actually reach the free list on
+    // FreeBlocks, so shared blocks are not counted. Lets the scheduler's decode
+    // admission gate credit the slide that DecodeStep performs before Acquire.
+    std::int32_t BlocksFreedByAdvanceWindow(const BlockTable& table,
+                                            std::int32_t num_computed_tokens) const override {
+        std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
+        std::int32_t freed = 0;
+        for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
+            CacheBlock* block = table.Blocks()[i];
+            if (block->IsNull()) {
+                break;  // already null -> earlier slots are null too
+            }
+            if (block->RefCount() == 1) {
+                ++freed;
+            }
+        }
+        return freed;
+    }
+
 private:
+    // Pages [0, result) have fully slid out of the window at num_computed_tokens
+    // (the count of tokens whose KV is already computed; the NEXT query sits at
+    // that position and needs keys [num_computed - window + 1, num_computed]).
+    // Single source of the skip math for AdvanceWindow and its freed-count query.
+    std::int32_t fullySlidOutBlocks(const BlockTable& table, std::int32_t num_computed_tokens) const {
+        std::int32_t skipped = num_computed_tokens - sliding_window_ + 1;
+        if (skipped <= 0) {
+            return 0;  // all tokens still inside the window
+        }
+        std::int32_t skipped_blocks = skipped / page_size_;  // only fully-slid-out pages
+        // Safety net for inconsistent input: with FSM-consistent num_computed_tokens
+        // the cap never engages the tail page (a full tail leaves >=1 in-window
+        // page), but an arbitrary oversized value could -- cap keeps us in bounds.
+        return std::min(skipped_blocks, table.NumBlocks());
+    }
+
     std::int32_t sliding_window_;
 };
 

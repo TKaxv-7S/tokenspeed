@@ -172,6 +172,17 @@ void KvCacheCoordinator::AdvanceWindow(std::span<BlockTable> tables, std::int32_
     }
 }
 
+std::int32_t KvCacheCoordinator::BlocksFreedByAdvance(std::span<const BlockTable> tables,
+                                                      std::int32_t num_computed_tokens) const {
+    _assert(static_cast<std::int32_t>(tables.size()) == NumGroups(),
+            "BlocksFreedByAdvance: tables size must match group count");
+    std::int32_t total_freed = 0;
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        total_freed += groups_[i].Manager().BlocksFreedByAdvanceWindow(tables[i], num_computed_tokens);
+    }
+    return total_freed;
+}
+
 KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, BlockPool& pool) {
     _assert(!specs.empty(), "MakeCoordinator requires at least one spec");
     std::int32_t page_size = specs[0].page_size;

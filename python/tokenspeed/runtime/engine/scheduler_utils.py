@@ -286,12 +286,19 @@ def _block_tables_from_forward_op(
     for key_obj, table in items:
         key = str(key_obj)
         rows = list(table)
-        if num_reqs is not None and rows and len(rows) != num_reqs:
+        if num_reqs is not None and len(rows) != num_reqs:
+            # Empty row lists get no exemption: on a live batch (num_reqs>0)
+            # a group present on the op must carry exactly num_reqs rows —
+            # silently dropping it here would hand downstream consumers (e.g.
+            # the flat CUDA-graph replay) a non-empty dict with a per-group
+            # hole over stale pages. num_reqs == 0 accepts only empty rows.
             raise ValueError(
                 f"{attr}[{key}] has {len(rows)} rows but forward op reported "
                 f"num_reqs={num_reqs}"
             )
         if not rows:
+            # Zero-request table (num_reqs None or 0, e.g. an idle/empty op):
+            # drop the group; callers treat the resulting {} as "no tables".
             continue
         max_pages = max((len(row) for row in rows), default=0)
         if max_pages == 0:

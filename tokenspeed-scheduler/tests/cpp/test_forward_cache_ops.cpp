@@ -30,6 +30,7 @@
 #include "cache/forward_cache_ops.h"
 #include "cache/kv_cache_coordinator.h"
 #include "resource/allocator/paged_cache_group.h"
+#include "scheduler/page_hasher.h"
 #include "scheduler/types.h"
 
 namespace tokenspeed::test {
@@ -77,10 +78,95 @@ TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
     ASSERT_TRUE(PrefillFirstChunk(coordinator, tables, hashes0, /*num_tokens=*/4));
 
     // Second chunk: 4 more tokens -> +2 pages/group; cache the 2 now-full pages.
+    // num_computed = 4 (chunk 0's tokens) -> skipped = 4-4+1 = 1 -> 1/2 = 0
+    // fully-slid-out pages: the slide punches nothing yet.
     std::vector<std::string> hashes2{std::string(64, 'a'), std::string(64, 'b')};
-    ASSERT_TRUE(PrefillChunk(coordinator, tables, hashes2, /*num_tokens=*/4, /*num_full_blocks=*/2));
+    ASSERT_TRUE(PrefillChunk(coordinator, tables, hashes2, /*num_tokens=*/4, /*num_full_blocks=*/2,
+                             /*num_computed_tokens=*/4));
     EXPECT_EQ(tables[0].NumBlocks(), 4);
     EXPECT_EQ(tables[1].NumBlocks(), 4);
+    for (CacheBlock* b : tables[1].Blocks()) {
+        EXPECT_FALSE(b->IsNull()) << "num_computed=4, W=4: no page is fully out of window yet";
+    }
+}
+
+// Mid-prefill slide: a chunk whose prior tokens already exceed the window must
+// punch the fully-slid-out SWA pages BEFORE acquiring its own pages, and the
+// punched pages' hashes must have been registered first (register -> punch
+// ordering; CacheFullBlocks skips holes, so the reverse order would lose them).
+TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
+    BlockPool pool(/*total_num_blocks=*/32, /*enable_caching=*/true);
+    KvCacheCoordinator coordinator = MakeTwoGroup(pool);  // page=2, W=4
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+
+    // Chunk 0: 8 tokens -> 4 pages/group (chunk >> window is fine: the slide
+    // happens on the NEXT op; see TODO(flat-swa-alloc)).
+    std::vector<std::string> hashes0;
+    ASSERT_TRUE(PrefillFirstChunk(coordinator, tables, hashes0, /*num_tokens=*/8));
+    const std::int32_t free_before_chunk = pool.NumFreeBlocks();
+
+    // Chunk 1: num_computed = 8 -> skipped = 8-4+1 = 5 -> 5/2 = 2 pages fully
+    // out of window: SWA slots 0,1 punched, then 2 fresh pages acquired.
+    std::vector<std::string> hashes{std::string(64, 'a'), std::string(64, 'b'), std::string(64, 'c'),
+                                    std::string(64, 'd')};
+    ASSERT_TRUE(PrefillChunk(coordinator, tables, hashes, /*num_tokens=*/4, /*num_full_blocks=*/4,
+                             /*num_computed_tokens=*/8));
+
+    // Full group keeps history; SWA group has holes exactly at slots 0,1.
+    EXPECT_EQ(tables[0].NumBlocks(), 6);
+    for (CacheBlock* b : tables[0].Blocks()) {
+        EXPECT_FALSE(b->IsNull());
+    }
+    ASSERT_EQ(tables[1].NumBlocks(), 6);
+    EXPECT_TRUE(tables[1].Blocks()[0]->IsNull());
+    EXPECT_TRUE(tables[1].Blocks()[1]->IsNull());
+    for (std::int32_t i = 2; i < 6; ++i) {
+        EXPECT_FALSE(tables[1].Blocks()[i]->IsNull()) << "slot " << i;
+    }
+
+    // Pool: the slide freed 2 SWA pages, the acquire took 2/group = 4 -> net -2.
+    EXPECT_EQ(pool.NumFreeBlocks(), free_before_chunk + 2 - 4);
+
+    // Register-then-punch: the punched SWA pages went to the free list WITH
+    // their hashes (cached-with-hash free blocks), so they stay prefix-hittable.
+    for (const std::string& h : {hashes[0], hashes[1]}) {
+        EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(h, /*group_id=*/1)), nullptr)
+            << "slid-out page must keep its registered hash";
+    }
+}
+
+// Finalize slides too: the prefill->decode transition releases the pages the
+// FIRST decode step no longer needs (query at position P reads keys back to
+// P - W + 1), instead of retaining them until the second decode step.
+TEST(ForwardCacheOpsPrefill, FinalizeSlidesSwaWindowBeforeReserveAcquire) {
+    BlockPool pool(/*total_num_blocks=*/32, /*enable_caching=*/true);
+    KvCacheCoordinator coordinator = MakeTwoGroup(pool);  // page=2, W=4
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+
+    // 12-token prefill -> 6 pages/group, tails full.
+    std::vector<std::string> hashes0;
+    ASSERT_TRUE(PrefillFirstChunk(coordinator, tables, hashes0, /*num_tokens=*/12));
+    const std::int32_t free_before = pool.NumFreeBlocks();
+
+    // num_computed = 12 -> skipped = 12-4+1 = 9 -> 9/2 = 4 pages punched
+    // (slots 0..3); reserve 1 token -> 1 fresh page/group.
+    std::vector<std::string> hashes(6, "");
+    for (std::size_t i = 0; i < hashes.size(); ++i) {
+        hashes[i] = std::string(64, static_cast<char>('a' + i));
+    }
+    ASSERT_TRUE(FinalizePrefillAndReserveDecode(coordinator, tables, hashes, /*reserve_tokens=*/1,
+                                                /*num_computed_tokens=*/12));
+
+    ASSERT_EQ(tables[1].NumBlocks(), 7);
+    for (std::int32_t i = 0; i < 4; ++i) {
+        EXPECT_TRUE(tables[1].Blocks()[i]->IsNull()) << "slot " << i;
+    }
+    for (std::int32_t i = 4; i < 7; ++i) {
+        EXPECT_FALSE(tables[1].Blocks()[i]->IsNull()) << "slot " << i;
+    }
+    EXPECT_EQ(tables[0].NumBlocks(), 7);
+    // Pool: slide freed 4, reserve acquire took 1/group = 2 -> net +2.
+    EXPECT_EQ(pool.NumFreeBlocks(), free_before + 4 - 2);
 }
 
 TEST(ForwardCacheOpsDecode, StepAcquiresAndSlidesSwaWindow) {

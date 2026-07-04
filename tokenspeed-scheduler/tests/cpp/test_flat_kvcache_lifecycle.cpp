@@ -143,6 +143,30 @@ TEST_F(FlatKvCacheLifecycleTestSuite, SingleRequest_PrefillDecodeFinish) {
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
 }
 
+// On flat builds the Python-bound available_kv_pages accessor must report the
+// flat shared BlockPool, not the radix device_allocator_ (which the flat path
+// never draws from -- reporting it showed Python monitoring a permanently-full
+// pool). Pins the redirect: AvailableKvPages() tracks FlatPoolFreeBlocks()
+// exactly, idle and under load, and actually decreases after a prefill.
+// TODO(radix-removal): collapses to the only accessor when radix goes.
+TEST_F(FlatKvCacheLifecycleTestSuite, AvailableKvPagesReportsFlatPool) {
+    const std::size_t idle = scheduler_->AvailableKvPages();
+    EXPECT_EQ(idle, static_cast<std::size_t>(scheduler_->FlatPoolFreeBlocks()));
+    // 32 total pages, block 0 is the never-allocated null placeholder.
+    EXPECT_EQ(idle, 31u);
+
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+    PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableKvPages(), static_cast<std::size_t>(scheduler_->FlatPoolFreeBlocks()));
+    EXPECT_LT(scheduler_->AvailableKvPages(), idle)
+        << "prefill draws from the flat pool and the bound accessor must see it";
+
+    SendForwardDone("r1", {42});
+    SendFinish("r1");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableKvPages(), idle);
+}
+
 // Two requests in one batch: the FlatForwardOperation must aggregate both into
 // one SoA op. Exercises the multi-request path the single-request test cannot:
 // two rows per group, rectangular (-1 padded) tables, and physical pages that

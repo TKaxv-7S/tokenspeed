@@ -75,20 +75,15 @@ public:
     // Pure pre-check: fresh pages the shared pool must supply for every group's
     // table to absorb num_tokens (sum of the per-group BlocksNeededFor math;
     // tail-page room is credited per group). Acquire's check-then-act gate and
-    // the scheduler's flat admission check both call this, so the page math
-    // lives in exactly one place.
+    // the scheduler's flat admission gates both build on this, so the page math
+    // lives in exactly one place. (No raw would-Acquire-succeed helper is
+    // exposed: the scheduler's gates must also account outstanding decode
+    // reservations and the pending SWA slide, so they compose this with
+    // BlocksFreedByAdvance and their reservation ledger instead.)
     std::int32_t BlocksNeededFor(std::span<const BlockTable> tables, std::int32_t num_tokens) const;
     // Overload for a not-yet-allocated request (prefill first chunk): every
     // group starts from a fresh, empty table (no tail credit).
     std::int32_t BlocksNeededFor(std::int32_t num_tokens) const;
-
-    // Would Acquire(tables, num_tokens) succeed right now? Same math as
-    // Acquire's gate, no allocation, no mutation.
-    bool CanAcquire(std::span<const BlockTable> tables, std::int32_t num_tokens) const {
-        return BlocksNeededFor(tables, num_tokens) <= pool_.NumFreeBlocks();
-    }
-    // Fresh-request variant (see BlocksNeededFor overload above).
-    bool CanAcquire(std::int32_t num_tokens) const { return BlocksNeededFor(num_tokens) <= pool_.NumFreeBlocks(); }
 
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
                          std::int32_t num_full_blocks);
@@ -99,6 +94,13 @@ public:
     // inherit KvCacheManager's no-op default, so only window-evicting managers
     // do work. tables are aligned by group index (size must equal NumGroups()).
     void AdvanceWindow(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
+
+    // Pure query, fan-out twin of AdvanceWindow: pages a pending
+    // AdvanceWindow(tables, num_computed_tokens) would return to the shared
+    // pool, summed over all groups (0 for full-history groups). Lets admission
+    // gates credit the slide DecodeStep performs before its Acquire without a
+    // second copy of the window math (each manager mirrors its own AdvanceWindow).
+    std::int32_t BlocksFreedByAdvance(std::span<const BlockTable> tables, std::int32_t num_computed_tokens) const;
 
 private:
     std::vector<std::string> keysForGroup(std::span<const std::string> content_hashes,

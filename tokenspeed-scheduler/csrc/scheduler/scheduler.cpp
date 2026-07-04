@@ -229,7 +229,19 @@ std::size_t Scheduler::RetractedSize() const {
 }
 
 std::size_t Scheduler::AvailableKvPages() const {
+#if TOKENSPEED_FLAT_KVCACHE
+    // TODO(radix-removal): the flat path never draws from the radix
+    // device_allocator_, so reporting it would show a permanently-full pool to
+    // Python monitoring (event_loop.py's _get_load / _get_scheduler_stats).
+    // Report the flat shared BlockPool instead. Units match: one flat block is
+    // one page of page_size tokens, the same unit as device_allocator_ pages
+    // and as Python's max_total_num_tokens // block_size. Block 0 is the
+    // pool's never-allocated null placeholder, so an idle pool reports
+    // total_pages - 1 (one page permanently "used").
+    return static_cast<std::size_t>(block_pool_.NumFreeBlocks());
+#else
     return device_allocator_.AvailablePages();
+#endif
 }
 
 std::size_t Scheduler::ActiveKvPages() const {

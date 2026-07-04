@@ -995,6 +995,30 @@ class CudaGraphWrapper:
             )
 
         else:
+            # Eager parity with the replay stale-table guard: with >1
+            # published group, the backend's single-table fallback would
+            # build one table from first-group pages — wrong pages for every
+            # other group — so an eager forward (the only prefill path, and
+            # the whole decode path under enforce_eager) must carry flat
+            # tables. Idle/bs==0 forwards carry no requests and are exempt
+            # (idle ranks bypass this wrapper via model_runner.forward, but
+            # keep the exemption explicit). A single published group is a
+            # documented fallback: the single table is that group's table.
+            if (
+                bs > 0
+                and not ctx.forward_mode.is_idle()
+                and not flat_block_tables
+                and getattr(self.attn_backend, "uses_flat_cache_groups", False)
+                and len(self.token_to_kv_pool.paged_cache_group_specs) > 1
+            ):
+                raise RuntimeError(
+                    "CudaGraphWrapper eager forward: pool publishes "
+                    f"{len(self.token_to_kv_pool.paged_cache_group_specs)} "
+                    "flat cache groups and the backend consumes flat tables, "
+                    f"but flat_block_tables is missing/empty at bs={bs} "
+                    f"({ctx.forward_mode.name}); the single-table fallback "
+                    "would use one group's pages for all layers."
+                )
             self._init_forward_metadata(
                 padded_bs,
                 ctx.num_extends,

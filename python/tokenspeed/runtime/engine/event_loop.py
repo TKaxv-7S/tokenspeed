@@ -37,6 +37,10 @@ from tokenspeed.runtime.cache.executor.memory_executor import (
 )
 from tokenspeed.runtime.cache.transfer.types import CacheKind
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    scheduler_ext_flat_kvcache,
+    validate_flat_scheduler_config,
+)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -305,6 +309,17 @@ class EventLoop:
 
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
+        # Fail fast before the C++ ctor: a flat-built ext either silently
+        # mis-drives V4-style paged-group backends (garbage replays) or dies
+        # inside MakeCoordinator with no hint on zero groups (spec decode /
+        # mamba). No-op on a radix build.
+        validate_flat_scheduler_config(
+            flat_kvcache_ext=scheduler_ext_flat_kvcache(),
+            paged_cache_groups=paged_cache_groups,
+            attn_backend=attn_backend,
+            kv_pool=token_to_kv_pool,
+            speculative_enabled=server_args.speculative_algorithm is not None,
+        )
         self._paged_cache_groups = paged_cache_groups
         prefix_cache_adjunct = None
         required_groups = token_to_kv_pool.prefix_cache_required_group_ids

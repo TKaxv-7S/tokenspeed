@@ -56,6 +56,73 @@ def scheduler_ext_flat_kvcache() -> bool:
     return bool(getattr(tokenspeed_scheduler, "FLAT_KVCACHE", False))
 
 
+def validate_flat_scheduler_config(
+    *,
+    flat_kvcache_ext: bool,
+    paged_cache_groups: Sequence[object],
+    attn_backend: object,
+    kv_pool: object,
+    speculative_enabled: bool,
+) -> None:
+    """Fail fast when a flat-built scheduler ext cannot drive this runtime setup.
+
+    Called at scheduler-config assembly, before the C++ ``Scheduler`` ctor. Two
+    misconfigurations are rejected (both no-ops on a radix build, where groups
+    are transport-only):
+
+    1. A backend that consumes paged-cache groups through the radix scheduler's
+       populate path but is not flat-group capable (``uses_paged_cache_groups``
+       without ``uses_flat_cache_groups``, e.g. DeepSeek V4/MLA). The flat build
+       compiles that path out and silently drops the specs' granularity fields,
+       so CUDA graphs would replay against stale capture placeholders — garbage
+       output with no error. The backend class flags are the same signals the
+       CUDA-graph wrapper keys its capture/replay paths off, so gating on them
+       rejects exactly the configs that would reach the broken path.
+    2. Zero published groups (spec decode gates MHA publication off; state-only
+       pools like mamba publish none). The flat Scheduler ctor would otherwise
+       die inside MakeCoordinator with no hint at the actual knob.
+    """
+    if not flat_kvcache_ext:
+        return
+    backend_name = type(attn_backend).__name__
+    pool_name = type(kv_pool).__name__
+    uses_paged = bool(getattr(attn_backend, "uses_paged_cache_groups", False))
+    uses_flat = bool(getattr(attn_backend, "uses_flat_cache_groups", False))
+    if uses_paged and not uses_flat:
+        raise RuntimeError(
+            "flat scheduler build (TOKENSPEED_FLAT_KVCACHE) does not support "
+            f"this model's cache layout yet: attention backend {backend_name} "
+            f"(KV pool {pool_name}) consumes paged-cache groups through the "
+            "radix scheduler's populate path, which the flat build compiles "
+            "out — CUDA graphs would silently replay against stale capture "
+            "placeholders. Use a radix-built tokenspeed_scheduler extension "
+            "for this model."
+        )
+    if not paged_cache_groups:
+        if speculative_enabled:
+            cause = (
+                "speculative decoding is enabled, which gates paged-cache "
+                "group publication off"
+            )
+            action = (
+                "Disable speculative decoding or use a radix-built "
+                "tokenspeed_scheduler extension."
+            )
+        else:
+            cause = (
+                f"KV pool {pool_name} publishes no paged-cache groups (e.g. "
+                "mamba/state-only pools)"
+            )
+            action = (
+                "Use a radix-built tokenspeed_scheduler extension for this "
+                "model."
+            )
+        raise RuntimeError(
+            "flat scheduler build (TOKENSPEED_FLAT_KVCACHE) requires at least "
+            f"one paged-cache group, but {cause}. {action}"
+        )
+
+
 def compute_paged_cache_group_page_counts(
     specs: Sequence[PagedCacheGroupSpec],
     *,
@@ -208,4 +275,5 @@ __all__ = [
     "compute_paged_cache_group_page_counts",
     "group_specs_from_layer_types",
     "scheduler_ext_flat_kvcache",
+    "validate_flat_scheduler_config",
 ]

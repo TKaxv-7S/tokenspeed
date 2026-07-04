@@ -34,26 +34,32 @@ bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>&
 
 bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                   std::span<const std::string> content_hashes, std::int32_t num_tokens,
-                  std::int32_t num_full_blocks) {
-    if (!coordinator.Acquire(tables, num_tokens)) {
-        return false;
-    }
+                  std::int32_t num_full_blocks, std::int32_t num_computed_tokens) {
+    // Order is load-bearing (see forward_cache_ops.h): register the prior
+    // chunks' completed pages BEFORE punching window holes (CacheFullBlocks
+    // skips holes), and slide BEFORE Acquire so the freed pages fund this
+    // chunk (schedulePrefill's gate credits the slide in lockstep).
     coordinator.CacheFullBlocks(tables, content_hashes, num_full_blocks);
-    return true;
+    coordinator.AdvanceWindow(tables, num_computed_tokens);
+    return coordinator.Acquire(tables, num_tokens);
 }
 
 bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                 std::int32_t num_tokens, std::int32_t num_computed_tokens) {
-    if (!coordinator.Acquire(tables, num_tokens)) {
-        return false;
-    }
+    // Slide BEFORE acquire (see forward_cache_ops.h): the pages the slide frees
+    // fund this request's own Acquire, so pool pressure cannot starve every
+    // decoding request at once. The scheduler's decode gate mirrors this order
+    // via BlocksFreedByAdvance.
     coordinator.AdvanceWindow(tables, num_computed_tokens);
-    return true;
+    return coordinator.Acquire(tables, num_tokens);
 }
 
 bool FinalizePrefillAndReserveDecode(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
-                                     std::span<const std::string> content_hashes, std::int32_t reserve_tokens) {
+                                     std::span<const std::string> content_hashes, std::int32_t reserve_tokens,
+                                     std::int32_t num_computed_tokens) {
+    // Same register -> slide -> acquire ordering as PrefillChunk (see header).
     coordinator.CacheFullBlocks(tables, content_hashes, static_cast<std::int32_t>(content_hashes.size()));
+    coordinator.AdvanceWindow(tables, num_computed_tokens);
     return coordinator.Acquire(tables, reserve_tokens);
 }
 
