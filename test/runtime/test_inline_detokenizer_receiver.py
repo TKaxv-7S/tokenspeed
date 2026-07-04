@@ -75,6 +75,7 @@ from tokenspeed.runtime.engine.output_processor import (  # noqa: E402
 )
 
 _GPT2_TOKENIZER = "gpt2"
+_MISSING = object()
 
 
 # ---------------------------------------------------------------------------
@@ -145,8 +146,11 @@ def _batch_token_id_out(
 ) -> BatchTokenIDOut:
     """Build a ``BatchTokenIDOut`` with safe defaults."""
     n = len(rids)
+    output_ids = overrides.pop("output_ids", _MISSING)
+    if output_ids is _MISSING:
+        output_ids = [list(ids) for ids in decode_ids]
     defaults: Dict[str, Any] = {
-        "output_ids": None,
+        "output_ids": output_ids,
         "output_multi_ids": None,
         "prompt_tokens": [0] * n,
         "completion_tokens": [0] * n,
@@ -421,6 +425,43 @@ class TestOutputIdsShape(unittest.TestCase):
         # Full copy every frame in non-stream mode.
         self.assertEqual(out1["output_ids"], ids_a)
         self.assertEqual(out2["output_ids"], ids_a + ids_b)
+
+    def test_inline_prefers_output_ids_over_decode_context(self):
+        mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
+        state = _mk_state(stream=True, rid="r1")
+        _register(mgr, state)
+
+        prompt_tail_ids = self.tok.encode("prompt tail")
+        output_ids = self.tok.encode(" answer")
+        recv = _batch_token_id_out(
+            ["r1"],
+            decode_ids=[prompt_tail_ids + output_ids],
+            decoded_texts=[""],
+            read_offsets=[len(prompt_tail_ids)],
+            output_ids=[output_ids],
+            finished_reasons=[{"type": "stop", "matched": None}],
+        )
+
+        mgr.output_processor.handle_batch_output(recv)
+        out = state.collector.take()
+
+        self.assertEqual(out["text"], self.tok.decode(output_ids))
+        self.assertEqual(out["output_ids"], output_ids)
+        self.assertEqual(state.output_ids, output_ids)
+
+    def test_inline_requires_output_ids(self):
+        mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
+        state = _mk_state(stream=True, rid="r1")
+        _register(mgr, state)
+
+        recv = _batch_token_id_out(
+            ["r1"],
+            decode_ids=[self.tok.encode("hello")],
+            output_ids=None,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "output_ids must be populated"):
+            mgr.output_processor.handle_batch_output(recv)
 
 
 # ---------------------------------------------------------------------------

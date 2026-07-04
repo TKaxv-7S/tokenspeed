@@ -107,6 +107,15 @@ class OutputProcessor:
         self.engine = engine
         self.logprobs_processor = LogprobsProcessor(engine)
 
+    @staticmethod
+    def _inline_output_ids(recv_obj: BatchTokenIDOut, index: int) -> list[int]:
+        if recv_obj.output_ids is None:
+            raise RuntimeError(
+                "BatchTokenIDOut.output_ids must be populated before "
+                "OutputProcessor handles inline token-id output."
+            )
+        return recv_obj.output_ids[index]
+
     def handle_batch_output(
         self,
         recv_obj: BatchStrOut | BatchEmbeddingOut | BatchTokenIDOut,
@@ -225,12 +234,12 @@ class OutputProcessor:
                     state.text += incremental_emit
                     if state.obj.stream:
                         state.logprobs_info = logprobs_info
-                        state.output_ids.extend(recv_obj.output_ids[i])
+                        state.output_ids.extend(self._inline_output_ids(recv_obj, i))
                         output_token_ids = state.output_ids[state.last_output_offset :]
                         state.last_output_offset = len(state.output_ids)
                     else:
                         state.logprobs_info.update(logprobs_info)
-                        state.output_ids.extend(recv_obj.output_ids[i])
+                        state.output_ids.extend(self._inline_output_ids(recv_obj, i))
                         output_token_ids = state.output_ids.copy()
 
                     out_dict = {
