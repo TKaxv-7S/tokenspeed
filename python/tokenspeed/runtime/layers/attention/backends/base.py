@@ -70,6 +70,11 @@ class AttentionBackend(ABC):
     ) -> bool:
         return False
 
+    def select_out_cache_loc(self, layer, out_cache_loc):
+        """Flat per-group write-location hook; identity for backends
+        without flat cache groups (see uses_flat_cache_groups)."""
+        return out_cache_loc
+
     @property
     def sinks_dtype(self) -> torch.dtype:
         return torch.bfloat16

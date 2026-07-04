@@ -384,13 +384,18 @@ class _BackendCase(_TorchCase):
         backend.spec_num_tokens = 1
         backend.is_draft = False
         backend.max_num_pages = MAX_NUM_PAGES
+        backend.page_size = 2
         backend.device = "cpu"
         backend.cuda_graph_decode_metadata = {}
         backend.cuda_graph_page_table = torch.zeros(
             (MAX_BS, MAX_NUM_PAGES), dtype=torch.int32
         )
-        backend.cuda_graph_seq_lens = torch.zeros(MAX_BS, dtype=torch.int32)
+        # seq_lens 1 (never 0): flat replay recomputes write locs from these
+        # (M11), and seq_len 0 would gather at position -1. 1 matches the
+        # dummy-row pad contract.
+        backend.cuda_graph_seq_lens = torch.ones(MAX_BS, dtype=torch.int32)
         backend.cuda_graph_flat_page_tables = {}
+        backend.cuda_graph_flat_out_cache_locs = {}
         backend._cuda_graph_max_bs = MAX_BS
         self.backend = backend
 

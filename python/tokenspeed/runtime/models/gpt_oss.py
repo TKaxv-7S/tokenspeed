@@ -231,7 +231,12 @@ class GptOssAttention(nn.Module):
             fused_kv_arg = create_fused_set_kv_buffer_arg(
                 value=v_3d,
                 layer=self.attn,
-                out_cache_loc=out_cache_loc,
+                # Flat path: write at this layer's group locations (M-W1).
+                # The tuple below keeps threading the ORIGINAL out_cache_loc;
+                # the backend re-selects downstream (idempotent).
+                out_cache_loc=ctx.attn_backend.select_out_cache_loc(
+                    self.attn, out_cache_loc
+                ),
                 token_to_kv_pool=ctx.token_to_kv_pool,
             )
 
