@@ -225,6 +225,30 @@ TEST(ComputePagedHashesTest, MissingExtraKeysPerPageTreatedAsEmpty) {
     EXPECT_EQ(got[1], h1);
 }
 
+// Incremental-hashing oracle for decode-time block caching: chaining a later
+// batch on the earlier batch's last hash reproduces the one-shot chain exactly.
+TEST(ComputePagedHashesTest, IncrementalChainEqualsOneShot) {
+    // 12-token stream, page_size 2 -> 6 pages.
+    std::vector<std::int32_t> tokens(12);
+    for (std::int32_t i = 0; i < 12; ++i) {
+        tokens[i] = 100 + i;
+    }
+    std::vector<token_span> pages;
+    for (std::size_t start = 0; start < tokens.size(); start += 2) {
+        pages.push_back(token_span(tokens.data() + start, 2));
+    }
+
+    const std::vector<std::string> one_shot = ComputePagedHashes(pages, "");
+
+    const std::vector<token_span> head(pages.begin(), pages.begin() + 3);
+    const std::vector<token_span> tail(pages.begin() + 3, pages.end());
+    std::vector<std::string> incremental = ComputePagedHashes(head, "");
+    const std::vector<std::string> rest = ComputePagedHashes(tail, incremental.back());
+    incremental.insert(incremental.end(), rest.begin(), rest.end());
+
+    EXPECT_EQ(incremental, one_shot);
+}
+
 // ---- group_id pack / unpack --------------------------------------------
 
 TEST(GroupIdTest, KeyIsContentHashPlusEightHex) {

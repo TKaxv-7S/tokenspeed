@@ -30,6 +30,8 @@
 //     finish orders.
 //   - cross-request prefix reuse (M9): admission-layer match -> FSM claim ->
 //     input window starting past the hit (FlatPrefixHitSuite below).
+//   - decode-filled page caching (M13): multi-turn prompts hit past the
+//     previous turn's response region (FlatDecodeCachingSuite below).
 // Retract/writeback are deliberately deferred on the flat path (C slice), so
 // they are NOT tested here. Abort, pool-exhaustion admission, and the
 // failure-path page release ARE covered (see the suites at the bottom of this
@@ -1840,6 +1842,345 @@ TEST_F(FlatPrefixHitTightPoolSuite, GateChargesFreeHitBlocksClaimWillConsume) {
     SendFinish("r2");
     PlanOnce();
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool back to baseline after both complete";
+}
+
+// ---------------------------------------------------------------------------
+// M13 decode-block caching, end to end through the Scheduler: pages that fill
+// up DURING decode register into the flat prefix cache via the hash chain the
+// Decoding state carries (DecodeStep: register -> slide -> acquire), so a
+// later turn whose prompt embeds the previous turn's response hits PAST the
+// previous prompt boundary -- the motivating multi-turn scenario.
+//
+// Shares FlatPrefixHitSuite's shape (page_size=2, full + swa groups, W=32 so
+// tests 1/2/4 stay about caching, disable_prefix_cache=false) and its
+// pool-accounting convention (claiming a cached free block leaves the free
+// count like an allocation does).
+//
+// Decode-page fill timing used in every derivation below: a round scheduled at
+// container Size s has N = s - decode_input_tokens(=1) computed tokens (the
+// pending input's KV is written by THIS round's forward), and the chain
+// registers pages up to N / page_size. So the page a generated token completes
+// registers only on the NEXT round -- once that token is no longer the pending
+// input. In particular the last wanted page needs one extra generated token
+// and schedule round before finish, or its block is freed hashless and can
+// never hit ("tail page registers one round late").
+// ---------------------------------------------------------------------------
+class FlatDecodeCachingSuite : public FlatPrefixHitSuite {
+protected:
+    // Deliver one sampled token and run the next schedule round, returning the
+    // per-group block-table row the round's flat op carried (state after that
+    // round's register -> slide -> acquire). Single-request rounds only.
+    std::map<std::string, std::vector<std::int32_t>> AdvanceOneRound(const std::string& id, token_t token) {
+        SendForwardDone(id, {token});
+        ExecutionPlan plan = PlanOnce();
+        const FlatForwardOperation* op = FindFlatOp(plan);
+        EXPECT_NE(op, nullptr);
+        std::map<std::string, std::vector<std::int32_t>> rows;
+        if (op != nullptr) {
+            for (const auto& [gid, table] : op->flat_block_tables) {
+                rows[gid] = table.at(0);
+            }
+        }
+        return rows;
+    }
+
+    // Turn-1 conversation prefix shared by the tests below: prompt {1,2,3,4},
+    // generated tokens 101..105. Registration schedule (page=2, W large or
+    // small -- fill timing is window-independent):
+    //   plan #1: prefill, 2 pages/group.
+    //   +101 -> Size 5, PrefillDone->Decoding finalize: registers PROMPT pages
+    //           0,1 and seeds the chain at {2 pages, hash(page 1)}.
+    //   +102 -> Size 6, N=5, filled = 5/2 = 2 == chained 2: nothing new.
+    //   +103 -> Size 7, N=6, filled = 3: REGISTERS page 2 = {101,102}.
+    //   +104 -> Size 8, N=7, filled = 3: page 3 = {103,104} is full in the
+    //           container, but 104 is this round's pending input -> NOT yet.
+    //   +105 -> Size 9, N=8, filled = 4: REGISTERS page 3 -- the tail page
+    //           lands one round late, so token 105 exists only to push N past
+    //           8; finishing after +104 instead would free page 3's block
+    //           hashless and cap the next turn's hit at 3 pages.
+    // The returned rows are the LAST round's tables: 5 slots (ceil(9/2)), the
+    // first 4 holding the conversation's pages 0..3.
+    std::map<std::string, std::vector<std::int32_t>> RunTurnOne() {
+        Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+        ExecutionPlan prefill = PlanOnce();
+        EXPECT_NE(FindFlatOp(prefill), nullptr);
+        AdvanceOneRound("r1", 101);
+        AdvanceOneRound("r1", 102);
+        AdvanceOneRound("r1", 103);
+        AdvanceOneRound("r1", 104);
+        auto rows = AdvanceOneRound("r1", 105);
+        SendFinish("r1");
+        PlanOnce();  // reap
+        return rows;
+    }
+
+    // Turn-2 prompt: r1's 4 prompt tokens + r1's first 4 generated tokens + 2
+    // new tokens = 10. The admission hashes chain from "" over the same token
+    // stream r1's registration chained over, so pages 0..3 match by content.
+    token_vec_t MakeTurnTwoPrompt() {
+        token_vec_t tokens = MakeAlignedTokens(/*num_pages=*/2, PageSize());  // {1,2,3,4} == r1's prompt
+        const token_vec_t response = MakeTokens(/*count=*/4, /*start=*/101);  // r1's generated 101..104
+        tokens.insert(tokens.end(), response.begin(), response.end());
+        const token_vec_t fresh = MakeTokens(/*count=*/2, /*start=*/901);
+        tokens.insert(tokens.end(), fresh.begin(), fresh.end());
+        return tokens;
+    }
+};
+
+// Test 1: the motivating hit. r2's 10-token prompt shares r1's full 8-token
+// stream; the hit covers all 4 pages -- 2 of them PAST r1's prompt boundary
+// (pages 2,3 were filled by r1's decode, not its prefill).
+TEST_F(FlatDecodeCachingSuite, DecodeFilledPageBecomesHittable) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    const auto r1_rows = RunTurnOne();
+    ASSERT_EQ(r1_rows.at("full").size(), 5u);
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "r1 must fully reclaim before r2 runs";
+
+    // Hit derivation: cap = (10-1)/2 = 4 pages -> match input = pages 0..3,
+    // all four registered by r1 (prompt pages 0,1 at finalize; decode pages
+    // 2,3 via the chain, see RunTurnOne). Full group matches 4; swa (W=32,
+    // contiguous_needed = ceil(31/2) = 16 > 4) keeps its whole cached run of
+    // 4 -> fixpoint 4 common blocks = 8 hit tokens.
+    Submit(MakeSpecWithTokens("r2", MakeTurnTwoPrompt()));
+    ExecutionPlan plan = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+
+    // Input window skips the 8 hit tokens: only the 2 new tokens are computed.
+    EXPECT_EQ(op->input_lengths.at(0), 2);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 8);
+    EXPECT_EQ(op->prefill_lengths.at(0), 10);
+    EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/901));
+    // Page space: 4 claimed + ceil(2 new tokens / 2) = 1 fresh page.
+    EXPECT_EQ(op->begins.at(0), 0);
+    EXPECT_EQ(op->sizes.at(0), 5);
+
+    // Physical reuse: r2's first 4 blocks ARE r1's pages, in both groups --
+    // slots 2,3 are the pages r1's decode filled, beyond its prompt boundary.
+    const std::vector<std::int32_t> full_prefix(r1_rows.at("full").begin(), r1_rows.at("full").begin() + 4);
+    const std::vector<std::int32_t> swa_prefix(r1_rows.at("swa").begin(), r1_rows.at("swa").begin() + 4);
+    ExpectRowPrefixEq(op->flat_block_tables.at("full").at(0), full_prefix, "full row");
+    ExpectRowPrefixEq(op->flat_block_tables.at("swa").at(0), swa_prefix, "swa row");
+
+    // Pool: claim pulls 4 cached-free blocks per group (8), the remainder
+    // Acquire takes 1 fresh page per group (2) -> 10 off the free count.
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 10);
+
+    SendForwardDone("r2", {199});
+    PlanOnce();
+    SendForwardDone("r2", {200});
+    SendFinish("r2");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool back to baseline after r2 finishes";
+}
+
+// Test 2: third turn. r2 decodes its own response whose pages register through
+// the SAME chain mechanics, so r3's hit grows to cover r2's response region.
+TEST_F(FlatDecodeCachingSuite, MultiTurnConversationReusesResponsePages) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    RunTurnOne();  // registers conversation pages 0..3
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+
+    // Turn 2: 10-token prompt, hit 4 pages (test 1's derivation), then 3
+    // generated tokens 201..203:
+    //   +201 -> Size 11, finalize: FlatWindowPageHashes covers pages 0..4
+    //           ((8+2)/2 = 5); pages 0..3 already carry hashes (IsCached skip),
+    //           page 4 = {901,902} REGISTERS; chain seeds at {5, hash(page 4)}.
+    //   +202 -> Size 12, N=11, filled = 5: nothing new.
+    //   +203 -> Size 13, N=12, filled = 6: REGISTERS page 5 = {201,202} (the
+    //           tail-page-late rule again: 203 exists to push N past 12).
+    Submit(MakeSpecWithTokens("r2", MakeTurnTwoPrompt()));
+    ExecutionPlan turn2 = PlanOnce();
+    const FlatForwardOperation* op2 = FindFlatOp(turn2);
+    ASSERT_NE(op2, nullptr);
+    EXPECT_EQ(op2->extend_prefix_lens.at(0), 8) << "turn 2 hits r1's prompt + response pages";
+    AdvanceOneRound("r2", 201);
+    AdvanceOneRound("r2", 202);
+    const auto r2_rows = AdvanceOneRound("r2", 203);
+    ASSERT_EQ(r2_rows.at("full").size(), 7u);  // ceil(13/2)
+    SendFinish("r2");
+    PlanOnce();  // reap
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+
+    // Turn 3 prompt: r2's full 13-token stream + 3 new = 16 tokens. Hit
+    // derivation: cap = (16-1)/2 = 7 -> match input = pages 0..6; pages 0..5
+    // are registered (0..3 by r1, 4..5 by r2), page 6 = {203, 951} was never
+    // full inside any request -> full group matches 6; swa (needed 16 > 6)
+    // keeps its run of 6 -> fixpoint 6 common blocks = 12 hit tokens, past
+    // turn 2's own 10-token prompt boundary and into r2's response (page 5).
+    token_vec_t r3_tokens = MakeTurnTwoPrompt();
+    const token_vec_t r2_response = MakeTokens(/*count=*/3, /*start=*/201);
+    r3_tokens.insert(r3_tokens.end(), r2_response.begin(), r2_response.end());
+    const token_vec_t fresh = MakeTokens(/*count=*/3, /*start=*/951);
+    r3_tokens.insert(r3_tokens.end(), fresh.begin(), fresh.end());
+    Submit(MakeSpecWithTokens("r3", r3_tokens));
+
+    ExecutionPlan turn3 = PlanOnce();
+    const FlatForwardOperation* op3 = FindFlatOp(turn3);
+    ASSERT_NE(op3, nullptr);
+    ASSERT_EQ(op3->request_ids.size(), 1u);
+    EXPECT_EQ(op3->extend_prefix_lens.at(0), 12) << "hit grows across turns: 8 -> 12 tokens";
+    EXPECT_EQ(op3->input_lengths.at(0), 4);
+    EXPECT_EQ(op3->prefill_lengths.at(0), 16);
+    EXPECT_EQ(op3->input_ids, (token_vec_t{203, 951, 952, 953}));
+    // 6 claimed + ceil(4 new tokens / 2) = 2 fresh pages.
+    EXPECT_EQ(op3->begins.at(0), 0);
+    EXPECT_EQ(op3->sizes.at(0), 8);
+
+    // Physical reuse spans BOTH earlier turns: slots 0..3 are r1's blocks
+    // (r2 claimed and re-freed them cached), slots 4..5 are r2's own pages.
+    const std::vector<std::int32_t> full_prefix(r2_rows.at("full").begin(), r2_rows.at("full").begin() + 6);
+    const std::vector<std::int32_t> swa_prefix(r2_rows.at("swa").begin(), r2_rows.at("swa").begin() + 6);
+    ExpectRowPrefixEq(op3->flat_block_tables.at("full").at(0), full_prefix, "full row");
+    ExpectRowPrefixEq(op3->flat_block_tables.at("swa").at(0), swa_prefix, "swa row");
+
+    // Pool: 6 claimed per group (12) + 2 fresh per group (4) = 16.
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 16);
+
+    SendForwardDone("r3", {299});
+    PlanOnce();
+    SendForwardDone("r3", {300});
+    SendFinish("r3");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool back to baseline after all three turns";
+}
+
+// Test 3: small window. A decode page REGISTERS (DecodeStep runs the
+// registration before the slide) and a later round's AdvanceWindow then
+// punches it -- the punch frees the block WITH its hash, so the next turn
+// still hits it through the bounded SWA fixpoint.
+class FlatDecodeCachingSmallWindowSuite : public FlatDecodeCachingSuite {
+protected:
+    std::int32_t SlidingWindowTokens() const override { return 4; }
+};
+
+TEST_F(FlatDecodeCachingSmallWindowSuite, SwaPunchedDecodePageStillHittable) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    // Turn-1 fill/register timing is RunTurnOne's (window-independent), inlined
+    // here because the punch round +106 must land BEFORE finish; the swa slides
+    // on top of it (W=4: first kept token = N-3, punched pages = (N-3)/2):
+    //   +101 -> Size 5, finalize: registers prompt pages 0,1; N=4 -> punches
+    //           nothing (first kept token 1).
+    //   +102 -> Size 6, N=5 -> punch slot 0.
+    //   +103 -> Size 7, N=6: REGISTERS page 2; first kept token 3 is still in
+    //           page 1 -> no new punch.
+    //   +104 -> Size 8, N=7 -> punch slot 1.
+    //   +105 -> Size 9, N=8: REGISTERS page 3; first kept page 2 -> no punch.
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+    ExecutionPlan r1_prefill = PlanOnce();
+    ASSERT_NE(FindFlatOp(r1_prefill), nullptr);
+    AdvanceOneRound("r1", 101);
+    AdvanceOneRound("r1", 102);
+    AdvanceOneRound("r1", 103);
+    AdvanceOneRound("r1", 104);
+    const auto r1_rows = AdvanceOneRound("r1", 105);
+    ASSERT_EQ(r1_rows.at("swa").size(), 5u);
+    EXPECT_EQ(r1_rows.at("swa")[0], 0);
+    EXPECT_EQ(r1_rows.at("swa")[1], 0);
+    ASSERT_GT(r1_rows.at("swa")[2], 0) << "page 2 is registered AND still live after the +105 round";
+    ASSERT_GT(r1_rows.at("swa")[3], 0);
+
+    // One more round punches the REGISTERED decode page: +106 -> Size 10, N=9
+    // -> first kept token 6 -> first kept page 3 -> slot 2 (registered at the
+    // +103 round) is evicted to null; its block reaches the free list with the
+    // hash intact. That block plus r1's finish is the cached state r2 hits.
+    const auto punched = AdvanceOneRound("r1", 106);
+    EXPECT_EQ(punched.at("swa")[2], 0) << "the registered decode page must be punched by now";
+    SendFinish("r1");
+    PlanOnce();  // reap
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+
+    // r2: same 8-token prefix + 2 new = 10 tokens. Fixpoint derivation (W=4,
+    // page=2, contiguous_needed = ceil(3/2) = 2): cap = (10-1)/2 = 4 -> match
+    // input = pages 0..3, all four hashes cached (slots 0,1,2 punched WITH
+    // hash, slot 3 and the whole full group freed cached at finish). Full
+    // group matches 4 -> common 4. SwaManager bounded to 4 scans right->left:
+    // page 3 cached (run 1), page 2 cached -- the punched decode page --
+    // (run 2 == needed) -> stop; keep = 4 with slots 0,1 as null holes. Its
+    // bounded length 4 == common, so the fixpoint settles at 4 common blocks
+    // = 8 hit tokens; the full group drives the common length.
+    token_vec_t r2_tokens = MakeTurnTwoPrompt();
+    Submit(MakeSpecWithTokens("r2", r2_tokens));
+    ExecutionPlan plan = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+
+    EXPECT_EQ(op->input_lengths.at(0), 2);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 8);
+    EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/901));
+    EXPECT_EQ(op->begins.at(0), 0);
+    EXPECT_EQ(op->sizes.at(0), 5);  // 4 claimed slots (real or hole) + 1 fresh page
+
+    // Full row: r1's 4 pages reused, no holes.
+    const std::vector<std::int32_t> full_prefix(r1_rows.at("full").begin(), r1_rows.at("full").begin() + 4);
+    ExpectRowPrefixEq(op->flat_block_tables.at("full").at(0), full_prefix, "full row");
+
+    // Swa row: holes exactly where the bounded match put them; slot 2 is THE
+    // punched-then-refreed decode block, physically r1's (id captured at the
+    // +105 round, before the punch).
+    const auto& swa_row = op->flat_block_tables.at("swa").at(0);
+    ASSERT_EQ(swa_row.size(), 5u);
+    EXPECT_EQ(swa_row[0], 0) << "out-of-window slot claimed as a null hole";
+    EXPECT_EQ(swa_row[1], 0) << "out-of-window slot claimed as a null hole";
+    EXPECT_EQ(swa_row[2], r1_rows.at("swa")[2]) << "punched decode page claimed back by hash";
+    EXPECT_EQ(swa_row[3], r1_rows.at("swa")[3]);
+    EXPECT_GT(swa_row[4], 0);
+
+    // Pool: full claims 4, swa claims 2 (holes claim nothing), remainder
+    // Acquire takes 1 fresh page per group -> 4 + 2 + 2 = 8 off the free count.
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 8);
+
+    SendForwardDone("r2", {199});
+    PlanOnce();
+    SendForwardDone("r2", {200});
+    SendFinish("r2");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+}
+
+// Test 4: registration writes hashes only -- never refcounts -- so the whole
+// three-turn flow must return the pool to baseline after every turn's finish.
+TEST_F(FlatDecodeCachingSuite, PoolBalanceAcrossDecodeCaching) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    // Turn 1: registers pages 0..3, two of them decode-filled (RunTurnOne).
+    RunTurnOne();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "turn 1: decode registration must not hold refs";
+
+    // Turn 2: hits 4 pages, decodes 3 tokens, registers pages 4..5.
+    Submit(MakeSpecWithTokens("r2", MakeTurnTwoPrompt()));
+    ExecutionPlan turn2 = PlanOnce();
+    ASSERT_NE(FindFlatOp(turn2), nullptr);
+    EXPECT_LT(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "turn 2 holds claimed + fresh pages while live";
+    AdvanceOneRound("r2", 201);
+    AdvanceOneRound("r2", 202);
+    AdvanceOneRound("r2", 203);
+    SendFinish("r2");
+    PlanOnce();  // reap
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "turn 2: claimed and fresh pages all return";
+
+    // Turn 3: hits 6 pages (12 tokens, test 2's derivation), one decode round.
+    token_vec_t r3_tokens = MakeTurnTwoPrompt();
+    const token_vec_t r2_response = MakeTokens(/*count=*/3, /*start=*/201);
+    r3_tokens.insert(r3_tokens.end(), r2_response.begin(), r2_response.end());
+    const token_vec_t fresh = MakeTokens(/*count=*/3, /*start=*/951);
+    r3_tokens.insert(r3_tokens.end(), fresh.begin(), fresh.end());
+    Submit(MakeSpecWithTokens("r3", r3_tokens));
+    ExecutionPlan turn3 = PlanOnce();
+    const FlatForwardOperation* op3 = FindFlatOp(turn3);
+    ASSERT_NE(op3, nullptr);
+    EXPECT_EQ(op3->extend_prefix_lens.at(0), 12);
+    SendForwardDone("r3", {299});
+    PlanOnce();
+    SendForwardDone("r3", {300});
+    SendFinish("r3");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "baseline restored after the whole conversation";
 }
 
 }  // namespace tokenspeed::test

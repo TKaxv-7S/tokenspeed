@@ -252,7 +252,7 @@ TEST(CoordinatorStepTest, CacheFullBlocksThenMatchHits) {
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}});
     std::vector<BlockTable> tables(2);
     ASSERT_TRUE(coord.Acquire(tables, 4));   // 1 page each
-    coord.CacheFullBlocks(tables, ch, /*num_full_blocks=*/1);
+    coord.CacheFullBlocks(tables, ch);
 
     // A fresh request now hits the common prefix (1 page) in both groups.
     CoordinatorMatch m = coord.MatchPrefix(ch);
@@ -287,7 +287,7 @@ TEST(CoordinatorStepTest, EndToEndTwoRequestsSharePrefix) {
         std::vector<BlockTable> a(2);
         coord.ClaimCommonPrefix(a, m);
         ASSERT_TRUE(coord.Acquire(a, 8));
-        coord.CacheFullBlocks(a, ch, 2);
+        coord.CacheFullBlocks(a, ch);
         coord.Free(a);
     }
     // Request B: shares the prefix -> common 2 pages in both groups.
@@ -301,6 +301,70 @@ TEST(CoordinatorStepTest, EndToEndTwoRequestsSharePrefix) {
         EXPECT_EQ(b[1].NumBlocks(), 2);
         coord.Free(b);
     }
+}
+
+TEST(CoordinatorStepTest, CacheFullBlocksAtSlotOffsetExtendsPrefix) {
+    BlockPool pool(64);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kSlidingWindow, 4, 4}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+
+    std::vector<std::string> ch = ContentHashes(
+        {{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}, {5, 5, 5, 5}});
+    std::vector<BlockTable> tables(2);
+    ASSERT_TRUE(coord.Acquire(tables, 24));   // 6 pages each
+    coord.CacheFullBlocks(tables, std::span(ch).first(4));   // prefill path: slots 0..3
+    coord.CacheFullBlocks(tables, std::span(ch).subspan(4), /*first_slot=*/4);
+
+    CoordinatorMatch m = coord.MatchPrefix(ch);
+    EXPECT_EQ(m.num_common_blocks, 6);
+    ASSERT_EQ(m.per_group.size(), 2u);
+    // Full group: every slot maps to the exact block it was registered under.
+    ASSERT_EQ(m.per_group[0].blocks.size(), 6u);
+    for (std::size_t s = 0; s < 6; ++s) {
+        EXPECT_EQ(m.per_group[0].blocks[s], tables[0].Blocks()[s]) << "slot " << s;
+    }
+    // Swa group (window 4 -> contiguous_needed 1): tail run only, and it maps
+    // to the offset-registered slot-5 block.
+    ASSERT_EQ(m.per_group[1].blocks.size(), 6u);
+    EXPECT_EQ(m.per_group[1].blocks[5], tables[1].Blocks()[5]);
+}
+
+TEST(CoordinatorStepTest, CacheFullBlocksAtOffsetSkipsSwaHoles) {
+    BlockPool pool(64);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kSlidingWindow, 4, 4}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+
+    std::vector<std::string> ch = ContentHashes(
+        {{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}, {5, 5, 5, 5}});
+    std::vector<BlockTable> tables(2);
+    ASSERT_TRUE(coord.Acquire(tables, 24));   // 6 pages each
+    // num_computed=20 -> swa skipped = 20-4+1 = 17 -> 17/4 = 4 pages punched:
+    // swa slots 0..3 are null holes.
+    coord.AdvanceWindow(tables, /*num_computed_tokens=*/20);
+    ASSERT_TRUE(tables[1].Blocks()[3]->IsNull());
+    ASSERT_FALSE(tables[1].Blocks()[4]->IsNull());
+
+    // Offset range 2..5 overlaps the holes at 2,3: skipped, real slots registered.
+    coord.CacheFullBlocks(tables, std::span(ch).subspan(2), /*first_slot=*/2);
+    for (std::size_t s = 2; s < 6; ++s) {
+        EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[s], 0)), nullptr) << "full slot " << s;
+    }
+    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 1)), nullptr);
+    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(ch[3], 1)), nullptr);
+    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[4], 1)), nullptr);
+    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[5], 1)), nullptr);
+}
+
+TEST(CoordinatorStepTest, CacheFullBlocksRejectsOutOfRangeFirstSlot) {
+    BlockPool pool(32);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kSlidingWindow, 4, 4}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+
+    std::vector<std::string> ch = ContentHashes({{7, 7, 7, 7}});
+    std::vector<BlockTable> tables(2);
+    ASSERT_TRUE(coord.Acquire(tables, 8));   // 2 pages each
+    EXPECT_THROW(coord.CacheFullBlocks(tables, ch, /*first_slot=*/2), std::runtime_error);
+    EXPECT_THROW(coord.CacheFullBlocks(tables, ch, /*first_slot=*/-1), std::runtime_error);
 }
 
 TEST(CoordinatorMatchTest, SwaRunCutByFullBoundDropsToNoValidMatch) {

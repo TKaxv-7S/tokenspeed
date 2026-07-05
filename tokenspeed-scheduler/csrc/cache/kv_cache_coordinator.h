@@ -75,8 +75,9 @@ public:
     // table (no tail credit).
     std::int32_t BlocksNeededFor(std::int32_t num_tokens) const;
 
+    // Register content_hashes[j] under every group's table slot first_slot + j.
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
-                         std::int32_t num_full_blocks);
+                         std::int32_t first_slot = 0);
     void Free(std::span<BlockTable> tables);
 
     // Fan out window eviction to every group; managers without a retention

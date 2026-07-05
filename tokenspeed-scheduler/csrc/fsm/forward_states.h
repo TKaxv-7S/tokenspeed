@@ -297,6 +297,15 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
+#if TOKENSPEED_FLAT_KVCACHE
+// Rolling page-hash chain over the request's full pages: pages [0,
+// num_hashed_pages) are registered, last_hash seeds the next increment.
+struct FlatHashChain {
+    std::int32_t num_hashed_pages{0};
+    std::string last_hash;
+};
+#endif
+
 struct Decoding : public ForwardState {
     Decoding(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
              std::unique_ptr<DeviceNodeRef>&& node_ref, std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,
@@ -322,9 +331,17 @@ struct Decoding : public ForwardState {
 
     std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
 
+#if TOKENSPEED_FLAT_KVCACHE
+    const FlatHashChain& GetFlatHashChain() const { return flat_hash_chain_; }
+    void SetFlatHashChain(FlatHashChain chain) { flat_hash_chain_ = std::move(chain); }
+#endif
+
 private:
     std::unique_ptr<HostNodeRef> host_node_ref_{};  // pins host pages until the next state takes ownership
     std::int32_t reserve_num_tokens_in_next_schedule_event_{-1};
+#if TOKENSPEED_FLAT_KVCACHE
+    FlatHashChain flat_hash_chain_{};
+#endif
 };
 
 // Request has finished it's generation, and host pages have been allocated,

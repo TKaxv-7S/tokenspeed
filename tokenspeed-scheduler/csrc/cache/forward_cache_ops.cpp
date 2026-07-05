@@ -38,16 +38,18 @@ bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tabl
     // the reverse order would lose the punched pages' hashes forever.
     // AdvanceWindow before Acquire: the slide's freed pages fund this chunk
     // (admission gates credit them via BlocksFreedByAdvance in lockstep).
-    coordinator.CacheFullBlocks(tables, content_hashes, num_full_blocks);
+    _assert(num_full_blocks >= 0 && num_full_blocks <= static_cast<std::int32_t>(content_hashes.size()),
+            "num_full_blocks out of range");
+    coordinator.CacheFullBlocks(tables, content_hashes.first(static_cast<std::size_t>(num_full_blocks)));
     coordinator.AdvanceWindow(tables, num_computed_tokens);
     return coordinator.Acquire(tables, num_tokens);
 }
 
 bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
+                std::span<const std::string> content_hashes, std::int32_t first_page_slot,
                 std::int32_t num_tokens, std::int32_t num_computed_tokens) {
-    // Slide before Acquire so a decoding request funds its own step from the
-    // pages its slide frees; the reverse order can starve every decoding
-    // request at once under pool pressure.
+    // register -> slide -> acquire: ordering rationale in PrefillChunk above.
+    coordinator.CacheFullBlocks(tables, content_hashes, first_page_slot);
     coordinator.AdvanceWindow(tables, num_computed_tokens);
     return coordinator.Acquire(tables, num_tokens);
 }
@@ -55,7 +57,7 @@ bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables
 bool FinalizePrefillAndReserveDecode(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                                      std::span<const std::string> content_hashes, std::int32_t reserve_tokens,
                                      std::int32_t num_computed_tokens) {
-    coordinator.CacheFullBlocks(tables, content_hashes, static_cast<std::int32_t>(content_hashes.size()));
+    coordinator.CacheFullBlocks(tables, content_hashes);
     coordinator.AdvanceWindow(tables, num_computed_tokens);
     return coordinator.Acquire(tables, reserve_tokens);
 }

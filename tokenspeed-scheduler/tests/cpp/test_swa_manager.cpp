@@ -248,7 +248,7 @@ TEST(SwaManagerTest, InheritedCacheFullBlocksMakesPagesHittable) {
 
     BlockTable a;
     ASSERT_TRUE(mgr.Acquire(a, 4));
-    mgr.CacheFullBlocks(a, std::vector<std::string>{h0}, 1);
+    mgr.CacheFullBlocks(a, std::vector<std::string>{h0});
 
     PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{h0});
     EXPECT_EQ(m.num_hit_blocks, 1);
@@ -393,7 +393,7 @@ TEST(SwaManagerTest, AdvanceWindowFreedCachedPageStaysPrefixReusable) {
     ASSERT_TRUE(mgr.Acquire(table, 8));  // 4 pages
     const std::string h0 = RealKey({1, 1}, 0);
     // Register page 0's content so it carries a hash.
-    mgr.CacheFullBlocks(table, std::vector<std::string>{h0}, 1);
+    mgr.CacheFullBlocks(table, std::vector<std::string>{h0});
     CacheBlock* p0 = table.Blocks()[0];
     EXPECT_TRUE(p0->IsCached());
 

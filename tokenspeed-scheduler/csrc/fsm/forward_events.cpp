@@ -407,6 +407,8 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
                       decode_input_tokens_,
                       nullptr};
     decoding.SetBlockTables(std::move(tables));
+    decoding.SetFlatHashChain(FlatHashChain{static_cast<std::int32_t>(hashes.size()),
+                                            hashes.empty() ? std::string{} : hashes.back()});
     return decoding;
 #else
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
@@ -449,9 +451,25 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
     // reads. scheduleDecode's gate credited the slide with this same value.
     const std::int32_t num_computed_tokens = state.GetTokenContainer()->Size() - decode_input_tokens_;
 
+    // Hash the pages decode filled since the last step, chained on the prior
+    // step's last hash, so DecodeStep can register them before its slide.
+    FlatHashChain chain = state.GetFlatHashChain();
+    const std::int32_t first_page_slot = chain.num_hashed_pages;
+    const std::int32_t filled_pages = num_computed_tokens / state.GetPageSize();
+    std::vector<std::string> new_hashes;
+    if (filled_pages > chain.num_hashed_pages) {
+        const auto paged = state.GetFullPagedTokens(false);
+        _assert(filled_pages <= static_cast<std::int32_t>(paged.size()),
+                "flat decode hashing: filled pages exceed the container's full pages");
+        const std::vector<std::span<const std::int32_t>> fresh(paged.begin() + chain.num_hashed_pages,
+                                                               paged.begin() + filled_pages);
+        new_hashes = ComputePagedHashes(fresh, chain.last_hash);
+        chain = FlatHashChain{filled_pages, new_hashes.back()};
+    }
+
     auto tables = std::move(state).TakeBlockTables();
     BlockTablesGuard tables_guard{*coordinator_, tables};
-    if (!DecodeStep(*coordinator_, tables, reserve, num_computed_tokens)) {
+    if (!DecodeStep(*coordinator_, tables, new_hashes, first_page_slot, reserve, num_computed_tokens)) {
         _assert(false, "flat path: allocation failure unsupported in C slice");
     }
     tables_guard.Disarm();
@@ -465,6 +483,7 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
                       decode_input_tokens_,
                       nullptr};
     decoding.SetBlockTables(std::move(tables));
+    decoding.SetFlatHashChain(std::move(chain));
     return decoding;
 #else
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();

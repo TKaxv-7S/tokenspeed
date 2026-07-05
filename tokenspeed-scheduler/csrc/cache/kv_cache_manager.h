@@ -104,20 +104,20 @@ public:
         return (over + page_size_ - 1) / page_size_;
     }
 
-    // Register the table's first num_full_blocks pages (partial tail excluded by
-    // the caller) under their page-hash keys so later requests can prefix-hit
-    // them; pages already carrying a hash are skipped.
+    // Register block_hashes[j] under table slot first_slot + j (partial tail
+    // excluded by the caller) so later requests can prefix-hit those pages;
+    // pages already carrying a hash are skipped.
     void CacheFullBlocks(BlockTable& table, std::span<const std::string> block_hashes,
-                         std::int32_t num_full_blocks) {
-        _assert(num_full_blocks <= table.NumBlocks(), "num_full_blocks exceeds table size");
-        _assert(num_full_blocks <= static_cast<std::int32_t>(block_hashes.size()),
-                "block_hashes shorter than num_full_blocks");
-        for (std::int32_t i = 0; i < num_full_blocks; ++i) {
-            CacheBlock* block = table.blocks_[i];
+                         std::int32_t first_slot = 0) {
+        _assert(first_slot >= 0, "first_slot must be >= 0");
+        _assert(first_slot + static_cast<std::int32_t>(block_hashes.size()) <= table.NumBlocks(),
+                "hash range exceeds table size");
+        for (std::size_t j = 0; j < block_hashes.size(); ++j) {
+            CacheBlock* block = table.blocks_[static_cast<std::size_t>(first_slot) + j];
             if (block->IsCached()) {
                 continue;  // already registered (prefix hit or earlier call)
             }
-            pool_.CacheFullBlocks(block, block_hashes[i]);
+            pool_.CacheFullBlocks(block, block_hashes[j]);
         }
     }
 

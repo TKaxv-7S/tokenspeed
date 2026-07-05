@@ -92,7 +92,7 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
     }
     std::vector<BlockTable> r1(coordinator.NumGroups());
     ASSERT_TRUE(PrefillFirstChunk(coordinator, r1, CoordinatorMatch{}, /*num_new_tokens=*/8));
-    coordinator.CacheFullBlocks(r1, hashes8, /*num_full_blocks=*/4);
+    coordinator.CacheFullBlocks(r1, hashes8);
     const std::vector<std::int32_t> r1_full_ids = BlockTablePageIds(r1[0]);
     const std::vector<std::int32_t> r1_swa_ids = BlockTablePageIds(r1[1]);
     FreeRequest(coordinator, r1);
@@ -244,7 +244,8 @@ TEST(ForwardCacheOpsDecode, StepAcquiresAndSlidesSwaWindow) {
     ASSERT_TRUE(coordinator.Acquire(tables, /*num_tokens=*/6));  // 3 pages/group
 
     for (std::int32_t computed = 7; computed <= 13; ++computed) {
-        ASSERT_TRUE(DecodeStep(coordinator, tables, /*num_tokens=*/1, /*num_computed_tokens=*/computed));
+        ASSERT_TRUE(DecodeStep(coordinator, tables, /*content_hashes=*/{}, /*first_page_slot=*/0,
+                               /*num_tokens=*/1, /*num_computed_tokens=*/computed));
     }
     // Full group: 13 tokens -> ceil(13/2)=7 pages, no nulls.
     EXPECT_EQ(tables[0].NumBlocks(), 7);
@@ -259,6 +260,66 @@ TEST(ForwardCacheOpsDecode, StepAcquiresAndSlidesSwaWindow) {
         if (b != pool.NullBlock()) ++swa_active;
     }
     EXPECT_LE(swa_active, 3);
+}
+
+// Decode-time block caching (M13): DecodeStep registers the pages decode just
+// filled at their absolute table slots, extending the request's prefix chain.
+TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
+    BlockPool pool(/*total_num_blocks=*/32, /*enable_caching=*/true);
+    std::vector<KvCacheSpec> specs{
+        KvCacheSpec{AttnKind::kFull, /*page_size=*/2, /*sliding_window=*/0},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+
+    // 8 tokens -> 4 full pages; pages 0-1 registered at prefill time.
+    ASSERT_TRUE(coordinator.Acquire(tables, /*num_tokens=*/8));
+    std::vector<std::string> hashes(4);
+    for (std::size_t i = 0; i < hashes.size(); ++i) {
+        hashes[i] = std::string(64, static_cast<char>('a' + i));
+    }
+    coordinator.CacheFullBlocks(tables, std::span<const std::string>(hashes).first(2));
+    ASSERT_EQ(coordinator.MatchPrefix(hashes).num_common_blocks, 2);
+
+    // Decode filled pages 2-3: register them at slots 2-3, then acquire the step.
+    const std::vector<std::string> fresh(hashes.begin() + 2, hashes.end());
+    ASSERT_TRUE(DecodeStep(coordinator, tables, fresh, /*first_page_slot=*/2,
+                           /*num_tokens=*/1, /*num_computed_tokens=*/8));
+
+    // The full 4-page chain is now hittable, and each slot maps to this
+    // request's physical page (registration, not a copy).
+    const CoordinatorMatch hit = coordinator.MatchPrefix(hashes);
+    EXPECT_EQ(hit.num_common_blocks, 4);
+    for (std::int32_t i = 0; i < 4; ++i) {
+        EXPECT_EQ(hit.per_group[0].blocks[i]->BlockId(), tables[0].Blocks()[i]->BlockId()) << "slot " << i;
+    }
+}
+
+// Empty content_hashes must keep DecodeStep byte-equivalent to the pre-M13
+// slide->acquire body: CacheFullBlocks over an empty span is a no-op.
+TEST(ForwardCacheOpsDecode, DecodeStepWithEmptyHashesUnchanged) {
+    BlockPool pool_new(/*total_num_blocks=*/32, /*enable_caching=*/true);
+    BlockPool pool_old(/*total_num_blocks=*/32, /*enable_caching=*/true);
+    KvCacheCoordinator coordinator_new = MakeTwoGroup(pool_new);  // page=2, W=4
+    KvCacheCoordinator coordinator_old = MakeTwoGroup(pool_old);
+    std::vector<BlockTable> tables_new(coordinator_new.NumGroups());
+    std::vector<BlockTable> tables_old(coordinator_old.NumGroups());
+    ASSERT_TRUE(coordinator_new.Acquire(tables_new, /*num_tokens=*/8));  // 4 pages/group
+    ASSERT_TRUE(coordinator_old.Acquire(tables_old, /*num_tokens=*/8));
+
+    // num_computed=8 slides the SWA window (punches slots 0,1), so the
+    // equivalence covers the slide, the acquire, and the pool accounting.
+    ASSERT_TRUE(DecodeStep(coordinator_new, tables_new, /*content_hashes=*/{}, /*first_page_slot=*/0,
+                           /*num_tokens=*/1, /*num_computed_tokens=*/8));
+    coordinator_old.AdvanceWindow(tables_old, /*num_computed_tokens=*/8);
+    ASSERT_TRUE(coordinator_old.Acquire(tables_old, /*num_tokens=*/1));
+
+    EXPECT_EQ(pool_new.NumFreeBlocks(), pool_old.NumFreeBlocks());
+    ASSERT_EQ(tables_new.size(), tables_old.size());
+    for (std::size_t g = 0; g < tables_new.size(); ++g) {
+        EXPECT_EQ(BlockTablePageIds(tables_new[g]), BlockTablePageIds(tables_old[g])) << "group " << g;
+        EXPECT_EQ(tables_new[g].TailAvailableTokens(), tables_old[g].TailAvailableTokens()) << "group " << g;
+    }
 }
 
 TEST(ForwardCacheOpsSpecs, TranslatesPagedCacheGroups) {

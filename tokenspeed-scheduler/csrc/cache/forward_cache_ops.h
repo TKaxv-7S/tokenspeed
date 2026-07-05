@@ -56,10 +56,10 @@ bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tabl
                   std::span<const std::string> content_hashes, std::int32_t num_tokens,
                   std::int32_t num_full_blocks, std::int32_t num_computed_tokens);
 
-// One decode step: slide the SWA window to num_computed_tokens (tokens computed
-// BEFORE this round's pending forward), then acquire the step's page need.
-// False = pool short; the slide already ran, nothing was allocated.
+// One decode step, same register->slide->acquire shape as PrefillChunk: hash j
+// registers under slot first_page_slot + j. False = pool short, nothing allocated.
 bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
+                std::span<const std::string> content_hashes, std::int32_t first_page_slot,
                 std::int32_t num_tokens, std::int32_t num_computed_tokens);
 
 // Prefill -> decode transition: register the remaining full prefill pages,

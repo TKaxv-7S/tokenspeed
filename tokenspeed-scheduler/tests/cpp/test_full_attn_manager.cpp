@@ -215,7 +215,7 @@ TEST(FullAttnManagerTest, CacheFullBlocksMakesPagesPrefixHittable) {
     BlockTable a;
     ASSERT_TRUE(mgr.Acquire(a, 8));
     ASSERT_EQ(a.NumBlocks(), 2);
-    mgr.CacheFullBlocks(a, std::vector<std::string>{k0, k1}, /*num_full_blocks=*/2);
+    mgr.CacheFullBlocks(a, std::vector<std::string>{k0, k1});
 
     // Request B sees both as a prefix hit.
     PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0, k1});
@@ -233,8 +233,8 @@ TEST(FullAttnManagerTest, CacheFullBlocksSkipsTailPage) {
     BlockTable a;
     ASSERT_TRUE(mgr.Acquire(a, 6));
     ASSERT_EQ(a.NumBlocks(), 2);
-    // Only the first (full) page is cached; num_full_blocks = 1.
-    mgr.CacheFullBlocks(a, std::vector<std::string>{k0}, /*num_full_blocks=*/1);
+    // Only the first (full) page is cached; one hash, slot 0.
+    mgr.CacheFullBlocks(a, std::vector<std::string>{k0});
 
     PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0});
     EXPECT_EQ(m.num_hit_blocks, 1);
@@ -250,9 +250,9 @@ TEST(FullAttnManagerTest, CacheFullBlocksIsIdempotentAcrossCalls) {
 
     BlockTable a;
     ASSERT_TRUE(mgr.Acquire(a, 4));
-    mgr.CacheFullBlocks(a, std::vector<std::string>{k0}, 1);        // page 0 cached
+    mgr.CacheFullBlocks(a, std::vector<std::string>{k0});           // page 0 cached
     ASSERT_TRUE(mgr.Acquire(a, 4));         // grow to page 1
-    mgr.CacheFullBlocks(a, std::vector<std::string>{k0, k1}, 2);    // must skip already-cached page 0
+    mgr.CacheFullBlocks(a, std::vector<std::string>{k0, k1});       // must skip already-cached page 0
 
     EXPECT_TRUE(a.Blocks()[0]->IsCached());
     EXPECT_TRUE(a.Blocks()[1]->IsCached());
@@ -281,7 +281,7 @@ TEST(FullAttnManagerTest, FreedCachedPageStaysPrefixReusable) {
 
     BlockTable a;
     ASSERT_TRUE(mgr.Acquire(a, 4));
-    mgr.CacheFullBlocks(a, std::vector<std::string>{k0}, 1);
+    mgr.CacheFullBlocks(a, std::vector<std::string>{k0});
     mgr.Free(a);
 
     // Content survives free -> still prefix-hittable.
@@ -302,7 +302,7 @@ TEST(FullAttnManagerTest, EndToEndTwoRequestsSharePrefix) {
         BlockTable a;
         mgr.ClaimHitBlocks(a, m);
         ASSERT_TRUE(mgr.Acquire(a, 8));
-        mgr.CacheFullBlocks(a, std::vector<std::string>{k0, k1}, 2);
+        mgr.CacheFullBlocks(a, std::vector<std::string>{k0, k1});
         mgr.Free(a);
     }
 
@@ -329,7 +329,7 @@ TEST(FullAttnManagerTest, GroupIdIsolatesContent) {
 
     BlockTable a;
     ASSERT_TRUE(mgr.Acquire(a, 4));
-    mgr.CacheFullBlocks(a, std::vector<std::string>{g0}, 1);
+    mgr.CacheFullBlocks(a, std::vector<std::string>{g0});
 
     EXPECT_EQ(mgr.MatchPrefix(std::vector<std::string>{g0}).num_hit_blocks, 1);
     EXPECT_EQ(mgr.MatchPrefix(std::vector<std::string>{g1}).num_hit_blocks, 0);  // group 1 not cached
@@ -364,7 +364,7 @@ TEST(FullAttnManagerTest, CacheFullBlocksZeroIsNoOp) {
     BlockTable a;
     ASSERT_TRUE(mgr.Acquire(a, 4));
     std::vector<std::string> no_hashes;
-    mgr.CacheFullBlocks(a, no_hashes, 0);   // nothing to register
+    mgr.CacheFullBlocks(a, no_hashes);      // nothing to register
     EXPECT_FALSE(a.Blocks()[0]->IsCached());
 }
 
@@ -402,7 +402,7 @@ TEST(FullAttnManagerTest, ChainedPriorPreventsSecondPageCollision) {
     // Request A caches both of its pages.
     BlockTable a;
     ASSERT_TRUE(mgr.Acquire(a, 8));
-    mgr.CacheFullBlocks(a, keys_a, 2);
+    mgr.CacheFullBlocks(a, keys_a);
 
     // Request B shares the second page's tokens but has a different first page;
     // page 1 misses, so the walk stops at zero -- it must not reach page 2.
