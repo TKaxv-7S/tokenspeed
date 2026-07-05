@@ -57,8 +57,7 @@ inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* to
     return shifted;
 }
 
-// Submitted holds only the token container and page size — no allocator pointers.
-// Allocators are owned by the events that perform resource allocation.
+// Holds no allocator pointers; allocators are owned by the events that allocate.
 struct Submitted {
     Submitted(TokenContainer* token_container, std::int32_t page_size)
         : token_container_{token_container}, page_size_{page_size} {}
@@ -67,9 +66,7 @@ struct Submitted {
     std::int32_t GetPageSize() const { return page_size_; }
 
     std::vector<std::int32_t> GetOccupiedPages() const {
-        // prefix is matched, but not locked
-        // will be locked in ScheduleEvent
-        return {};
+        return {};  // prefix matched but not locked until ScheduleEvent
     }
 
 private:
@@ -117,17 +114,13 @@ public:
 
     const TreeNode* GetDeviceNode() const { return device_node_ref_->Node(); }
 
-    // Flat KV-cache path leaves device_node_ref_/local_kv_allocator_ null and
-    // drives allocation through block_tables_ instead; radix path always holds a
-    // device node here. Lets radix-only publishing branches skip on flat input.
+    // Null on the flat path (block_tables_ drives allocation), so radix-only publishing branches can skip.
     // TODO(radix-removal): drop together with the radix device-node publish path.
     bool HasDeviceNodeRef() const { return device_node_ref_ != nullptr; }
 
     std::int32_t TailPageAvailableTokens() const {
         if (!block_tables_.empty()) {
-            // flat: any group works here. Every group Acquires the same token
-            // count each step (the coordinator fans out uniformly), so all
-            // groups always carry an identical tail_avail.
+            // flat: every group Acquires the same token count each step, so tail_avail is identical across groups.
             return block_tables_[0].TailAvailableTokens();
         }
         return local_kv_allocator_->TailPageAvailableTokens();  // radix
@@ -181,25 +174,10 @@ struct ForwardState : public BaseState {
     std::unique_ptr<ReqPoolIndex> TakeReqPoolIndex() && { return std::move(req_pool_index_); }
     std::int32_t GetReqPoolIndex() const { return req_pool_index_ ? req_pool_index_->slot_ : -1; }
 
-    // Flat contract for this and GetLocalAllocatorPages below: group 0 = the
-    // FIRST CONFIGURED group, which need not be the full-attention one (group
-    // order follows first appearance in the model's layer_types; GPT-OSS lists
-    // sliding_attention first). Unlike tail_avail, page IDS genuinely differ
-    // per group (distinct physical pages; AdvanceWindow punches 0-holes into
-    // SWA tables), so this is a single-group SAMPLE.
-    // Count-only consumers are fine: applyPrefillEvent/applyDecodeEvent rely
-    // on the page COUNTS before/after an event (identical across groups) and
-    // ActiveKvPages is a one-group stat. BUT op.occupied_pages built from this
-    // ALSO feeds Python's req_to_page -> compute_out_cache_loc -- the SINGLE
-    // KV-WRITE address stream for every layer. With >1 group that is a
-    // CORRECTNESS BUG: all layers write into group 0's pages while non-group-0
-    // layers read their own (never-written) tables; on a fresh pool those
-    // reads are zeros, silently ablating those layers (masked GPT-OSS first
-    // light, 2026-07-03 investigation).
-    // TODO(flat-group-writes): per-group write addressing (per-group
-    // occupied_pages across the binding, or backend-side write locs from
-    // metadata.page_tables[group]) before multi-group flat is usable; until
-    // then this view is only correct for single-group configs.
+    // Flat: a single-group SAMPLE of group 0 (the first CONFIGURED group; page ids differ per group, counts
+    // do not). KV writes use per-group metadata.out_cache_locs derived from each group's own table (M11),
+    // so this sample feeds page counts, one-group stats and the radix-era req_to_page fallback only.
+    // TODO(radix-removal): drop the req_to_page fallback fed by this sample together with the radix path.
     std::vector<std::int32_t> GetOccupiedPages() const {
         if (!block_tables_.empty()) {
             return BlockTablePageIds(block_tables_[0]);  // flat: first-group sample (see above)
@@ -207,12 +185,11 @@ struct ForwardState : public BaseState {
         return GetPageContainer().Pages();  // radix
     }
 
-    // Returns only the pages held by the local KV allocator (tail pages, not radix-tree prefix pages).
     std::vector<std::int32_t> GetLocalAllocatorPages() const {
         if (!block_tables_.empty()) {
             return BlockTablePageIds(block_tables_[0]);  // flat: first-group sample (see GetOccupiedPages)
         }
-        return local_kv_allocator_->Pages();  // radix
+        return local_kv_allocator_->Pages();  // radix: tail pages only, not tree-owned prefix pages
     }
 
 private:
@@ -253,8 +230,7 @@ private:
     std::unique_ptr<HostNodeRef> host_node_ref_{};  // pins host pages until the next state takes ownership
 };
 
-// All prefill tokens have been scheduled (in-flight in the last chunk).
-// On the next NextExecutionPlan call, ScheduleEvent transitions this to Decoding.
+// All prefill tokens scheduled (last chunk in flight); the next ScheduleEvent transitions to Decoding.
 struct PrefillDone : public ForwardState {
     PrefillDone(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
                 std::unique_ptr<DeviceNodeRef>&& device_node_ref,
@@ -270,7 +246,6 @@ struct PrefillDone : public ForwardState {
     PrefillDone(PrefillDone&& state) noexcept = default;
     PrefillDone& operator=(PrefillDone&&) noexcept = default;
 
-    // As a design decision, SetReserveNumTokensInNextScheduleEvent is not allowed
     std::int32_t GetReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
 
     std::span<const std::int32_t> PrefillInputIds() const { return token_container_->GetTokenSlice(window); }
@@ -298,8 +273,7 @@ private:
 };
 
 #if TOKENSPEED_FLAT_KVCACHE
-// Rolling page-hash chain over the request's full pages: pages [0,
-// num_hashed_pages) are registered, last_hash seeds the next increment.
+// Rolling page-hash chain: pages [0, num_hashed_pages) are registered, last_hash seeds the next increment.
 struct FlatHashChain {
     std::int32_t num_hashed_pages{0};
     std::string last_hash;
@@ -344,14 +318,10 @@ private:
 #endif
 };
 
-// Request has finished it's generation, and host pages have been allocated,
-// ready to WriteBack to l2 Cache, but no ops generated yet.
+// Generation finished, host pages allocated, writeback op not yet generated.
 struct Draining {
-    // pages_to_transfer is captured in FinishEvent immediately after alloc_host_node,
-    // while the node→page mapping is still stable (before any future splitChild calls
-    // can redistribute pages across new prefix/suffix nodes).
-    // Storing concrete (device_page, host_page) pairs here makes newWriteBackOperation
-    // split-safe: it never needs to re-walk the radix tree.
+    // pages_to_transfer is captured in FinishEvent while the node->page mapping is still stable: storing
+    // concrete pairs makes newWriteBackOperation split-safe (no re-walk after splitChild redistributes pages).
     using PagePair = TransferPair;
     Draining(std::vector<PagePair> pages_to_transfer, std::unique_ptr<DeviceNodeRef>&& device_node_ref,
              std::unique_ptr<HostNodeRef>&& host_node_ref, std::vector<TreeNode*> mamba_writeback_nodes = {})
@@ -361,7 +331,6 @@ struct Draining {
           mamba_writeback_nodes_(std::move(mamba_writeback_nodes)) {}
 
 public:
-    // Transfer pairs that must be copied Device→Host.
     const std::vector<PagePair>& GetPagesToTransfer() const { return pages_to_transfer_; }
 
     std::unique_ptr<DeviceNodeRef> TakeDeviceNodeRef() && { return std::move(device_node_ref_); }
@@ -375,9 +344,7 @@ private:
     std::vector<TreeNode*> mamba_writeback_nodes_;    // exact Mamba nodes covered by this writeback op
 };
 
-// WritingBack OP has been generated, executing offload.
-// Holds both node refs as RAII locks so the pages are not evicted while the
-// async Device→Host transfer is in flight.
+// Writeback op executing; both node refs are RAII locks pinning the pages while the transfer is in flight.
 struct WritingBack {
     WritingBack(std::unique_ptr<DeviceNodeRef>&& device_node_ref, std::unique_ptr<HostNodeRef>&& host_node_ref,
                 std::vector<TreeNode*> mamba_writeback_nodes = {})
@@ -399,7 +366,7 @@ private:
     std::vector<TreeNode*> mamba_writeback_nodes_;    // pending host Mamba slots published by this op ack
 };
 
-// Need to hold local_kv_allocator(has tail page info), and token container for recovery
+// Keeps the local KV allocator (tail-page info) and token container for recovery.
 struct Retracting : public WritingBack {
     using PagePair = TransferPair;
 
@@ -422,11 +389,9 @@ struct Retracting : public WritingBack {
     std::unique_ptr<LocalMambaAllocator> TakeMambaAllocator() && { return std::move(local_mamba_allocator_); }
     std::int32_t GetPageSize() const { return page_size_; }
 
-    // (device_page, host_page) pairs to transfer, captured at ScheduleRetractEvent time.
     const std::vector<PagePair>& GetPagesToTransfer() const { return pages_to_transfer_; }
     void ExtendResultTokens(const std::vector<std::int32_t> result_tokens) { token_container_->Extend(result_tokens); }
 
-    // Returns only the pages held by the local KV allocator (tail page after retraction insert).
     std::vector<std::int32_t> GetLocalAllocatorPages() const {
         return local_kv_allocator_ ? local_kv_allocator_->Pages() : std::vector<std::int32_t>{};
     }
@@ -457,7 +422,6 @@ struct Retracted {
     std::unique_ptr<LocalKVAllocator> TakeKVAllocator() && { return std::move(local_kv_allocator_); }
     std::unique_ptr<LocalMambaAllocator> TakeMambaAllocator() && { return std::move(local_mamba_allocator_); }
 
-    // Returns only the pages held by the local KV allocator (tail page kept after retraction).
     std::vector<std::int32_t> GetLocalAllocatorPages() const {
         return local_kv_allocator_ ? local_kv_allocator_->Pages() : std::vector<std::int32_t>{};
     }

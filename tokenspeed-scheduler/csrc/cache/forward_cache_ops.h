@@ -33,53 +33,35 @@ namespace tokenspeed {
 
 struct SchedulerConfig;  // defined in scheduler/types.h; only used by-ref below
 
-// Claim/slide safety while KV writes are still in flight (overlap scheduling):
-// all forwards share one execution stream, so any reuse write of a freed page is
-// enqueued after the in-flight kernels; slid-out pages also lie below every later
-// batch's read window, and claimed pages are ref>1 so they cannot be freed and
-// rewritten from outside the stream.
+// Stream-ordering safety: all forwards share one execution stream, so reuse writes of freed/slid-out
+// pages enqueue after in-flight KV kernels, and claimed pages stay ref>1 -- never rewritten from outside.
 // TODO(flat-l2): out-of-stream writers (load-back H2D) must fence before joining the flat path.
 
-// Prefill first chunk: claim the admission-layer prefix hit into fresh tables,
-// then acquire pages for the NEW tokens only (claimed pages are full, no tail
-// credit, so the page math is exact). On false (pool short) nothing is acquired
-// but the claimed blocks REMAIN in the tables -- the caller must FreeRequest.
+// On false (pool short) nothing is acquired but the claimed prefix blocks REMAIN -- caller must FreeRequest.
 // TODO(flat-swa-alloc): SWA Acquire transiently allocates the full chunk (even chunk >> window); gates charge it.
 bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                        const CoordinatorMatch& hit, std::int32_t num_new_tokens);
 
-// Register the prior chunks' completed pages, slide the SWA window to
-// num_computed_tokens (tokens of chunks 0..k-1), then acquire this chunk's
-// pages. False = pool short: registration and slide already ran, nothing was
-// allocated.
+// Register prior chunks' pages, slide to num_computed_tokens, then acquire; false = pool
+// short (registration and slide already ran, nothing allocated) -- same for the two ops below.
 bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                   std::span<const std::string> content_hashes, std::int32_t num_tokens,
                   std::int32_t num_computed_tokens);
 
-// One decode step, same register->slide->acquire shape as PrefillChunk: hash j
-// registers under slot first_page_slot + j. False = pool short, nothing allocated.
 bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                 std::span<const std::string> content_hashes, std::int32_t first_page_slot,
                 std::int32_t num_tokens, std::int32_t num_computed_tokens);
 
-// Prefill -> decode transition: register the remaining full prefill pages,
-// slide the SWA window to num_computed_tokens (the full prefill length), then
-// acquire the first decode step's reservation. False = pool short: registration
-// and slide already ran, nothing was allocated.
 bool FinalizePrefillAndReserveDecode(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                                      std::span<const std::string> content_hashes, std::int32_t reserve_tokens,
                                      std::int32_t num_computed_tokens);
 
-// Translate the Python-provided per-group cache config into KvCacheSpecs (one
-// per paged_cache_group, group_id = index). All groups share config.page_size.
+// One KvCacheSpec per config paged_cache_group (group_id = index); all groups share config.page_size.
 std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
 
-// Finish / abort: return every page in every table to the pool.
 void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables);
 
-// One row per group, keyed by config group_id (e.g. "full"/"swa") to match the
-// Python-side assertions: the BlockId() sequence in absolute logical-page order,
-// null-block holes written as 0 (no compaction).
+// One row per config group_id: BlockId() per logical page, null-block holes written as 0 (no compaction).
 std::map<std::string, std::vector<std::int32_t>> BuildFlatBlockTables(
     const std::vector<BlockTable>& tables, std::span<const std::string> group_ids);
 
