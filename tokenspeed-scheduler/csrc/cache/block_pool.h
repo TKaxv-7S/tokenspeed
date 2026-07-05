@@ -41,11 +41,9 @@ class CacheBlock {
 public:
     explicit CacheBlock(std::int32_t block_id) : block_id_{block_id} {}
 
-    // Move-only: free_pos_ is an iterator into BlockPool::free_, so a copy would
-    // carry a foreign iterator -- deleting copy catches accidental copies at
-    // compile time. Move is defaulted only to satisfy vector::emplace_back's
-    // requirement; it never actually runs, because blocks_ is reserve()'d up
-    // front and never reallocates.
+    // Copy is deleted because free_pos_ is an iterator into BlockPool::free_.
+    // Move is defaulted only for vector::emplace_back; it never actually runs
+    // (blocks_ is reserve()'d up front and never reallocates).
     CacheBlock(const CacheBlock&) = delete;
     CacheBlock& operator=(const CacheBlock&) = delete;
     CacheBlock(CacheBlock&&) = default;
@@ -69,8 +67,7 @@ public:
 private:
     friend class BlockPool;
 
-    // Hash mutators, assertion-guarded: a block must be hashed at most once
-    // before being reset.
+    // A block may be hashed at most once before being reset (asserted).
     void SetHash(std::string hash) {
         _assert(block_hash_.empty(), "block already has a hash");
         block_hash_ = std::move(hash);
@@ -81,9 +78,8 @@ private:
     std::int32_t ref_cnt_{0};
     std::string block_hash_{};
     bool is_null_{false};
-    // Free-list membership. free_pos_ is valid only while in_free_ is true; it
-    // points at this block's node in BlockPool::free_, enabling O(1) removal on
-    // a prefix hit (TouchBlock).
+    // free_pos_ is valid only while in_free_ is true; it points at this block's
+    // node in BlockPool::free_, enabling O(1) removal on a prefix hit.
     bool in_free_{false};
     std::list<CacheBlock*>::iterator free_pos_{};
 };
@@ -119,10 +115,8 @@ public:
         return blocks_[block_id];
     }
 
-    // Prefix lookup: find a cached block by its full BlockHashWithGroupId key
-    // (i.e. a single page hash from ComputePagedHashesWithGroup). Returns the
-    // first block cached under that key, or nullptr on miss. Does NOT change ref
-    // counts -- callers TouchBlock() the result to claim it.
+    // Prefix lookup by BlockHashWithGroupId key; nullptr on miss. Does NOT
+    // change ref counts -- callers TouchBlock() the result to claim it.
     CacheBlock* GetCachedBlock(const std::string& block_hash_with_group) {
         if (!enable_caching_) {
             return nullptr;
@@ -147,10 +141,9 @@ public:
         block->IncrRef();
     }
 
-    // Allocate `num` fresh blocks for content that is not yet cached. Pops from
-    // the LRU head; if a popped block still carried cached content, evict that
-    // content (drop it from the hash map and reset) before reuse. Returns the
-    // claimed blocks (ref_cnt == 1 each). Returns empty if capacity is short.
+    // Allocate `num` fresh blocks (ref_cnt == 1 each) from the LRU head,
+    // evicting any cached content a popped block still carried. All-or-nothing:
+    // returns empty if capacity is short.
     std::vector<CacheBlock*> AllocateBlocks(std::int32_t num) {
         std::vector<CacheBlock*> out;
         if (num <= 0 || static_cast<std::int32_t>(free_.size()) < num) {
@@ -168,10 +161,9 @@ public:
         return out;
     }
 
-    // Release references. Each block's ref drops by one; those reaching zero go
-    // back onto the free list WITH their hash intact (still prefix-reusable).
-    // Blocks are returned in reverse so the tail of a chain (more prefix tokens)
-    // lands nearer the eviction head.
+    // Release references; blocks reaching ref 0 return to the free list WITH
+    // their hash intact (still prefix-reusable). Returned in reverse so the tail
+    // of a chain (more prefix tokens) lands nearer the eviction head.
     void FreeBlocks(const std::vector<CacheBlock*>& blocks) {
         for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
             CacheBlock* block = *it;
@@ -186,9 +178,7 @@ public:
     }
 
     // Record a now-full block's content under its BlockHashWithGroupId so future
-    // requests can prefix-hit it. The key is one page hash from
-    // ComputePagedHashesWithGroup. No-op when caching is disabled or the block is
-    // null.
+    // requests can prefix-hit it. No-op when caching is disabled or the block is null.
     void CacheFullBlocks(CacheBlock* block, const std::string& block_hash_with_group) {
         if (!enable_caching_ || block->is_null_) {
             return;
@@ -211,10 +201,9 @@ public:
     }
 
 private:
-    // Free-list ops. The list is ordered head = least-recently-used (eviction
-    // end), tail = most-recently-freed. std::list gives O(1) push/pop at both
-    // ends and O(1) erase via a stored iterator, which is the one operation a
-    // prefix cache needs that a vector/deque free stack cannot provide.
+    // Free-list ops (head = LRU eviction end, tail = most-recently-freed).
+    // std::list provides the O(1) erase via stored iterator that a prefix cache
+    // needs and a vector/deque free stack cannot give.
     void pushToFree(CacheBlock* block) {
         block->free_pos_ = free_.insert(free_.end(), block);
         block->in_free_ = true;
@@ -252,10 +241,8 @@ private:
     std::list<CacheBlock*> free_{};
 
     // BlockHashWithGroupId -> blocks cached under it. One key can map to several
-    // physical blocks holding identical content: a full block is never
-    // de-duplicated against existing cache entries on insert, so already-handed-
-    // out block ids stay stable. The vector holds those co-existing duplicates;
-    // GetCachedBlock returns any one of them.
+    // physical duplicates: inserts are never de-duplicated so already-handed-out
+    // block ids stay stable; GetCachedBlock returns any one of them.
     std::unordered_map<std::string, std::vector<CacheBlock*>> cached_hash_to_blocks_{};
     CacheBlock* null_block_{nullptr};
 };

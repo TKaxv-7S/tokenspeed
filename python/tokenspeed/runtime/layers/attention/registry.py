@@ -49,13 +49,9 @@ if TYPE_CHECKING:
 
 
 def _kv_profile_layer_divisor(num_layers, layer_types, speculative_enabled):
-    """num_attention_layers to charge per token in the KV memory profile:
-    layers-per-group under the hybrid slab layout (M12 -- paired layers
-    share slabs, so a token costs one group's layers, not all layers),
-    else all layers. MUST agree with the layout decision in
-    MHATokenToKVPool._create_buffers -- both consume
-    hybrid_slab_group_size, the single source.
-    """
+    """Attention layers to charge per token in the KV memory profile:
+    layers-per-group under the slab layout, else all layers (single
+    source: hybrid_slab_group_size)."""
     gs = hybrid_slab_group_size(layer_types, speculative_enabled=speculative_enabled)
     return gs if gs is not None else num_layers
 
@@ -552,25 +548,16 @@ def create_attn_components(
             server_args.max_total_tokens,
         )
     else:
-        # M12 hybrid slab sizing: when the slab layout activates, paired
-        # layers share K/V slabs, so a token's KV budget charges one group's
-        # layers instead of all layers. layer_types is read off the attn
-        # config -- the exact tuple MHAConfig.generate derived from
-        # hf_config.layer_types and forwards to MHATokenToKVPool -- so the
-        # sizing divisor and the buffer layout consume identical inputs
-        # (MLA configs carry no layer_types attribute -> legacy divisor).
+        # config.layer_types is the exact tuple forwarded to the KV pool, so
+        # sizing and layout consume identical inputs (MLA configs carry no
+        # layer_types -> legacy divisor).
         slab_divisor = _kv_profile_layer_divisor(
             num_layers,
             getattr(config, "layer_types", None),
             server_args.speculative_algorithm is not None,
         )
         if profile_cache_cell_size is not None and slab_divisor != num_layers:
-            # cache_cell_size overrides replace the per-layer cell-size
-            # computation entirely in profile_max_num_pages; the per-group
-            # divisor cannot compose with them silently, so fall back to
-            # charging all layers (conservative). Unreachable today -- the
-            # override is only set on the DeepSeek V4 branch -- but must not
-            # break quietly if that changes.
+            # A cell-size override can't compose with the slab divisor.
             logger.warning(
                 "hybrid slab sizing disabled: profile cache_cell_size "
                 "override is set; charging all %d layers instead of %d",

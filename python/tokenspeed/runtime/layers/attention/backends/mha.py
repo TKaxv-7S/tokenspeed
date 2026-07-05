@@ -55,59 +55,39 @@ _KERNEL_SOLUTION_BY_BACKEND = {
 
 @dataclass(kw_only=True)
 class MHAPrefillMetadata:
-    # Device-side metadata:
-    # - seq_lens: total length after this step
-    # - extend_seq_lens: length of new tokens
-    #   cu_extend_seq_lens: the cumsum version of extend_seq_lens
-    # - extend_prefix_lens: length of the cached prefix tokens
     # seq_lens[i] = extend_prefix_lens[i] + extend_seq_lens[i]
     page_table: torch.Tensor
     seq_lens: torch.Tensor
     extend_seq_lens: torch.Tensor
     cu_extend_seq_lens: torch.Tensor
     extend_prefix_lens: torch.Tensor
-    # Host-side metadata:
     extend_seq_lens_cpu: list[int]
     cu_extend_seq_lens_cpu: list[int]
     max_extend_seq_len: int
     max_extend_prefix_len: int = 0
-    # Flat KV-cache per-group page tables (group_id -> [num_reqs, max_pages]).
-    # None on the single-table path. TODO(radix-removal): drop with the single
-    # page_table field once flat is the only path.
+    # Flat per-group page tables (group_id -> [num_reqs, max_pages]); None on
+    # the single-table path. TODO(radix-removal): drop the single page_table.
     page_tables: dict[str, torch.Tensor] | None = None
-    # Flat per-group KV WRITE locations (group_id -> [num_tokens] int32),
-    # derived from page_tables[gid] so writes land in the pages the group
-    # reads (M-W1). None on the single-table path. Built wherever
-    # page_tables is built -- same groups, same lifecycle.
+    # Flat per-group KV write locations (group_id -> [num_tokens] int32),
+    # built with page_tables — same groups, same lifecycle.
     out_cache_locs: dict[str, torch.Tensor] | None = None
 
 
 @dataclass(kw_only=True)
 class MHADecodeMetadata:
-    # Device-side metadata.
     page_table: torch.Tensor
     seq_lens: torch.Tensor
     scheduler_metadata: torch.Tensor | None = None
+    # Flat per-group tables/write-locs; see MHAPrefillMetadata.
     page_tables: dict[str, torch.Tensor] | None = None
-    # Flat per-group KV WRITE locations (group_id -> [num_tokens] int32),
-    # derived from page_tables[gid] so writes land in the pages the group
-    # reads (M-W1). None on the single-table path. Built wherever
-    # page_tables is built -- same groups, same lifecycle.
     out_cache_locs: dict[str, torch.Tensor] | None = None
 
 
 class MHAAttnBackend(AttentionBackend):
     """Standard MHA backend that routes through tokenspeed_kernel attention APIs."""
 
-    # Consume flat per-group page tables when the scheduler delivers them. The
-    # flag is unconditional; safety comes from upstream gating plus a replay
-    # guard: (a) the pool publishes paged_cache_group_specs only when the
-    # tokenspeed_scheduler ext is flat-built and spec decode is off (see the
-    # publication rule in kv_cache/mha.py), so capture only allocates flat
-    # buffers when the scheduler will actually deliver tables, and (b)
-    # init_forward_metadata_replay_cuda_graph raises if a flat-captured graph
-    # would replay without fresh tables. TODO(radix-removal): unconditional
-    # once radix is gone.
+    # Unconditional: safety comes from the publication rule (kv_cache/mha.py)
+    # plus the replay stale-table guard. TODO(radix-removal): drop the flag.
     uses_flat_cache_groups: bool = True
 
     def support_kv_cache_prewrite(
@@ -167,15 +147,7 @@ class MHAAttnBackend(AttentionBackend):
             self.max_context_len,
         )
 
-        # Flat per-group tables (Phase 3 delivered them already bridged to GPU
-        # tensors). Present only when uses_flat_cache_groups AND the op carried a
-        # non-empty flat_block_tables (the wrapper gates on the flag). None -> the
-        # single-table path below is unchanged.
         flat_page_tables = flat_block_tables or None
-
-        # Per-group KV WRITE locations, derived from the same tables the
-        # groups read (M-W1). Extend uses the raw extend_prefix_lens sliced
-        # here (equivalent to the [:bs] slice inside the extend branch).
         flat_out_cache_locs = None
         if flat_page_tables:
             if forward_mode.is_extend_or_mixed():
@@ -220,9 +192,8 @@ class MHAAttnBackend(AttentionBackend):
                 out_cache_locs=flat_out_cache_locs,
             )
 
-            # Drafter: also fill decode_metadata so step 1+ multi-step has
-            # metadata under EXTEND/MIXED target. seq_lens is the drafter's
-            # live alias buffer (wrapper pre-writes it before this call).
+            # Drafter step 1+ decodes under an EXTEND/MIXED target; seq_lens
+            # aliases the drafter's live buffer (pre-written by the wrapper).
             if self.is_draft:
                 self.forward_decode_metadata = MHADecodeMetadata(
                     page_table=page_table,
@@ -297,13 +268,9 @@ class MHAAttnBackend(AttentionBackend):
             )
             self.cuda_graph_seq_lens = seq_lens_buf
 
-        # Flat per-group CUDA-graph buffers (gid -> [max_bs, max_num_pages]),
-        # lazily allocated on first capture keyed by the flat dict's groups.
-        # TODO(radix-removal): parallels cuda_graph_page_table for the flat path.
+        # Flat per-group persistent buffers, lazily allocated at first
+        # capture. TODO(radix-removal): parallels cuda_graph_page_table.
         self.cuda_graph_flat_page_tables: dict[str, torch.Tensor] = {}
-        # Flat per-group write-loc buffers (gid -> [max_bs] int32), lazily
-        # allocated with the page-table buffers at first capture. Replay
-        # recomputes locs from the persistent tables and copy_'s here.
         self.cuda_graph_flat_out_cache_locs: dict[str, torch.Tensor] = {}
         self._cuda_graph_max_bs = max_bs
 
@@ -318,17 +285,14 @@ class MHAAttnBackend(AttentionBackend):
     ):
         assert not forward_mode.is_extend_or_mixed()
 
-        # Flat per-group tables: lazily allocate persistent buffers for the
-        # given group ids and hand metadata slices into them, so replay can
-        # copy_ into the same addresses the graph recorded. Real tables only
-        # arrive at replay, so capture needs nothing but the ids. Empty when
-        # the flat path is off — single-table behavior is unchanged.
+        # Real tables only arrive at replay: capture lazily allocates
+        # persistent per-group buffers and records metadata views into them,
+        # so replay can copy_ fresh data to the graph-recorded addresses.
         page_tables = None
         out_cache_locs = None
         if flat_cache_group_ids:
-            # Flat + spec-decode is out of scope for M10: the per-group views
-            # below are bs rows while spec buffers are expanded to
-            # bs * spec_num_tokens rows (gpt-oss does not use spec decode).
+            # Per-group views are bs rows; spec buffers expand to
+            # bs * spec_num_tokens rows. TODO(flat+spec).
             assert not (self.spec_num_tokens > 1 and not self.is_draft), (
                 "flat_cache_group_ids is unsupported with spec_num_tokens > 1"
             )
@@ -343,9 +307,6 @@ class MHAAttnBackend(AttentionBackend):
                         device=self.device,
                     )
                     self.cuda_graph_flat_page_tables[gid] = buf
-                # Write-loc buffer alongside the page-table buffer (same gid
-                # source, same lifecycle): metadata gets a view so the graph
-                # records the persistent address; replay copy_'s fresh locs.
                 loc_buf = self.cuda_graph_flat_out_cache_locs.get(gid)
                 if loc_buf is None:
                     loc_buf = torch.zeros(
@@ -394,13 +355,9 @@ class MHAAttnBackend(AttentionBackend):
     ):
         assert not forward_mode.is_extend_or_mixed()
 
-        # A flat-captured graph replayed without fresh tables would silently
-        # compute over stale/zero page tables — fail loudly instead. bs == 0
-        # keeps the documented skip: buffers hold valid col-0 entries (capture
-        # zeros, real pages, or dummy-row pad 0 — never -1) and outputs are
-        # discarded. The bs == 0 skip is only reachable from unit tests: the
-        # wrapper always replays with padded_bs >= 1 and synthesizes idle
-        # tables for the bs == 0 idle graph.
+        # Fail loudly instead of replaying over stale/zero page tables.
+        # bs == 0 may skip: col-0 buffer entries stay valid (never -1),
+        # outputs are discarded, and only unit tests reach it.
         if self.cuda_graph_flat_page_tables and bs > 0:
             if not flat_block_tables:
                 raise RuntimeError(
@@ -410,8 +367,6 @@ class MHAAttnBackend(AttentionBackend):
                     f"but flat_block_tables is missing/empty at bs={bs}; the "
                     "captured graph would read stale page tables."
                 )
-            # Per-group hole: a group silently absent from a non-empty dict
-            # (e.g. dropped upstream) would leave its captured buffer stale.
             missing = set(self.cuda_graph_flat_page_tables) - set(flat_block_tables)
             if missing:
                 raise RuntimeError(
@@ -434,32 +389,16 @@ class MHAAttnBackend(AttentionBackend):
                 req_to_page[req_pool_indices[:bs], : self.max_num_pages]
             )
 
-        # Flat per-group tables: copy_ into the persistent capture buffers so
-        # the graph-recorded addresses see the new pages (absolute pages, no
-        # base-offset math). The single-table update above still serves the
-        # radix/single-table path.
-        #
-        # Padding contract (bs here is the padded bs): dummy ROWS in
-        # [actual_bs, bs) arrive from the wrapper padded with 0 — they replay
-        # with seq_lens=1, so the captured kernel dereferences exactly their
-        # col-0 entry, which must be page 0 (the zero-initialized dummy page).
-        # Column tails beyond a row's pages pad with -1 — past cache_seqlens,
-        # never dereferenced. The fill_(-1) below also hits dummy rows'
-        # columns 1.. (giving [0, -1, ...]), which is fine: with seq_lens=1
-        # nothing past col 0 is read for those rows.
+        # Padding contract (canonical; bs is the padded bs): dummy ROWS pad
+        # with 0 — replayed at seq_lens=1 they dereference exactly col 0,
+        # the zero-init dummy page. Column tails pad with -1, never read
+        # past cache_seqlens.
         if flat_block_tables:
-            # The missing-groups guard above enforced that every captured
-            # group is present in this dict (the bridge also raises at the
-            # source when a group's row count disagrees with the batch, so a
-            # hole can only come from a future upstream change). Iterating
-            # the delivered dict, a group the graph never captured raises
-            # KeyError below — also loud.
             for gid, src in flat_block_tables.items():
-                # Buffers exist: capture allocated them for these groups.
                 buf = self.cuda_graph_flat_page_tables[gid]
                 cols = src.shape[1]
-                # cols >= 1 keeps the col-0 contract self-enforcing: a
-                # zero-width table would leave dummy rows' col 0 unwritten.
+                # cols >= 1: a zero-width table would leave dummy rows'
+                # col 0 unwritten.
                 assert 1 <= cols <= buf.shape[1], (
                     f"flat table for group {gid!r}: {cols} cols outside"
                     f" [1, {buf.shape[1]}] (CUDA-graph buffer width)"
@@ -472,14 +411,9 @@ class MHAAttnBackend(AttentionBackend):
                 if cols < buf.shape[1]:
                     buf[:bs, cols:].fill_(-1)
 
-            # Recompute per-group write locs from the freshly-updated
-            # persistent tables and copy_ into the loc buffers the captured
-            # graph reads. cuda_graph_seq_lens aliases the controller's
-            # seq_lens_buf, which input prep fills with the CURRENT step's
-            # lens (active rows) and 1s (padding tail) BEFORE this replay
-            # call, so [:bs] is current here. Padded dummy rows: seq_len 1
-            # + page-0 col 0 -> loc 0 in the zero-init dummy page (M10 pad
-            # contract).
+            # cuda_graph_seq_lens aliases the controller's seq_lens_buf,
+            # which input prep fills (current lens + padding 1s) BEFORE this
+            # call, so [:bs] is current when recomputing write locs.
             locs = self._compute_flat_decode_out_cache_locs(
                 {
                     gid: self.cuda_graph_flat_page_tables[gid][:bs, :]
@@ -515,8 +449,6 @@ class MHAAttnBackend(AttentionBackend):
             k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
             v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
-        # Route the KV write to this layer's group pages on the flat path
-        # (M-W1). Selected ONCE here; the inner set_kv_buffer sites reuse it.
         out_cache_loc = self._select_out_cache_loc(
             layer, self.forward_decode_metadata, out_cache_loc
         )
@@ -555,8 +487,6 @@ class MHAAttnBackend(AttentionBackend):
         v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
         metadata = self.forward_prefill_metadata
-        # Route the KV write to this layer's group pages on the flat path
-        # (M-W1). Selected ONCE here; the inner set_kv_buffer sites reuse it.
         out_cache_loc = self._select_out_cache_loc(layer, metadata, out_cache_loc)
         if metadata.max_extend_prefix_len > 0:
             if self.mha_extend_mode == "ragged":
@@ -597,12 +527,8 @@ class MHAAttnBackend(AttentionBackend):
 
     def _select_page_table(self, layer, metadata):
         """Pick this layer's page table: its group's table on the flat path,
-        else the single shared table.
-
-        TODO(radix-removal): the empty-group_id / single-table fallbacks exist to
-        keep non-group-aware layers and single-group models working while radix
-        coexists. Once flat is the only path and every KV layer carries a
-        group_id, this collapses to `metadata.page_tables[layer.group_id]`.
+        else the single shared table. TODO(radix-removal): collapses to
+        `metadata.page_tables[layer.group_id]` once flat is the only path.
         """
         if metadata.page_tables is None:
             return metadata.page_table
@@ -618,13 +544,9 @@ class MHAAttnBackend(AttentionBackend):
         return tables[group_id]
 
     def _select_out_cache_loc(self, layer, metadata, out_cache_loc):
-        """Pick this layer's KV WRITE locations: its group's derived locs on
-        the flat path, else the caller's single-stream out_cache_loc.
-        Mirror of _select_page_table (M-W1: writes must land in the pages
-        the layer's group reads). Same fallback ladder: None -> single
-        stream; empty/unknown group_id + single group -> that group.
-        TODO(radix-removal): collapses to `locs[layer.group_id]` with
-        _select_page_table once flat is the only path.
+        """Mirror of _select_page_table for KV writes: writes must land in
+        the pages the layer's group reads (M-W1). TODO(radix-removal):
+        collapses to `locs[layer.group_id]` once flat is the only path.
         """
         locs = metadata.out_cache_locs
         if locs is None:
@@ -640,9 +562,8 @@ class MHAAttnBackend(AttentionBackend):
         return locs[group_id]
 
     def select_out_cache_loc(self, layer, out_cache_loc):
-        """Per-group write locations for OUT-OF-BACKEND KV writers (the
-        fused RoPE+prewrite path). Prewrite only runs on decode
-        (support_kv_cache_prewrite), so this reads forward_decode_metadata.
+        """Per-group write locations for out-of-backend KV writers (fused
+        RoPE prewrite); prewrite is decode-only, so reads decode metadata.
         """
         metadata = self.forward_decode_metadata
         if metadata is None or metadata.out_cache_locs is None:
@@ -651,13 +572,9 @@ class MHAAttnBackend(AttentionBackend):
 
     @staticmethod
     def _compute_flat_decode_out_cache_locs(page_tables, seq_lens, page_size):
-        """Per-group write locations for decode: one new token per request at
-        position seq_len-1. Derived from the group's own read table, so
-        writes land in the pages that group reads (M-W1). The tail page is
-        never a hole (SWA holes only at the window front), so the gather is
-        always a real page; padded dummy rows (table row 0-filled, seq_len 1)
-        resolve to loc 0 inside the zero-init dummy page 0 -- same contract
-        as the single-stream out_cache_loc padding.
+        """Per-group decode write locs: one token per request at seq_len-1,
+        gathered from the group's own read table (M-W1). The tail page is
+        never a hole (SWA holes sit only at the window front).
         """
         pos = (seq_lens - 1).to(torch.int64)
         page_idx = pos // page_size
@@ -672,11 +589,9 @@ class MHAAttnBackend(AttentionBackend):
     def _compute_flat_extend_out_cache_locs(
         page_tables, seq_lens, extend_prefix_lens, page_size
     ):
-        """Per-group write locations for extend/prefill: positions
-        [prefix_len, seq_len) per request, flattened in request order --
-        matching the q/k/v token layout (cu_extend_seq_lens order). Prefill
-        runs once per request; the per-request Python loop is acceptable
-        bring-up cost (TODO(flat-perf): batch via repeat_interleave).
+        """Per-group extend write locs: positions [prefix_len, seq_len) per
+        request, flattened in q/k/v token order (cu_extend_seq_lens).
+        TODO(flat-perf): batch the per-request loop via repeat_interleave.
         """
         out = {gid: [] for gid in page_tables}
         for i in range(int(seq_lens.shape[0])):
@@ -699,11 +614,9 @@ class MHAAttnBackend(AttentionBackend):
 
     @staticmethod
     def _maybe_check_flat_write_locs(page_tables, out_cache_locs, page_size):
-        """TOKENSPEED_FLAT_DEBUG=1: write pages must be real (non-hole) and
-        inside the group's table. Costs a GPU sync -- eager path only, off
-        by default. Graph-path coverage comes from the GPU write probe.
-        Do NOT reuse against graph-padded batches: dummy rows legitimately
-        resolve to page 0 and would trip the non-hole assert.
+        """TOKENSPEED_FLAT_DEBUG=1 (eager only, GPU sync): write pages must
+        be real and inside the group's table. Not for graph-padded batches:
+        dummy rows resolve to page 0 and would trip the non-hole assert.
         """
         import os
 

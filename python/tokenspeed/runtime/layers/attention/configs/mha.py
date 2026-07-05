@@ -35,27 +35,17 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 @dataclass
 class MHAConfig(BaseAttnConfig):
-    # Per-layer attention-type labels + window, forwarded to the KV pool so it
-    # can publish paged_cache_group_specs (full-history + sliding-window). Empty
-    # tuple -> single full-history group (non-hybrid models).
+    # Per-layer attention-type labels + window, forwarded to the KV pool for
+    # paged_cache_group_specs publication (empty -> single full-history group).
     layer_types: tuple[str, ...] = ()
     sliding_window_tokens: int | None = None
     max_scheduled_tokens: int = 0
-    # True iff server_args.speculative_algorithm is set. The pool publishes
-    # paged_cache_group_specs only when this is False AND the scheduler ext is
-    # flat-built (see the publication rule in kv_cache/mha.py): flat page
-    # tables are unsupported with spec-expanded metadata, non-empty groups
-    # would disable the overlap scheduler under spec decode, and a radix-built
-    # ext never delivers flat tables at all.
+    # True iff server_args.speculative_algorithm is set (publication rule:
+    # kv_cache/mha.py).
     speculative_enabled: bool = False
-    # True iff server_args.enable_kvstore (L2 host cache). Forwarded as a
-    # plain bool (speculative_enabled precedent) so the pool can refuse
-    # the hybrid slab layout: L2 host offload copies KV per layer, and
-    # slab-paired layers alias the same tensor.
+    # True iff server_args.enable_kvstore; the pool's slab guards consume it.
     kvstore_enabled: bool = False
-    # True iff server_args.disaggregation_mode != "null" (PD split). Same
-    # slab-layout guard rationale: PD registers per-layer buffer pointers
-    # for KV transfer.
+    # True iff server_args.disaggregation_mode != "null"; same slab guards.
     pd_disaggregation_enabled: bool = False
 
     @classmethod

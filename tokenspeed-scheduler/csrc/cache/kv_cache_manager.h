@@ -32,10 +32,9 @@
 
 namespace tokenspeed {
 
-// Abstract base for the per-attention-type KV managers (FullAttnManager, and
-// later SwaManager / MambaManager). MatchPrefix is the only type-specific
-// operation -- the four others are shared, stateless over (pool_, page_size_)
-// plus the BlockTable handed in. Holds no per-request state.
+// Abstract base for the per-attention-type KV managers. MatchPrefix and the
+// window hooks are type-specific; the rest is shared and stateless over
+// (pool_, page_size_) plus the BlockTable handed in. Holds no per-request state.
 class KvCacheManager {
 public:
     KvCacheManager(BlockPool& pool, std::int32_t page_size) : pool_{pool}, page_size_{page_size} {
@@ -49,21 +48,17 @@ public:
     // Per-attention-type prefix match. Read-only: must NOT change ref counts.
     virtual PrefixMatch MatchPrefix(std::span<const std::string> block_hashes) const = 0;
 
-    // Bounded prefix match: the manager's best valid match whose coverage is at
-    // most max_blocks. Implemented by matching only the first max_blocks page
-    // hashes, so each manager's own validity invariant (e.g. SwaManager's
-    // trailing contiguous run) is enforced against the BOUNDED end -- never
-    // computed unbounded and then chopped, which could break it. May return a
-    // match shorter than max_blocks (or empty) if no valid match fits the bound.
+    // Bounded match: matches only the first max_blocks hashes, so each manager's
+    // validity invariant (e.g. SwaManager's trailing run) is enforced against the
+    // BOUNDED end -- never computed unbounded and then chopped. May come back shorter.
     PrefixMatch MatchPrefix(std::span<const std::string> block_hashes, std::int32_t max_blocks) const {
         std::size_t bound = std::min(block_hashes.size(), static_cast<std::size_t>(std::max(max_blocks, 0)));
         return MatchPrefix(block_hashes.first(bound));
     }
 
-    // Claim each real hit block (TouchBlock pulls it from the free list and bumps
-    // ref) and append it to the table. null_block holes are appended as-is (they
-    // keep logical-page alignment) but never touched -- the null block is not ref
-    // counted. Must be called on a fresh table (prefill start) before any Acquire.
+    // Claim each real hit block into a fresh table (before any Acquire).
+    // null_block holes are appended as-is to keep logical-page alignment but
+    // never touched -- the null block is not ref counted.
     void ClaimHitBlocks(BlockTable& table, const PrefixMatch& hit) {
         _assert(table.blocks_.empty(), "ClaimHitBlocks requires a fresh (empty) table");
         for (CacheBlock* block : hit.blocks) {
@@ -74,10 +69,9 @@ public:
         }
     }
 
-    // Token-driven incremental allocation, mirroring LocalKVAllocator::Acquire.
-    // Fills the tail page's remaining room first; if more is needed, allocates
-    // ceil(overflow / page_size) fresh pages and appends them. All-or-nothing:
-    // on a capacity shortfall the table is left unchanged and false is returned.
+    // Token-driven incremental allocation, mirroring LocalKVAllocator::Acquire:
+    // tail-page room first, then ceil(overflow / page_size) fresh pages.
+    // All-or-nothing: on shortfall the table is left unchanged, returns false.
     bool Acquire(BlockTable& table, std::int32_t num_tokens) {
         if (num_tokens <= 0) {
             return true;
@@ -100,10 +94,8 @@ public:
         return true;
     }
 
-    // Pure query: how many fresh pages this table would need to absorb
-    // num_tokens, WITHOUT allocating or mutating anything. Mirrors Acquire's page
-    // math exactly (tail room first, then ceil(overflow / page_size)). Used by
-    // the coordinator to check capacity across all groups before committing.
+    // Pure query mirroring Acquire's page math exactly; allocates and mutates
+    // nothing. The coordinator sums it across groups before committing.
     std::int32_t BlocksNeededFor(const BlockTable& table, std::int32_t num_tokens) const {
         if (num_tokens <= table.tail_avail_) {
             return 0;
@@ -112,11 +104,9 @@ public:
         return (over + page_size_ - 1) / page_size_;
     }
 
-    // Register the table's full pages [first-uncached, num_full_blocks) into the
-    // pool under their page-hash keys so later requests can prefix-hit them.
-    // Leading pages already carrying a hash (from a prefix hit or an earlier
-    // call) are skipped. block_hashes is indexed in lockstep with table pages;
-    // the caller passes num_full_blocks excluding any partial tail page.
+    // Register the table's first num_full_blocks pages (partial tail excluded by
+    // the caller) under their page-hash keys so later requests can prefix-hit
+    // them; pages already carrying a hash are skipped.
     void CacheFullBlocks(BlockTable& table, std::span<const std::string> block_hashes,
                          std::int32_t num_full_blocks) {
         _assert(num_full_blocks <= table.NumBlocks(), "num_full_blocks exceeds table size");
@@ -131,27 +121,21 @@ public:
         }
     }
 
-    // Advance the manager's retention window to num_computed_tokens, releasing
-    // whatever fell out of it. Full-history managers retain everything
-    // mid-sequence, so the default is a no-op; window-evicting managers
-    // (SwaManager, later MambaManager) override it. The coordinator fans this
-    // out to every group uniformly, like its other operations.
+    // Advance the retention window to num_computed_tokens, releasing whatever
+    // fell out. Full-history managers retain everything mid-sequence (no-op
+    // default); window-evicting managers override.
     virtual void AdvanceWindow(BlockTable& /*table*/, std::int32_t /*num_computed_tokens*/) {}
 
-    // Pure query: how many pages would AdvanceWindow(table, num_computed_tokens)
-    // return to the pool, WITHOUT freeing or mutating anything. Full-history
-    // managers never evict mid-sequence, so the default is 0; window-evicting
-    // managers override it in lockstep with their AdvanceWindow. Used by the
-    // scheduler's decode admission gate to credit the slide DecodeStep performs
-    // before its Acquire.
+    // Pure query: pages AdvanceWindow(table, num_computed_tokens) would return
+    // to the pool. Overridden in lockstep with AdvanceWindow; admission gates
+    // use it to credit a pending slide.
     virtual std::int32_t BlocksFreedByAdvanceWindow(const BlockTable& /*table*/,
                                                     std::int32_t /*num_computed_tokens*/) const {
         return 0;
     }
 
-    // Release every page the table holds (reverse-order via the pool) and reset
-    // the table. Cached pages keep their hash on free, so they remain
-    // prefix-reusable until evicted.
+    // Release every page the table holds and reset it. Cached pages keep their
+    // hash on free, so they remain prefix-reusable until evicted.
     void Free(BlockTable& table) {
         pool_.FreeBlocks(table.blocks_);
         table.blocks_.clear();

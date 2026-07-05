@@ -31,26 +31,17 @@
 
 namespace tokenspeed {
 
-// Common-prefix match across all groups. num_common_blocks is the page-aligned
-// fixpoint coverage every group can validly claim: full-attention matches are
-// truncated to it (any prefix of a full match is valid), and sliding-window
-// matches are computed BOUNDED to it, so each SWA group's trailing
-// contiguous-run invariant holds at exactly that length (no null hole inside
-// the last window). per_group[i] is group i's PrefixMatch at that length.
+// Common-prefix match across all groups: num_common_blocks is the fixpoint
+// coverage every group can validly claim (MatchPrefix computes it), and
+// per_group[i] is group i's PrefixMatch at exactly that length.
 struct CoordinatorMatch {
     std::int32_t num_common_blocks{0};
     std::vector<PrefixMatch> per_group;
 };
 
-// Stateless multi-group fan-out over the per-attention managers. Holds the
-// groups (config + managers) and a reference to the shared BlockPool (for the
-// cross-group capacity check). Per-request BlockTables are passed in by the
-// caller, aligned by group index. Consumes one content-hash stream (64-hex, no
-// group_id) and wraps it per group internally.
-//
-// Per-request flow (driven by FSM transition events):
-//   prefill first chunk:  MatchPrefix -> ClaimCommonPrefix -> Acquire(remainder)
-//   later prefill/decode: Acquire(new tokens)
+// Stateless multi-group fan-out over the per-attention managers, all sharing
+// one BlockPool. Per-request BlockTables are passed in by the caller, aligned
+// by group index; the single content-hash stream is re-keyed per group.
 class KvCacheCoordinator {
 public:
     KvCacheCoordinator(std::vector<CacheGroup> groups, BlockPool& pool)
@@ -60,64 +51,41 @@ public:
 
     CoordinatorMatch MatchPrefix(std::span<const std::string> content_hashes) const;
 
-    // Claim the common-prefix hit blocks into each group's table. Pure claim, no
-    // allocation, never fails (ClaimHitBlocks skips null holes). Call on fresh
-    // tables before Acquire, at prefill start. A default-constructed
-    // CoordinatorMatch (empty per_group, num_common_blocks == 0) is the
-    // canonical zero hit and claims nothing; any non-empty per_group must be
-    // sized to the group count.
+    // Claim the hit blocks into each group's fresh table. Pure claim, never
+    // fails. A default-constructed CoordinatorMatch is the canonical zero hit;
+    // a non-empty per_group must be sized to the group count.
     void ClaimCommonPrefix(std::span<BlockTable> tables, const CoordinatorMatch& hit);
 
-    // Pure query, gate-side twin of ClaimCommonPrefix (same pattern as
-    // AdvanceWindow / BlocksFreedByAdvance): free-list blocks the claim will
-    // consume. ClaimCommonPrefix TouchBlock()s every real hit block, and
-    // touching a ref_cnt==0 cached block REMOVES it from the free list
-    // (block_pool.h), so a claim shrinks NumFreeBlocks() by exactly the number
-    // of ref-0 hit blocks -- on top of anything Acquire takes. Admission gates
-    // must charge this or the free count they check overstates what the
-    // transition's Acquire will find. Hit blocks with ref > 0 (still held by a
-    // live request) are not in the free list and cost nothing; null holes are
-    // TouchBlock no-ops. No block is ever counted twice across groups: a block
-    // carries at most one hash (CacheBlock::SetHash asserts) and hash keys are
-    // group-scoped (MakeKeyWithGroupId), so a physical block can appear in at
-    // most one group's match.
+    // Pure query, gate-side twin of ClaimCommonPrefix: free-list blocks the
+    // claim will consume (TouchBlock pulls ref-0 cached hit blocks from the free
+    // list), which admission gates must charge on top of what Acquire takes.
+    // Group-scoped hash keys keep a block in at most one group's match.
     std::int32_t BlocksConsumedByClaim(const CoordinatorMatch& hit) const;
 
-    // Token-driven incremental allocation across all groups. Check-then-act: sums
-    // the pages every group needs, and if the shared pool cannot supply them all,
-    // allocates NOTHING and returns false (no partial/unaligned state ever exists,
-    // so no rollback is needed). Otherwise allocates in every group and returns
-    // true. Used for both the prefill remainder and each decode step.
+    // Token-driven incremental allocation across all groups. Check-then-act
+    // against the shared pool: on shortfall allocates NOTHING and returns false,
+    // so no partial/unaligned state ever exists and no rollback is needed.
     bool Acquire(std::span<BlockTable> tables, std::int32_t num_tokens);
 
-    // Pure pre-check: fresh pages the shared pool must supply for every group's
-    // table to absorb num_tokens (sum of the per-group BlocksNeededFor math;
-    // tail-page room is credited per group). Acquire's check-then-act gate and
-    // the scheduler's flat admission gates both build on this, so the page math
-    // lives in exactly one place. (No raw would-Acquire-succeed helper is
-    // exposed: the scheduler's gates must also account outstanding decode
-    // reservations and the pending SWA slide, so they compose this with
-    // BlocksFreedByAdvance and their reservation ledger instead.)
+    // Pure pre-check: fresh pages the shared pool must supply for every group to
+    // absorb num_tokens. Single home of the gate-side page math -- Acquire's
+    // check and the scheduler's flat admission gates both build on it.
     std::int32_t BlocksNeededFor(std::span<const BlockTable> tables, std::int32_t num_tokens) const;
-    // Overload for a not-yet-allocated request (prefill first chunk): every
-    // group starts from a fresh, empty table (no tail credit).
+    // For a not-yet-allocated request: every group starts from a fresh, empty
+    // table (no tail credit).
     std::int32_t BlocksNeededFor(std::int32_t num_tokens) const;
 
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
                          std::int32_t num_full_blocks);
     void Free(std::span<BlockTable> tables);
 
-    // Fan out window-eviction to every group, mirroring Acquire's per-group
-    // fan-out shape. Managers without a retention window (FullAttnManager)
-    // inherit KvCacheManager's no-op default, so only window-evicting managers
-    // do work. tables are aligned by group index (size must equal NumGroups()).
+    // Fan out window eviction to every group; managers without a retention
+    // window inherit the no-op default.
     void AdvanceWindow(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
 
-    // Pure query, fan-out twin of AdvanceWindow: pages a pending
-    // AdvanceWindow(tables, num_computed_tokens) would return to the shared
-    // pool, summed over all groups (0 for full-history groups). Lets admission
-    // gates credit the slide DecodeStep performs before its Acquire without a
-    // second copy of the window math (each manager mirrors its own AdvanceWindow).
+    // Pure query, twin of AdvanceWindow: pages a pending
+    // AdvanceWindow(tables, num_computed_tokens) would return to the pool. Lets
+    // admission gates credit a coming slide without a second copy of the window math.
     std::int32_t BlocksFreedByAdvance(std::span<const BlockTable> tables, std::int32_t num_computed_tokens) const;
 
 private:

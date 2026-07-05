@@ -49,7 +49,6 @@
 namespace {
 
 // Build a flat list of (device_page, host_page) pairs from the given write_diff nodes.
-// Both Draining::PagePair and Retracting::PagePair are std::tuple<int32_t, int32_t>.
 std::vector<tokenspeed::TransferPair> BuildWriteBackPairs(const std::vector<tokenspeed::TreeNode*>& write_diff) {
     std::vector<tokenspeed::TransferPair> pages_to_transfer;
     for (tokenspeed::TreeNode* n : write_diff) {
@@ -110,13 +109,34 @@ namespace tokenspeed::fsm {
 #if TOKENSPEED_FLAT_KVCACHE
 namespace {
 
-// The flat path does not yet support retract/writeback/loadback. Used to terminate
-// those transitions; the throw makes the call noreturn so callers with non-default-
-// constructible return types still compile.
+// Terminates the retract/writeback/loadback transitions on the flat path; the
+// throw makes it noreturn so callers with non-default-constructible returns compile.
 [[noreturn]] void FlatRetractUnsupported() {
     _assert(false, "flat path: retract/writeback/loadback unsupported in C slice");
     throw std::logic_error("flat path: retract/writeback/loadback unsupported in C slice");
 }
+
+// Frees the tables on destruction unless disarmed: BlockTable is non-owning, so
+// a transition that throws before the new state adopts its tables must return
+// their page refs to the pool or they leak forever.
+class BlockTablesGuard {
+public:
+    BlockTablesGuard(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables)
+        : coordinator_{coordinator}, tables_{tables} {}
+    BlockTablesGuard(const BlockTablesGuard&) = delete;
+    BlockTablesGuard& operator=(const BlockTablesGuard&) = delete;
+    ~BlockTablesGuard() {
+        if (armed_) {
+            FreeRequest(coordinator_, tables_);
+        }
+    }
+    void Disarm() { armed_ = false; }
+
+private:
+    KvCacheCoordinator& coordinator_;
+    std::vector<BlockTable>& tables_;
+    bool armed_{true};
+};
 
 }  // namespace
 #endif
@@ -164,33 +184,18 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
     TokenContainer* token_container = state.GetTokenContainer();
 
     // Allocate the request-pool slot BEFORE populating the tables: Allocate()
-    // throws on exhaustion, and doing it after PrefillFirstChunk would leak the
-    // freshly acquired pages (the throw would bypass the FreeRequest guard
-    // below). ReqPoolIndex is RAII, so if PrefillFirstChunk throws instead, the
-    // slot returns on unwind. Unreachable today via the AvailableSlots pre-gate
-    // in schedulePrefillFirstChunk, but the guard exists precisely for this.
+    // throws on exhaustion, and ReqPoolIndex is RAII while BlockTable is not.
     auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
 
     std::vector<BlockTable> tables(coordinator_->NumGroups());
-
-    try {
-        if (!PrefillFirstChunk(*coordinator_, tables, flat_hit_, tokens_this_round_)) {
-            _assert(false, "flat path: allocation failure unsupported in C slice");
-        }
-    } catch (...) {
-        // A failed PrefillFirstChunk leaves the claimed prefix blocks in the
-        // tables (see forward_cache_ops.h). BlockTable is non-owning, so release
-        // them before the exception escapes or their refs leak forever.
-        FreeRequest(*coordinator_, tables);
-        throw;
+    BlockTablesGuard tables_guard{*coordinator_, tables};
+    if (!PrefillFirstChunk(*coordinator_, tables, flat_hit_, tokens_this_round_)) {
+        _assert(false, "flat path: allocation failure unsupported in C slice");
     }
+    tables_guard.Disarm();
 
-    // The window starts past the claimed prefix: the same num_common_blocks
-    // that drove the admission token math (tokens_this_round_ is already the
-    // hit-adjusted remainder) sets window.begin here, mirroring the radix arm's
-    // max_matched_pages * page_size below. Everything window-derived follows:
-    // input_ids slice [begin, begin+size), extend_prefix_len = begin, and
-    // is_last_chunk covers a hit + one chunk completing the prompt.
+    // The window starts past the claimed prefix: the admission num_common_blocks
+    // that set tokens_this_round_ also sets window.begin (single source).
     const std::int32_t hit_tokens = flat_hit_.num_common_blocks * state.GetPageSize();
     TokenContainer::Window window{.begin = hit_tokens, .size = tokens_this_round_};
     bool is_last_chunk = (window.begin + window.size) == token_container->PrefillSize();
@@ -218,7 +223,6 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
     prefilling.SetBlockTables(std::move(tables));
     return prefilling;
 #else
-    // Lock node
     std::unique_ptr<HostNodeRef> host_node_ref{nullptr};
     std::unique_ptr<DeviceNodeRef> device_node_ref{nullptr};
     if (!disable_l2_cache_ && (match_result_.host.DepthInPage() > match_result_.device.DepthInPage())) {
@@ -230,15 +234,12 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
         device_node_ref = std::make_unique<DeviceNodeRef>(match_result_.device.last_node);
     }
 
-    // Allocate KV pages for tokens not covered by the prefix cache
     auto local_kv_allocator = std::make_unique<LocalKVAllocator>(device_allocator_, tokens_this_round_);
-    // Reserve token slots for draft multi-step decode
+    // Reserve token slots for draft multi-step decode.
     local_kv_allocator->Acquire(decode_input_tokens_);
 
-    // Allocate req_pool_idx when first-time scheduled
     auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
 
-    // Mamba: allocate working + checkpoint slots if mamba is enabled
     std::unique_ptr<LocalMambaAllocator> local_mamba_allocator;
     if (mamba_allocator_ != nullptr) {
         local_mamba_allocator = std::make_unique<LocalMambaAllocator>(mamba_allocator_);
@@ -292,31 +293,16 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
         FlatWindowPageHashes(state.GetFullPagedTokens(false), state.GetPageSize(), state.window.begin,
                              state.window.size);
     const std::int32_t num_full_blocks = static_cast<std::int32_t>(hashes.size());
-    // Tokens of the prior chunks 0..k-1 (state.window is the PREVIOUS chunk).
-    // Under overlap scheduling that chunk's forward may still be IN FLIGHT --
-    // the slide is safe not because its KV is written, but because (a) all
-    // forwards run on the single execution stream, so any reuse write of a
-    // freed page is enqueued after the in-flight kernels, and (b) the freed
-    // pages lie fully below every later batch's read window. Writes into
-    // re-acquired pages from OUTSIDE that stream (e.g. cache load-back H2D)
-    // must fence against it. PrefillChunk slides the SWA window to this
-    // position; schedulePrefill's admission gate credits the slide with the
-    // same value, so gate math and op math stay aligned.
+    // Tokens of the prior chunks 0..k-1 (state.window is the PREVIOUS chunk);
+    // the admission gate credited the pending slide with this same value.
     const std::int32_t num_computed_tokens = state.window.begin + state.window.size;
 
     auto tables = std::move(state).TakeBlockTables();
-    try {
-        if (!PrefillChunk(*coordinator_, tables, hashes, tokens_this_round_, num_full_blocks,
-                          num_computed_tokens)) {
-            _assert(false, "flat path: allocation failure unsupported in C slice");
-        }
-    } catch (...) {
-        // On any throw the local tables would be dropped and, BlockTable being
-        // non-owning, every page's ref would leak. Return them to the pool; the
-        // request keeps empty tables and can still be Aborted cleanly.
-        FreeRequest(*coordinator_, tables);
-        throw;
+    BlockTablesGuard tables_guard{*coordinator_, tables};
+    if (!PrefillChunk(*coordinator_, tables, hashes, tokens_this_round_, num_full_blocks, num_computed_tokens)) {
+        _assert(false, "flat path: allocation failure unsupported in C slice");
     }
+    tables_guard.Disarm();
 
     TokenContainer::Window window{.begin = state.window.begin + state.window.size, .size = tokens_this_round_};
     bool is_last_chunk = (window.begin + window.size) == state.GetTokenContainer()->PrefillSize();
@@ -397,28 +383,20 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
 Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
     _assert(coordinator_ != nullptr, "ScheduleDecodeEvent: flat path requires a coordinator");
-    // Read state before taking the tables (use-after-move hygiene).
     const std::vector<std::string> hashes =
         FlatWindowPageHashes(state.GetFullPagedTokens(false), state.GetPageSize(), state.window.begin,
                              state.window.size);
     const std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
-    // All prefill tokens' KV is computed before the pending first decode step
-    // (window end == PrefillSize() by the is_last_chunk transition condition).
-    // Finalize slides to this position; scheduleDecode's PrefillDone gate
-    // credits the slide with PrefillSize(), the same value.
+    // Full prefill length (window end == PrefillSize() by the is_last_chunk
+    // condition); scheduleDecode's PrefillDone gate credited the same value.
     const std::int32_t num_computed_tokens = state.window.begin + state.window.size;
 
     auto tables = std::move(state).TakeBlockTables();
-    try {
-        if (!FinalizePrefillAndReserveDecode(*coordinator_, tables, hashes, reserve, num_computed_tokens)) {
-            _assert(false, "flat path: allocation failure unsupported in C slice");
-        }
-    } catch (...) {
-        // Non-owning tables: free the pages before the exception escapes (see
-        // SchedulePrefillEvent above).
-        FreeRequest(*coordinator_, tables);
-        throw;
+    BlockTablesGuard tables_guard{*coordinator_, tables};
+    if (!FinalizePrefillAndReserveDecode(*coordinator_, tables, hashes, reserve, num_computed_tokens)) {
+        _assert(false, "flat path: allocation failure unsupported in C slice");
     }
+    tables_guard.Disarm();
 
     Decoding decoding{state.GetTokenContainer(),
                       state.GetPageSize(),
@@ -465,30 +443,18 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
 Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
     _assert(coordinator_ != nullptr, "ScheduleDecodeEvent: flat path requires a coordinator");
-    // Read state before taking the tables (use-after-move hygiene).
     const std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
-    // Tokens whose KV is already computed BEFORE this round's forward. The
-    // container's Size() includes the decode_input_tokens_ tail the executor
-    // appended via ExtendResult, whose KV is computed by THIS round's
-    // still-pending forward -- pass Size() and the SWA slide runs one token
-    // ahead, freeing a page the pending query still reads (off-by-one: the
-    // query at position Size()-1 needs keys down to Size()-1-window+1, but the
-    // first kept token would become Size()-window+1). scheduleDecode's
-    // admission gate uses the same TokenSize() - decode_input_tokens value, so
-    // gate math and DecodeStep math stay aligned.
+    // Size() includes the decode_input_tokens_ tail this round's still-pending
+    // forward computes; sliding at Size() would free a page its query still
+    // reads. scheduleDecode's gate credited the slide with this same value.
     const std::int32_t num_computed_tokens = state.GetTokenContainer()->Size() - decode_input_tokens_;
 
     auto tables = std::move(state).TakeBlockTables();
-    try {
-        if (!DecodeStep(*coordinator_, tables, reserve, num_computed_tokens)) {
-            _assert(false, "flat path: allocation failure unsupported in C slice");
-        }
-    } catch (...) {
-        // Non-owning tables: free the pages before the exception escapes (see
-        // SchedulePrefillEvent above).
-        FreeRequest(*coordinator_, tables);
-        throw;
+    BlockTablesGuard tables_guard{*coordinator_, tables};
+    if (!DecodeStep(*coordinator_, tables, reserve, num_computed_tokens)) {
+        _assert(false, "flat path: allocation failure unsupported in C slice");
     }
+    tables_guard.Disarm();
 
     Decoding decoding{state.GetTokenContainer(),
                       state.GetPageSize(),
@@ -516,8 +482,7 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
 #endif
 }
 
-// Retracted -> Decoding: recover via LoadBack (host → device).
-// match_result_ was computed by the caller; alloc_device_node attaches device pages to LoadBack nodes.
+// Retracted -> Decoding: recover via LoadBack (host -> device).
 Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
     FlatRetractUnsupported();
@@ -532,7 +497,8 @@ Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
             throw std::logic_error(
                 "ScheduleDecodeFromRetractedEvent: failed to allocate device pages for host cache recovery");
         }
-        // This is not a typo
+        // Device pages were just attached along the host-matched chain, so the
+        // device ref pins the HOST match's last node -- not a typo.
         device_node_ref = std::make_unique<DeviceNodeRef>(match_result_.host.last_node);
     } else {
         device_node_ref = std::make_unique<DeviceNodeRef>(match_result_.device.last_node);
@@ -566,8 +532,7 @@ Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
 #endif
 }
 
-// Decode -> Finish / PrefillDone -> Finish
-// This transection is triggered by python side Advance
+// Decoding/PrefillDone -> Draining/Finished, driven by the Python side's Advance.
 template <typename ForwardStateT>
 std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
@@ -643,18 +608,15 @@ std::variant<Draining, Finished> FinishEvent::operator()(PrefillDone&& state) {
     return apply(std::move(state));
 }
 
-// The request finished (EOS) while its device→host writeback is still in-flight.
-// Downcast to WritingBack so that WriteBackDoneEvent takes the existing
-// WritingBack → Finished path.  TokenContainer and LocalKVAllocator are
-// released here (no longer needed for recovery).
+// EOS arrived while the device->host writeback is still in flight: downcast to
+// WritingBack so WriteBackDoneEvent takes the existing WritingBack -> Finished
+// path (TokenContainer and LocalKVAllocator release here).
 WritingBack FinishEvent::operator()(Retracting&& state) {
     return static_cast<WritingBack&&>(state);
 }
 
-// Draining → WritingBack
-// Transfer both RAII node-ref locks out of Draining and into WritingBack.
-// From this point the request no longer owns match_result; the locks alone
-// are enough to keep the Device and Host pages pinned until WriteBackDone.
+// Draining -> WritingBack: the two RAII node-ref locks move across; they alone
+// keep the Device and Host pages pinned until WriteBackDone.
 WritingBack CommitDrainingEvent::operator()(Draining&& state) {
     auto device_node_ref = std::move(state).TakeDeviceNodeRef();
     auto host_node_ref = std::move(state).TakeHostNodeRef();
@@ -662,9 +624,8 @@ WritingBack CommitDrainingEvent::operator()(Draining&& state) {
     return WritingBack{std::move(device_node_ref), std::move(host_node_ref), std::move(mamba_writeback_nodes)};
 }
 
-// WritingBack → Finished
-// The async Device→Host transfer completed. Dropping the refs releases locks,
-// then written-back cache becomes host-only so the next hit must load back.
+// WritingBack -> Finished: the async device->host transfer completed; the
+// written-back cache demotes to host-only, so the next hit must load back.
 Finished WriteBackDoneEvent::operator()(WritingBack&& state) {
     TreeNode* device_node = state.DeviceNode();
     if (hybrid_prefix_cache_ != nullptr) {
@@ -808,9 +769,8 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
                 hybrid_prefix_cache_->InsertMamba(terminal, local_mamba_allocator->DetachWorking());
             }
         }
-        // Once retracted, the recoverable Mamba state is tree-owned and
-        // therefore evictable by HybridPrefixCache. Do not keep request-local
-        // slots alive in Retracting/Retracted.
+        // Once retracted, the recoverable Mamba state is tree-owned and evictable:
+        // keep no request-local slots alive in Retracting/Retracted.
         local_mamba_allocator.reset();
     }
 

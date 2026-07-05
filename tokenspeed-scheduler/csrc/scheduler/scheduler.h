@@ -84,10 +84,8 @@ public:
     // Compact-view base logical-page offset; 0 for full-history / unseen.
     std::int32_t GetRequestPagedCacheBaseLogicalPage(const std::string& request_id, const std::string& group_id) const;
 #if TOKENSPEED_FLAT_KVCACHE
-    // Free physical pages in the flat shared BlockPool (flat path only).
-    // AvailableKvPages() reports the same value on flat builds (the Python
-    // binding redirects there; see scheduler.cpp); this int32 accessor stays
-    // for C++ tests.
+    // Free physical pages in the flat shared BlockPool. AvailableKvPages()
+    // reports the same value on flat builds; this int32 accessor stays for C++ tests.
     std::int32_t FlatPoolFreeBlocks() const { return block_pool_.NumFreeBlocks(); }
 #endif
 
@@ -120,6 +118,18 @@ private:
     std::optional<fsm::ScheduleDecodeFromRetractedEvent> scheduleDecodeFromRetracted(
         Request* request, std::map<std::string, std::int32_t>& simulated_free);
     std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);
+
+#if TOKENSPEED_FLAT_KVCACHE
+    CoordinatorMatch matchFlatPrefixAtAdmission(Request* request) const;
+    std::optional<std::int32_t> flatAdmitFirstChunk(Request* request, const CoordinatorMatch& hit,
+                                                    std::int32_t chunk_tokens,
+                                                    std::int32_t decode_reserve_tokens) const;
+    std::optional<std::int32_t> flatAdmitPrefillChunk(Request* request, std::int32_t chunk_tokens,
+                                                      std::int32_t decode_reserve_tokens,
+                                                      std::int32_t num_computed_tokens) const;
+    bool flatAdmitDecode(Request* request) const;
+    std::optional<std::size_t> flatStarvationDeadlockRisk(const std::vector<Request*>& candidates) const;
+#endif
 
     void check_device_mem();
 
@@ -167,41 +177,26 @@ private:
     BlockPool block_pool_;
     KvCacheCoordinator coordinator_;
     std::vector<std::string> flat_group_ids_;  // group_id per cache group, index-aligned to coordinator groups
-    // Forward results the executor still owes us, per request: one ExtendResult
-    // per emitted decode op and one per prefill-completing op (mid-prefill chunk
-    // ops produce no event, so they are not counted). Incremented when
-    // newForwardOperation emits such an op, decremented on ExtendResult, erased
-    // on Finish/Abort/PD-success. Non-empty means a forward is in flight whose
-    // completion can still finish a request and free pool pages -- the flat
-    // starvation-deadlock check keys off this (see newForwardOperation).
+    // ExtendResults the executor still owes, per request: one per decode op and
+    // one per prefill-completing op (mid-prefill chunks emit none); decremented
+    // on ExtendResult, erased on Finish/Abort/PD-success. Non-empty means an
+    // in-flight forward can still finish a request and free pool pages -- the
+    // flat starvation-deadlock check keys off this.
     std::unordered_map<std::string, std::int32_t> pending_forward_results_;
-    // Decode-reserve pages promised but not yet acquired, per request. A
-    // prefill-completing admission (first or final chunk) charges its gate
-    // chunk + decode reserve, but the reserve is only Acquired at the
-    // PrefillDone->Decoding transition -- between those rounds the promised
-    // pages still sit in the pool's free count. Entries record the exact page
-    // need (BlocksNeededFor on the post-prefill table shape, computed at
-    // admission time) so other candidates' gates can subtract them and not be
-    // admitted into promised pages. Inserted when the prefill-completing
-    // admission commits, erased when the PrefillDone->Decoding transition
-    // acquires the reserve, and on Finish/Abort/PD-success (no phantom
-    // reservation may outlive its request).
+    // Reserve ledger: decode pages promised by a prefill-completing admission
+    // but only Acquired at the PrefillDone->Decoding transition. Until then they
+    // sit in the pool's free count, so every flat gate subtracts OTHER requests'
+    // entries to avoid admitting into promised pages. Erased on that acquire and
+    // on Finish/Abort/PD-success (no phantom reservation outlives its request).
     std::unordered_map<std::string, std::int32_t> flat_reserved_pages_;
-    // Consecutive fully-starved fused rounds (every candidate deferred, pool
-    // pages held, nothing in flight). The deadlock assert in
-    // newForwardOperation requires TWO such rounds: a single round can be a
-    // false positive when a pool-freeing Finish is queued between a request's
-    // ExtendResult (which empties pending_forward_results_) and its Finish
-    // (which frees the pages). Reset on any round that schedules ops or fails
-    // the starvation predicate. Residual risk (accepted for this fail-loud
-    // stopgap until TODO(flat-retract)): a Finish arriving two or more rounds
-    // after the last ExtendResult still trips the assert on a recoverable
-    // state.
+    // Consecutive fully-starved fused rounds; the deadlock assert requires TWO,
+    // because a pool-freeing Finish queued between ExtendResult and its arrival
+    // makes a single starved round a false positive. Residual risk (accepted
+    // until TODO(flat-retract)): a Finish arriving 2+ rounds late still trips it.
     std::int32_t flat_starved_rounds_{0};
 
-    // Sum of flat_reserved_pages_ excluding request_id's own entry: a request
-    // gating its own decode is the one consuming its reservation, so it must
-    // not be blocked by it.
+    // Ledger sum excluding request_id's own entry: a request consuming its own
+    // reservation must not be gated by it.
     std::int32_t flatReservedPagesExcept(const std::string& request_id) const {
         std::int32_t total = 0;
         for (const auto& [id, pages] : flat_reserved_pages_) {

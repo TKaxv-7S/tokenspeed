@@ -74,12 +74,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
-        # Decide the buffer layout (M12 hybrid slab vs legacy per-layer)
-        # BEFORE sizing: _get_page_size_bytes (next line) and
-        # _create_buffers both key off _slab_group_size and must agree.
-        # hybrid_slab_group_size is also what the registry's KV memory
-        # profile consumes (_kv_profile_layer_divisor) -- one predicate,
-        # two consumers, so sizing and layout can never diverge.
+        # hybrid_slab_group_size is the single source for sizing (here and
+        # the registry's KV profile) and layout (_create_buffers).
         self._layer_types = tuple(layer_types or ())
         self._kvstore_enabled = kvstore_enabled
         self._pd_disaggregation_enabled = pd_disaggregation_enabled
@@ -114,31 +110,12 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             scheduler_ext_flat_kvcache,
         )
 
-        # Publish per-group specs so the C++ scheduler is configured multi-group
-        # for hybrid full/SWA models (gpt-oss). Empty layer_types -> single
-        # full-history group, which the flat (TOKENSPEED_FLAT_KVCACHE) scheduler
-        # build needs to allocate pages for plain non-hybrid MHA models.
-        #
-        # Rule: publish groups iff (a) the scheduler ext is flat-built AND
-        # (b) speculative decoding is off. Publication is THE upstream signal:
-        # the C++ scheduler config, the CUDA-graph flat capture path, and the
-        # flat_block_tables bridge all key off it, so this single gate keeps
-        # every downstream consumer consistent.
-        # (a) Only a flat-built ext ever populates flat_block_tables; a
-        #     radix-built ext (default) never does (MaybeFillFlatBlockTables is
-        #     a no-op), so publishing against it would make CUDA-graph capture
-        #     bind the flat per-group buffers to tables that never arrive and
-        #     the replay guard (backends/mha.py) raise on the first graph
-        #     decode. Older exts without the FLAT_KVCACHE attribute report
-        #     False — the correct radix-safe default.
-        # (b) Flat page tables do not support spec-expanded metadata
-        #     (backends/mha.py asserts on flat_cache_group_ids with
-        #     spec_num_tokens > 1), and non-empty groups turn off the overlap
-        #     scheduler under spec decode
-        #     (scheduler_utils.should_use_overlap_schedule), so spec runs keep
-        #     the pre-group behavior: no specs, no flat capture kwarg, overlap
-        #     schedule unaffected. TODO(flat+spec): publish under spec decode
-        #     once the flat path supports spec-expanded metadata.
+        # Publication rule (canonical): publish groups iff the scheduler ext
+        # is flat-built (a radix ext never delivers flat tables — capture
+        # would bind dead buffers) and spec decode is off (flat tables do not
+        # support spec-expanded metadata; non-empty groups would also disable
+        # the overlap scheduler under spec). Publication is THE upstream signal
+        # every flat consumer keys off. TODO(flat+spec): publish under spec.
         if speculative_enabled or not scheduler_ext_flat_kvcache():
             self.paged_cache_group_specs = ()
             self.paged_cache_group_page_counts = {}
@@ -151,9 +128,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                     page_size=page_size,
                 )
             )
-            # Per-group page budgets, required by pool_to_paged_cache_groups.
-            # Mirrors DeepseekV4TokenToKVPool: size=total tokens,
-            # max_batch_size=live reqs.
             self.paged_cache_group_page_counts = compute_paged_cache_group_page_counts(
                 self.paged_cache_group_specs,
                 max_live_requests=max_batch_size,
@@ -163,9 +137,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             )
 
     def _get_page_size_bytes(self):
-        # Under the hybrid slab layout (M12) paired layers share K/V
-        # slabs, so a page only carries one group's layers worth of bytes
-        # -- this is the byte-level capacity win the layout exists for.
+        # Slab layout: a page carries one group's layers, not all layers.
         return (
             2
             * self.page_size
@@ -176,12 +148,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         )
 
     def _slab_pair_index(self) -> list[int]:
-        """Map layer_id -> slab index for the hybrid slab layout.
-
-        Groups form in FIRST-APPEARANCE order of layer_types -- the same
-        ordering group_specs_from_layer_types uses, so slab i
-        deterministically pairs group-A's i-th layer with group-B's i-th
-        layer -- and the i-th layer of every group binds slab i.
+        """Map layer_id -> slab index: the i-th layer of every group binds
+        slab i (first-appearance order, as in group_specs_from_layer_types).
         """
         assert self._slab_group_size is not None
         assert len(self._layer_types) == self.layer_num, (
@@ -194,17 +162,14 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             idx = occurrence.get(label, 0)
             occurrence[label] = idx + 1
             pair_index.append(idx)
-        # Pairing completeness: every group contributes exactly one layer
-        # to each slab (equal group sizes are guaranteed by the predicate;
-        # this pins the mapping itself).
         assert all(
             count == self._slab_group_size for count in occurrence.values()
         ), f"hybrid slab layout: uneven groups {occurrence!r}"
         return pair_index
 
     def _check_slab_guards(self):
-        """Refuse features whose per-layer buffer assumptions break under
-        the slab layout (paired layers alias the SAME tensor)."""
+        """Refuse features whose per-layer buffer assumptions break when
+        paired layers alias the same slab tensor."""
         if self._kvstore_enabled:
             raise RuntimeError(
                 "hybrid slab KV layout is incompatible with the kvstore L2 "
@@ -230,13 +195,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region():
-            # [size, head_num, head_dim] for each layer.
-            # The padded page 0 is used for writing dummy outputs from padded tokens.
-            # Zero-init: attention kernels may read block_table entries beyond the
-            # valid seq_len (pointing at page 0), so the slots must be finite to
-            # keep softmax well-defined. Under the slab layout paired layers
-            # share one dummy page 0 per slab -- writes there are discarded
-            # either way, so the contract is unchanged.
+            # Page 0 is the zero-initialized dummy page: padded tokens write
+            # there, and kernels may read it past valid seq_len, so its slots
+            # must stay finite to keep softmax well-defined.
             logger.info(
                 "_create_buffers self.size=%r, self.page_size=%r, self.head_num=%r, self.head_dim=%r, self.layer_num=%r",
                 self.size,
@@ -254,14 +215,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 )
 
             if self._slab_group_size is not None:
-                # M12 hybrid slab layout: allocate group_size K/V slab
-                # pairs and bind the i-th layer of EVERY group to slab i
-                # (same tensor object, vLLM-style aliasing). Safety
-                # invariant (do not re-derive here): the flat scheduler's
-                # single BlockPool guarantees a page id is owned by at
-                # most one group at a time, so paired layers' live rows
-                # never overlap; the M11 write-within-group-table probes
-                # cover it at runtime.
+                # Paired layers alias the same slab tensor; live rows never
+                # overlap (page-ownership contract in hybrid_slab_group_size).
                 self._check_slab_guards()
                 pair_index = self._slab_pair_index()
                 k_slabs = [_alloc() for _ in range(self._slab_group_size)]
@@ -274,16 +229,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                     v_slabs[pair_index[layer_id]]
                     for layer_id in range(self.layer_num)
                 ]
-                # Per-layer host (L2) copies would alias shared slabs, so
-                # opt out of the hierarchical cache surface: event_loop
-                # builds a MemoryExecutor for retraction offload even when
-                # the kvstore flag is off, and this attribute is what
-                # gates it (DeepseekV4TokenToKVPool precedent).
+                # Gates event_loop's retraction offload (built even with the
+                # kvstore off): per-layer host copies would alias shared slabs.
                 self.supports_hierarchical_kv_cache = False
-                # move_kv_cache broadcasts one (tgt, src) over data_ptrs;
-                # duplicated slab entries would just re-copy the same rows
-                # (idempotent, wasteful). It has NO callers anywhere today
-                # (grep before wiring it up under the slab layout).
                 logger.info(
                     "KV layout: hybrid slab (%d slabs x %d rows; paired "
                     "layers share storage; M12)",
@@ -374,6 +322,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # Slab layout: data_ptrs holds duplicated slab entries, so this
+        # broadcast re-copies rows. No callers today; re-check before wiring.
         if self._kv_copy_config is None:
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
         else:
@@ -393,9 +343,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
         assert hasattr(self, "v_buffer")
-        # Dedup by tensor identity: under the hybrid slab layout k_buffer
-        # holds layer_num references to group_size slabs, and allocated
-        # bytes must not be double-counted (legacy layout: no-op).
+        # Dedup by tensor identity: the slab layout aliases layers to shared
+        # slabs, and allocated bytes must not be double-counted.
         k_size_bytes = 0
         for k_cache in {id(t): t for t in self.k_buffer}.values():
             k_size_bytes += np.prod(k_cache.shape) * k_cache.dtype.itemsize

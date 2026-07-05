@@ -88,6 +88,117 @@ static void MaybeFillFlatBlockTables(Op& op, Request* request, std::span<const s
 
 }  // namespace
 
+#if TOKENSPEED_FLAT_KVCACHE
+// One match at admission (vLLM V1 shape): the returned num_common_blocks is the
+// single source for the token math, the gate charge and the FSM window.begin,
+// so the double-subtraction class of bugs cannot exist. Claiming pages whose KV
+// write is still in flight is stream-ordering safe (forward_cache_ops.h).
+CoordinatorMatch Scheduler::matchFlatPrefixAtAdmission(Request* request) const {
+    if (config_.disable_prefix_cache) {
+        return {};
+    }
+    // Hash input must be byte-identical to the REGISTRATION form
+    // (GetFullPagedTokens(false), the whole prompt at admission) or hits never
+    // occur. Radix's except_last=true rule -- the last prompt token is always
+    // recomputed to produce logits (vLLM semantics) -- is applied as the page
+    // cap instead, which also bounds the SWA fixpoint match input.
+    const std::int32_t cap_pages = std::max((request->PrefillSize() - 1) / config_.page_size, 0);
+    const std::vector<std::string> flat_hashes = FlatWindowPageHashes(
+        request->GetFullPagedTokens(/*except_last=*/false), config_.page_size, 0, request->PrefillSize());
+    const std::size_t bounded = std::min(flat_hashes.size(), static_cast<std::size_t>(cap_pages));
+    return coordinator_.MatchPrefix(std::span<const std::string>(flat_hashes).first(bounded));
+}
+
+// TODO(radix-removal): the radix EnsureCapacityByEvict gates never bind on flat builds; the flatAdmit* gates below
+// own admission -- a request that does not fit is deferred this round, so the transitions' Acquires cannot fail.
+//
+// Admit/defer gate for a first prefill chunk. Returns the decode-reserve page
+// count to record in flat_reserved_pages_ when admitted (0 unless this chunk
+// completes the prefill), nullopt to defer the request intact.
+std::optional<std::int32_t> Scheduler::flatAdmitFirstChunk(Request* request, const CoordinatorMatch& hit,
+                                                           std::int32_t chunk_tokens,
+                                                           std::int32_t decode_reserve_tokens) const {
+    // Charging chunk + reserve in one query gates exactly the two Acquires the
+    // request will run (BlocksNeededFor is tail-associative); without the
+    // reserve charge, a prompt that exactly fills the pool is admitted and its
+    // own decode defers forever (TODO(flat-retract)). The fresh-table overload
+    // also charges the SWA transient peak (TODO(flat-swa-alloc)).
+    const std::int32_t blocks_needed = coordinator_.BlocksNeededFor(chunk_tokens + decode_reserve_tokens);
+    // The transition's ClaimCommonPrefix consumes free-list blocks Acquire never
+    // sees (BlocksConsumedByClaim). Exact, not a bound: gate and apply run back
+    // to back, so no other admission can interleave.
+    const std::int32_t claim_blocks = coordinator_.BlocksConsumedByClaim(hit);
+    if (blocks_needed + claim_blocks > block_pool_.NumFreeBlocks() - flatReservedPagesExcept(request->Id())) {
+        return std::nullopt;
+    }
+    // Exact reserve need on the post-prefill table shape, computed while that
+    // shape is known -- never recomputed later against drifted state.
+    return decode_reserve_tokens > 0 ? blocks_needed - coordinator_.BlocksNeededFor(chunk_tokens) : 0;
+}
+
+// Admit/defer gate for a later prefill chunk; same contract as
+// flatAdmitFirstChunk, on the request's live tables. num_computed_tokens is the
+// prior chunks' token count, matching the slide the transition performs.
+std::optional<std::int32_t> Scheduler::flatAdmitPrefillChunk(Request* request, std::int32_t chunk_tokens,
+                                                             std::int32_t decode_reserve_tokens,
+                                                             std::int32_t num_computed_tokens) const {
+    // Credit the pending slide (slide-before-acquire, forward_cache_ops.cpp) so
+    // long-prompt admission is not over-conservative once chunk >> window. The
+    // credit is exact: the op registers hashes first, which never changes refs.
+    const std::int32_t slide_credit =
+        coordinator_.BlocksFreedByAdvance(request->FlatBlockTablesRef(), num_computed_tokens);
+    const std::int32_t blocks_needed =
+        coordinator_.BlocksNeededFor(request->FlatBlockTablesRef(), chunk_tokens + decode_reserve_tokens);
+    if (blocks_needed > block_pool_.NumFreeBlocks() + slide_credit - flatReservedPagesExcept(request->Id())) {
+        return std::nullopt;
+    }
+    // The pending slide cannot drift the stored reserve: AdvanceWindow only
+    // punches front holes, and BlocksNeededFor depends on tail_avail alone.
+    return decode_reserve_tokens > 0
+               ? blocks_needed - coordinator_.BlocksNeededFor(request->FlatBlockTablesRef(), chunk_tokens)
+               : 0;
+}
+
+// Admit/defer gate covering both the PrefillDone reserve Acquire and each
+// Decoding DecodeStep, composed from the same two coordinator primitives the
+// transition runs: BlocksNeededFor for the Acquire, BlocksFreedByAdvance for
+// the slide the op performs before it.
+bool Scheduler::flatAdmitDecode(Request* request) const {
+    // Same num_computed the transition will slide with: a Decoding request's
+    // pending tail (decode_input_tokens) is not yet computed; a PrefillDone
+    // request finalizes at the full prefill length.
+    const std::int32_t num_computed_tokens = request->Is<fsm::Decoding>()
+                                                 ? request->TokenSize() - config_.decode_input_tokens
+                                                 : request->PrefillSize();
+    const std::int32_t slide_credit =
+        coordinator_.BlocksFreedByAdvance(request->FlatBlockTablesRef(), num_computed_tokens);
+    const std::int32_t blocks_needed = coordinator_.BlocksNeededFor(
+        request->FlatBlockTablesRef(), request->GetReserveNumTokensInNextScheduleEvent());
+    return blocks_needed <= block_pool_.NumFreeBlocks() + slide_credit - flatReservedPagesExcept(request->Id());
+}
+
+// Deferred-candidate count when this round can never unwedge itself: nothing
+// scheduled, live requests hold pool pages, and neither ledger has in-flight
+// work that could free them. Fused-only: under PD-disagg, requests awaiting pd
+// events hold pages while appearing in neither ledger.
+std::optional<std::size_t> Scheduler::flatStarvationDeadlockRisk(const std::vector<Request*>& candidates) const {
+    std::size_t deferred = 0;
+    for (const Request* req : candidates) {
+        if (req->Is<fsm::Submitted>() || req->Is<fsm::PrefetchDone>() || req->Is<fsm::Prefilling>() ||
+            req->Is<fsm::PrefillDone>() || req->Is<fsm::Decoding>() || req->Is<fsm::Retracted>()) {
+            ++deferred;
+        }
+    }
+    // Block 0 is the null placeholder, never allocated.
+    const bool pool_pages_held = block_pool_.NumFreeBlocks() < block_pool_.TotalBlocks() - 1;
+    const bool nothing_in_flight = pending_forward_results_.empty() && cache_op_tracker_.empty();
+    if (config_.role != Role::kFused || deferred == 0 || !pool_pages_held || !nothing_in_flight) {
+        return std::nullopt;
+    }
+    return deferred;
+}
+#endif
+
 std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFirstChunk(
     Request* request, std::int32_t remaining, std::int32_t decode_input_tokens, bool disable_l2_cache,
     std::map<std::string, std::int32_t>& simulated_free) {
@@ -130,101 +241,21 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
 #if TOKENSPEED_FLAT_KVCACHE
-    // M9: cross-request prefix hit. One match at admission (vLLM V1 shape);
-    // the SAME num_common_blocks drives the token math here, the gate charge
-    // below, and window.begin in the FSM event -- single source, so the
-    // double-subtraction class of bugs cannot exist.
-    // Hash input: GetFullPagedTokens(/*except_last=*/false) pages the whole
-    // token buffer, which at admission holds exactly the prompt -- so the
-    // chained page hashes are byte-identical to what the write side registers
-    // (the prefill events hash state.GetFullPagedTokens(false); the radix
-    // match above uses except_last=true, but admission hashes must equal the
-    // REGISTRATION form or hits never occur). The rule except_last=true
-    // encodes for radix -- the last prompt token is always recomputed to
-    // produce logits (vLLM semantics) -- is applied here as the explicit
-    // (PrefillSize-1)/page_size cap instead, which also bounds the SWA
-    // fixpoint match input.
-    // Safety of claiming pages whose KV write may still be in flight
-    // (registration happens at schedule time): identical stream-ordering
-    // invariant as the prefill window slide -- the claimer's read kernels
-    // are enqueued after the writer's on the single execution stream, and
-    // claimed pages are ref>1 so they cannot be freed and reloaded from
-    // outside the stream. TODO(flat-l2): revisit when out-of-stream writers
-    // (load-back H2D) join the flat path.
-    CoordinatorMatch flat_hit;
-    if (!config_.disable_prefix_cache) {
-        const std::int32_t cap_pages = std::max((request->PrefillSize() - 1) / config_.page_size, 0);
-        const std::vector<std::string> flat_hashes = FlatWindowPageHashes(
-            request->GetFullPagedTokens(/*except_last=*/false), config_.page_size, 0, request->PrefillSize());
-        const std::size_t bounded = std::min(flat_hashes.size(), static_cast<std::size_t>(cap_pages));
-        flat_hit = coordinator_.MatchPrefix(std::span<const std::string>(flat_hashes).first(bounded));
-    }
+    // M9: cross-request prefix hit, matched once at admission.
+    CoordinatorMatch flat_hit = matchFlatPrefixAtAdmission(request);
     // Overwrite the radix-sourced locals: the radix tree is never written on
-    // flat builds, so the match at the top of this function is always empty
-    // and both arrived holding the full prompt. Every consumer below
-    // (completes_prefill, the pool gate, first_pos, the event) then reads the
-    // hit-adjusted values naturally.
+    // flat builds, so the match above is empty and both hold the full prompt.
     const std::int32_t flat_hit_tokens = flat_hit.num_common_blocks * config_.page_size;
     unscheduled = request->PrefillSize() - flat_hit_tokens;
     tokens_this_round = std::min(remaining, unscheduled);
 
-    // TODO(radix-removal): the EnsureCapacityByEvict gate above budgets the radix
-    // device_allocator_, which the flat path never draws from -- it always
-    // admits. The flat shared BlockPool is gated here instead: a request that
-    // does not fit is simply not scheduled this round (mirrors the radix skip),
-    // so the FSM transition's Acquire cannot fail in normal operation. The flat
-    // first chunk claims the admission prefix hit (flat_hit, threaded through
-    // the event) and acquires tokens_this_round.
-    //
-    // When this chunk completes the prefill, also charge the decode headroom the
-    // PrefillDone->Decoding transition will acquire (decode_input_tokens becomes
-    // that state's reserve; scheduleDecode gates on exactly that value). Without
-    // it, a prompt that exactly fills the pool is admitted and its own decode
-    // step defers forever -- unrecoverable while flat retract is unimplemented
-    // (TODO(flat-retract)). No slide credit is possible for the first chunk
-    // itself (fresh tables, num_computed = 0), and even when chunk >> window
-    // the SWA group transiently allocates the FULL chunk before any later op
-    // slides it (TODO(flat-swa-alloc), forward_cache_ops.h), so
-    // BlocksNeededFor(tokens_this_round + reserve) charges that transient peak
-    // -- correctness over post-slide optimism. With an admission prefix hit,
-    // tokens_this_round above is already the hit-adjusted remainder, and the
-    // charge stays exact for the NEW tokens only: claimed pages are full (no
-    // tail credit), and the fresh-table BlocksNeededFor overload assumes no
-    // tail credit either.
-    // The charge is only kept if a reservation is recorded in
-    // flat_reserved_pages_ (below): the reserve is not Acquired until the
-    // PrefillDone->Decoding round, so without the ledger other candidates would
-    // read the raw free count and be admitted into the promised pages. Every
-    // flat gate subtracts the outstanding reservations of OTHER requests.
     const bool completes_prefill = tokens_this_round == unscheduled;
     const std::int32_t flat_decode_reserve = completes_prefill ? decode_input_tokens : 0;
-    const std::int32_t flat_blocks_needed = coordinator_.BlocksNeededFor(tokens_this_round + flat_decode_reserve);
-    // The transition's ClaimCommonPrefix consumes free blocks BlocksNeededFor
-    // never sees: TouchBlock on a ref-0 cached hit block REMOVES it from the
-    // free list (block_pool.h), so the claim shrinks the free count by the
-    // number of such blocks before the remainder Acquire runs. Charge them
-    // too. The count is exact, not a bound: this gate and the event's apply
-    // run back to back within the same planning-loop iteration for this
-    // request (no other admission interleaves), so the set of hit blocks at
-    // ref 0 now is precisely the set TouchBlock will pull. Not added to
-    // flat_reserve_pages below: the ledger carries cross-round promises only
-    // (the decode acquire lands rounds later), while the claim lands within
-    // this same round's apply.
-    const std::int32_t flat_claim_blocks = coordinator_.BlocksConsumedByClaim(flat_hit);
-    if (flat_blocks_needed + flat_claim_blocks >
-        block_pool_.NumFreeBlocks() - flatReservedPagesExcept(request->Id())) {
+    const std::optional<std::int32_t> flat_reserve_pages =
+        flatAdmitFirstChunk(request, flat_hit, tokens_this_round, flat_decode_reserve);
+    if (!flat_reserve_pages) {
         return {};
     }
-    // Exact reserve page need on the post-prefill table shape: BlocksNeededFor
-    // is tail-associative, so needed(chunk + reserve) - needed(chunk) equals
-    // BlocksNeededFor(post-prefill tables, reserve). Computed now, while the
-    // future table shape is known, and stored -- never recomputed later against
-    // drifted state. Recorded just before the event is returned (below), after
-    // all remaining admission gates have passed.
-    const std::int32_t flat_reserve_pages =
-        flat_decode_reserve > 0
-            ? flat_blocks_needed - coordinator_.BlocksNeededFor(tokens_this_round)
-            : 0;
 #endif
 
     if (hybrid_prefix_cache_ && hybrid_prefix_cache_->HasMambaAdjunct() && match_result.mamba_host_src_index >= 0 &&
@@ -261,15 +292,11 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
 #if TOKENSPEED_FLAT_KVCACHE
-    // Admission commits here (the caller always applies a returned event).
-    // Record the decode-reserve promise only when this request will consume it
-    // locally: role kD reaches PrefillDone via RemotePrefillDoneEvent, which
-    // builds the state with reserve 0 (pd_events.cpp), so its transition
-    // acquires nothing and a recorded entry would be a phantom until Finish.
-    // Erased when FinalizePrefillAndReserveDecode acquires, or on
-    // Finish/Abort/PD-success.
-    if (flat_reserve_pages > 0 && config_.role != Role::kD) {
-        flat_reserved_pages_[request->Id()] = flat_reserve_pages;
+    // Admission commits here (the caller always applies a returned event). Role
+    // kD reaches PrefillDone via RemotePrefillDoneEvent with reserve 0, so its
+    // transition acquires nothing -- recording would leave a phantom entry.
+    if (*flat_reserve_pages > 0 && config_.role != Role::kD) {
+        flat_reserved_pages_[request->Id()] = *flat_reserve_pages;
     }
 #endif
 
@@ -306,46 +333,14 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     }
 
 #if TOKENSPEED_FLAT_KVCACHE
-    // TODO(radix-removal): the radix gate above is dead on the flat path (see
-    // schedulePrefillFirstChunk); the flat pool is gated here. The final chunk
-    // additionally charges the PrefillDone->Decoding decode headroom
-    // (reserve_num_tokens_in_next_schedule_event), mirroring the first-chunk
-    // gate: BlocksNeededFor is tail-associative, so gating chunk + reserve in
-    // one query equals gating the two acquires the request will actually run.
-    // Like the first-chunk gate, the reserve is kept as a flat_reserved_pages_
-    // entry until the PrefillDone->Decoding transition acquires it, and other
-    // requests' outstanding reservations are subtracted from the free count.
-    //
-    // Slide credit (mirrors scheduleDecode): PrefillChunk slides the SWA
-    // window BEFORE its Acquire, with num_computed = the prior chunks' tokens
-    // (chunks 0..k-1 when gating chunk k = PrefillSize() - unscheduled; the
-    // SchedulePrefillEvent transition computes the identical window.begin +
-    // window.size). Crediting BlocksFreedByAdvance here keeps long-prompt
-    // admission from being over-conservative once chunk >> window, without a
-    // second copy of the window math. The credit is exact: the op runs
-    // CacheFullBlocks first, which never changes ref counts, so the pending
-    // slide frees exactly what this query reports.
     const bool completes_prefill = tokens_this_round == unscheduled;
     const std::int32_t flat_decode_reserve = completes_prefill ? reserve_num_tokens_in_next_schedule_event : 0;
     const std::int32_t flat_num_computed = request->PrefillSize() - unscheduled;
-    const std::int32_t flat_slide_credit =
-        coordinator_.BlocksFreedByAdvance(request->FlatBlockTablesRef(), flat_num_computed);
-    const std::int32_t flat_blocks_needed =
-        coordinator_.BlocksNeededFor(request->FlatBlockTablesRef(), tokens_this_round + flat_decode_reserve);
-    if (flat_blocks_needed >
-        block_pool_.NumFreeBlocks() + flat_slide_credit - flatReservedPagesExcept(request->Id())) {
+    const std::optional<std::int32_t> flat_reserve_pages =
+        flatAdmitPrefillChunk(request, tokens_this_round, flat_decode_reserve, flat_num_computed);
+    if (!flat_reserve_pages) {
         return {};
     }
-    // Exact reserve page need on the post-prefill table shape (tail-associative
-    // BlocksNeededFor; see schedulePrefillFirstChunk). Prefill sliding does not
-    // perturb this: AdvanceWindow only punches front holes and never touches
-    // the tail page or tail_avail, and BlocksNeededFor depends on tail_avail
-    // alone -- the stored count stays exact on the post-slide table. Recorded
-    // before the event is returned, after the remaining admission gates.
-    const std::int32_t flat_reserve_pages =
-        flat_decode_reserve > 0
-            ? flat_blocks_needed - coordinator_.BlocksNeededFor(request->FlatBlockTablesRef(), tokens_this_round)
-            : 0;
 #endif
 
     if (hybrid_prefix_cache_ && hybrid_prefix_cache_->HasMambaAdjunct() &&
@@ -360,12 +355,10 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     }
 
 #if TOKENSPEED_FLAT_KVCACHE
-    // Admission commits here (see schedulePrefillFirstChunk). No role gate is
-    // needed on the final chunk: the planning loop only calls schedulePrefill
-    // for Prefilling requests when role != kD (newForwardOperation's
-    // Is<Prefilling>() && role != kD gate), so kD can never record here.
-    if (flat_reserve_pages > 0) {
-        flat_reserved_pages_[request->Id()] = flat_reserve_pages;
+    // Admission commits here. No kD gate needed: the planning loop never calls
+    // schedulePrefill for role kD, so kD can never record a reservation here.
+    if (*flat_reserve_pages > 0) {
+        flat_reserved_pages_[request->Id()] = *flat_reserve_pages;
     }
 #endif
 
@@ -389,32 +382,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
     }
 
 #if TOKENSPEED_FLAT_KVCACHE
-    // TODO(radix-removal): the radix gate above is dead on the flat path (see
-    // schedulePrefillFirstChunk); the flat pool is gated here. Covers both the
-    // PrefillDone->Decoding reserve Acquire and each Decoding DecodeStep.
-    //
-    // Gate design (one source of page math): the gate composes the same two
-    // coordinator primitives the transition will run -- BlocksNeededFor for the
-    // Acquire, and BlocksFreedByAdvance for the SWA slide the op performs
-    // BEFORE that Acquire (slide-before-acquire; the slide's freed pages fund
-    // the step). A Decoding request gets its slide credited here with the same
-    // num_computed DecodeStep will use (TokenSize() minus the
-    // decode_input_tokens tail still pending compute); a PrefillDone request
-    // runs FinalizePrefillAndReserveDecode, which slides at the full prefill
-    // length -- credit that slide with PrefillSize() (the transition slides at
-    // window.begin + window.size, equal by its is_last_chunk condition).
-    // Outstanding decode reservations of OTHER requests are subtracted from the
-    // free count (a request consuming its own reservation is exactly what this
-    // gate admits).
-    const std::int32_t num_computed_tokens = request->Is<fsm::Decoding>()
-                                                 ? request->TokenSize() - config_.decode_input_tokens
-                                                 : request->PrefillSize();
-    const std::int32_t slide_credit =
-        coordinator_.BlocksFreedByAdvance(request->FlatBlockTablesRef(), num_computed_tokens);
-    const std::int32_t flat_blocks_needed = coordinator_.BlocksNeededFor(
-        request->FlatBlockTablesRef(), request->GetReserveNumTokensInNextScheduleEvent());
-    if (flat_blocks_needed >
-        block_pool_.NumFreeBlocks() + slide_credit - flatReservedPagesExcept(request->Id())) {
+    if (!flatAdmitDecode(request)) {
         return {};
     }
 #endif
@@ -621,22 +589,15 @@ std::optional<WriteBackOperation> Scheduler::newRetractOperation(Request* retrac
     return std::nullopt;
 }
 
-// Apply event: state transfer + resource allocation
 template <typename Event>
     requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> || std::same_as<Event, fsm::SchedulePrefillEvent>)
 static PrefillOperation applyPrefillEvent(Request* request, Event event,
                                           std::span<const std::string> flat_group_ids) {
-    // begin/size are in PAGE space: the slice of occupied_pages that is new to
-    // the REQUEST'S TABLE this round (Python copies exactly that slice into
-    // req_to_page rows [begin, begin+size)). On a first chunk with a prefix hit
-    // -- radix or flat -- the matched pages enter the table during the event
-    // (radix: PageContainer prepends the device node's prefix pages; flat:
-    // ClaimCommonPrefix appends the claimed blocks), so begin stays 0 and size
-    // COUNTS THE PREFIX: req_to_page has no rows for this request yet and needs
-    // the prefix mappings too. The op's INPUT window is token-space and comes
-    // from the state's window below (input_ids/extend_len/extend_prefix_len),
-    // which the transition already started past the hit -- the two spaces
-    // intentionally differ on a hit.
+    // begin/size are in PAGE space: the slice of occupied_pages new to the
+    // request's table this round (Python copies it into req_to_page rows). On a
+    // first-chunk prefix hit the matched pages enter the table during the event,
+    // so begin stays 0 and size counts the prefix (req_to_page needs those rows
+    // too); the op's token-space INPUT window intentionally starts past the hit.
     std::int32_t begin = static_cast<std::int32_t>(request->GetOccupiedPages().size());
     request->Apply(event);
     std::vector<std::int32_t> all_pages = request->GetOccupiedPages();
@@ -669,24 +630,20 @@ static PrefillOperation applyPrefillEvent(Request* request, Event event,
     return op;
 }
 
-// TODO(radix-removal): radix hybrid prefix-cache publishing is compile-cut on
-// the flat build (#if !TOKENSPEED_FLAT_KVCACHE below): in the flat binary these
-// op-builders are only reached by flat requests, which carry no radix device
-// node. Reachable by radix requests only in the radix build. Remove these arms
-// with the radix path.
+// TODO(radix-removal): the #if !TOKENSPEED_FLAT_KVCACHE publishing arms in these
+// op-builders are reachable only in the radix build; remove with the radix path.
 PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillFirstChunkEvent event) {
 #if !TOKENSPEED_FLAT_KVCACHE
     auto match = event.GetMatchResult();
 #endif
     auto op = applyPrefillEvent(request, std::move(event), FlatGroupIds());
 #if !TOKENSPEED_FLAT_KVCACHE
-    // Mamba fields only when adjunct is active.
     if (hybrid_prefix_cache_ && hybrid_prefix_cache_->HasMambaAdjunct()) {
         op.mamba_cow_src_idx = match.mamba_cow_src_index;
         op.mamba_branching_seqlen = match.mamba_branching_seqlen;
     }
-    // Order: attach, acquire, populate. Attach before acquire so prior-chunk
-    // tail pages commit into snapshots before Acquire's ReleaseSkipped frees them.
+    // Attach (CommitChunk) before acquire so prior-chunk tail pages commit into
+    // snapshots before Acquire's ReleaseSkipped frees them.
     if (hybrid_prefix_cache_) {
         hybrid_prefix_cache_->CommitChunk(op.request_id, const_cast<TreeNode*>(request->GetDeviceNode()));
         hybrid_prefix_cache_->AcquireForRequest(op.request_id, op.extend_prefix_len,
@@ -700,7 +657,6 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sched
 PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillEvent event) {
     auto op = applyPrefillEvent(request, std::move(event), FlatGroupIds());
 #if !TOKENSPEED_FLAT_KVCACHE
-    // Order: attach, acquire, populate (see SchedulePrefillFirstChunkEvent).
     if (hybrid_prefix_cache_) {
         hybrid_prefix_cache_->CommitChunk(op.request_id, const_cast<TreeNode*>(request->GetDeviceNode()));
         hybrid_prefix_cache_->AcquireForRequest(op.request_id, op.extend_prefix_len,
@@ -757,15 +713,13 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
         op.decode_input_id = bootstrap_token;
     }
 #if TOKENSPEED_FLAT_KVCACHE
-    // The PrefillDone->Decoding transition just ran FinalizePrefillAndReserveDecode,
-    // turning the promised decode reserve into actually-acquired pages: retire
-    // the reservation (see flat_reserved_pages_).
+    // FinalizePrefillAndReserveDecode just turned the promised decode reserve
+    // into acquired pages: retire the ledger entry.
     if (came_from_prefill_done) {
         flat_reserved_pages_.erase(op.request_id);
     }
 #endif
 #if !TOKENSPEED_FLAT_KVCACHE
-    // Order: attach, acquire, populate.
     if (hybrid_prefix_cache_) {
         if (came_from_prefill_done) {
             hybrid_prefix_cache_->CommitChunk(op.request_id, const_cast<TreeNode*>(request->GetDeviceNode()));
@@ -835,13 +789,9 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         if (req->Is<fsm::Retracted>()) return 4;
         return 9;
     };
-    // TP-determinism: tie-break on Request::Id() so the relative order within a
-    // priority class is identical across ranks. requests_ is an unordered_map
-    // keyed by string id; libstdc++ randomizes string hashing per process, so
-    // without the tiebreaker each rank visits candidates in a different order
-    // and — when token_budget / page / mamba-slot constraints are tight — picks
-    // a different subset to schedule. That made forward_op None on some ranks
-    // and non-None on others, deadlocking the next NCCL collective.
+    // TP-determinism: tie-break on Request::Id() so every rank schedules the
+    // same subset under tight budgets (string-hash order varies per process; a
+    // rank-varying forward_op deadlocks the next NCCL collective).
     std::sort(candidates.begin(), candidates.end(), [&](const auto& a, const auto& b) {
         int pa = priority(a), pb = priority(b);
         return pa != pb ? pa < pb : a->Id() < b->Id();
@@ -860,11 +810,8 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         ops.push_back(std::move(op));
     };
 #if TOKENSPEED_FLAT_KVCACHE
-    // The executor owes one ExtendResult per decode op and one per op that
-    // completes a prefill; a mid-prefill chunk op produces no event (the driver
-    // just schedules the next chunk). Record the debt so a starved round can
-    // tell "results still in flight" from a genuine starvation deadlock (see the
-    // check below the loop). Decrements live in the outside-event handlers.
+    // Increment the pending_forward_results_ ledger; mid-prefill chunk ops emit
+    // no ExtendResult, so only decode and prefill-completing ops owe one.
     auto note_result_owed = [&](Request* request) {
         if (!request->Is<fsm::Prefilling>()) {
             ++pending_forward_results_[request->Id()];
@@ -902,9 +849,8 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                 }
             }
         } else if (request->Is<fsm::PrefillDone>() || (request->Is<fsm::Decoding>() && config_.role != Role::kP)) {
-            // If mixed-batch is disabled, skip ALL decode if any prefill was scheduled this round.
-            // If mixed-batch is enabled, the priority sort puts decodes first, so this
-            // branch is reached before any prefill push.
+            // Mixed-batch disabled: skip ALL decode once a prefill was scheduled
+            // (with it enabled, the priority sort puts decodes first anyway).
             if (!config_.enable_mixed_prefill_decode && pushed_prefill) break;
 
             if (auto ev = scheduleDecode(request, simulated_free)) {
@@ -928,41 +874,14 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     }
 
 #if TOKENSPEED_FLAT_KVCACHE
-    // TODO(flat-retract): retract is unsupported on the flat path (C slice), so
-    // a pool-starved round schedules nothing; the flat admission gates deferred
-    // the requests intact and they retry when pages free up. Pages only free
-    // when a request finishes, which requires a forward result still in flight
-    // (pending_forward_results_) or a pending cache op (cache_op_tracker_). If
-    // the deferred set itself holds the pool's pages with neither pending, no
-    // free can ever arrive and the stall is permanent: fail loud instead of
-    // spinning silently, until flat retract lands.
-    //
-    // The assert requires TWO consecutive such rounds (flat_starved_rounds_):
-    // pending_forward_results_ decrements on ExtendResult but the pages free on
-    // the request's later Finish, so a single starved round observed in that
-    // gap is a false positive -- the queued Finish frees pages before the next
-    // round, which then schedules and resets the counter. A genuine deadlock
-    // stays starved and trips the assert one round later.
+    // TODO(flat-retract): a starved round is permanent once nothing in flight can free pages; fail loud until
+    // flat retract lands. Two starved rounds required before asserting (see flat_starved_rounds_).
     bool starved_this_round = false;
     if (ops.empty() && !candidates.empty()) {
-        std::size_t deferred = 0;
-        for (const Request* req : candidates) {
-            if (req->Is<fsm::Submitted>() || req->Is<fsm::PrefetchDone>() || req->Is<fsm::Prefilling>() ||
-                req->Is<fsm::PrefillDone>() || req->Is<fsm::Decoding>() || req->Is<fsm::Retracted>()) {
-                ++deferred;
-            }
-        }
-        // Block 0 is the null placeholder, never allocated: fewer than
-        // TotalBlocks()-1 free blocks means live requests hold pool pages.
-        const bool pool_pages_held = block_pool_.NumFreeBlocks() < block_pool_.TotalBlocks() - 1;
-        const bool nothing_in_flight = pending_forward_results_.empty() && cache_op_tracker_.empty();
-        // Fused-only: under PD-disagg, requests awaiting pd::Succeeded /
-        // remote-prefill events hold pages while appearing in neither ledger,
-        // so this predicate would misfire on a system PD completion unwedges.
-        if (config_.role == Role::kFused && deferred > 0 && pool_pages_held && nothing_in_flight) {
+        if (const std::optional<std::size_t> deferred = flatStarvationDeadlockRisk(candidates)) {
             starved_this_round = true;
             if (++flat_starved_rounds_ >= 2) {
-                const std::string msg = "flat pool starvation deadlock: " + std::to_string(deferred) +
+                const std::string msg = "flat pool starvation deadlock: " + std::to_string(*deferred) +
                                         " candidate(s) deferred, no request in flight to free pages; flat retract "
                                         "not yet implemented (TODO(flat-retract))";
                 _assert(false, msg.c_str());
@@ -970,7 +889,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         }
     }
     if (!starved_this_round) {
-        flat_starved_rounds_ = 0;  // any progress (or in-flight work) resets the streak
+        flat_starved_rounds_ = 0;
     }
 #else
     // If all active decode requests failed, device memory is exhausted: retract the longest one.

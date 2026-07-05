@@ -38,18 +38,12 @@ _PAGED_CACHE_GROUP_DUMMY_PAGES = 1
 
 
 def scheduler_ext_flat_kvcache() -> bool:
-    """Whether the installed tokenspeed_scheduler ext is a flat-KV-cache build.
-
-    True iff the compiled extension was built with TOKENSPEED_FLAT_KVCACHE
-    (flat KvCacheCoordinator scheduler). Failure-tolerant probe: a missing
-    package, or an older / radix-built extension without the ``FLAT_KVCACHE``
-    attribute, reports False. False must keep paged-cache group publication
-    off — the radix scheduler never populates ``flat_block_tables``, so the
-    flat CUDA-graph capture path must stay inactive against it.
+    """True iff the installed tokenspeed_scheduler ext was built with
+    TOKENSPEED_FLAT_KVCACHE. A missing package or an older / radix-built
+    ext reports False — the radix-safe default (never delivers flat tables).
     """
     try:
-        # Local import: keeps this module importable without the compiled
-        # scheduler extension (pure-spec unit tests).
+        # Local import: module must stay importable without the compiled ext.
         import tokenspeed_scheduler
     except ImportError:
         return False
@@ -61,25 +55,15 @@ def hybrid_slab_group_size(
     *,
     speculative_enabled: bool,
 ) -> Optional[int]:
-    """Group size for the hybrid slab KV layout, or None to keep the legacy
-    per-layer-buffer layout.
+    """Group size for the hybrid slab KV layout (one layer of EACH group
+    shares a K/V slab), or None to keep the legacy per-layer layout.
 
-    The slab layout (M12) shares one K/V slab between one layer from EACH
-    group (vLLM-style aliasing) and divides the memory budget by
-    layers-per-group instead of total layers -- the byte-level capacity win
-    for hybrid models. Safe only when (a) the flat scheduler ext is active
-    (single BlockPool guarantees a page id is owned by at most one group at
-    a time, so paired layers' live rows never overlap) and (b) every group
-    has the SAME layer count (equal slab fan-out). Per-layer page bytes are
-    uniform for MHA pools by construction (single head_num/head_dim/dtype).
-    This predicate is the SINGLE source for both the sizing divisor
-    (registry profile) and the buffer layout (_create_buffers) -- the two
-    must never disagree.
-
-    Unlike ``group_specs_from_layer_types`` (which raises on an unknown
-    label, since spec publication must fail loudly), an unknown label here
-    returns None: the predicate gates an optimization, so unrecognized
-    input degrades to the safe legacy layout.
+    Single source (canonical) for both the sizing divisor (registry KV
+    profile) and the buffer layout (_create_buffers) -- the two must never
+    disagree. Safe only with the flat ext (its single BlockPool owns each
+    page id by at most one group, so paired layers' live rows never
+    overlap) and equal group sizes. Unknown labels degrade to None -- the
+    predicate gates an optimization, so it must not raise.
     """
     if speculative_enabled or not scheduler_ext_flat_kvcache():
         return None
@@ -106,23 +90,9 @@ def validate_flat_scheduler_config(
     kv_pool: object,
     speculative_enabled: bool,
 ) -> None:
-    """Fail fast when a flat-built scheduler ext cannot drive this runtime setup.
-
-    Called at scheduler-config assembly, before the C++ ``Scheduler`` ctor. Two
-    misconfigurations are rejected (both no-ops on a radix build, where groups
-    are transport-only):
-
-    1. A backend that consumes paged-cache groups through the radix scheduler's
-       populate path but is not flat-group capable (``uses_paged_cache_groups``
-       without ``uses_flat_cache_groups``, e.g. DeepSeek V4/MLA). The flat build
-       compiles that path out and silently drops the specs' granularity fields,
-       so CUDA graphs would replay against stale capture placeholders — garbage
-       output with no error. The backend class flags are the same signals the
-       CUDA-graph wrapper keys its capture/replay paths off, so gating on them
-       rejects exactly the configs that would reach the broken path.
-    2. Zero published groups (spec decode gates MHA publication off; state-only
-       pools like mamba publish none). The flat Scheduler ctor would otherwise
-       die inside MakeCoordinator with no hint at the actual knob.
+    """Fail fast, before the C++ ``Scheduler`` ctor, when a flat-built ext
+    cannot drive this setup: a paged-groups backend that is not flat-group
+    capable, or zero published groups. No-op on a radix build.
     """
     if not flat_kvcache_ext:
         return
@@ -174,8 +144,7 @@ def compute_paged_cache_group_page_counts(
     max_context_len: int,
     safety_margin: int = 0,
 ) -> Dict[str, int]:
-    # Local import: keeps this module torch-free at import time so the pure
-    # spec dataclasses + group_specs_from_layer_types load without torch.
+    # Local import: keeps this module torch-free at import time.
     from tokenspeed.runtime.utils.common import ceil_div
 
     if max_live_requests < 0:

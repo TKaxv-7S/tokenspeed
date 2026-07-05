@@ -486,13 +486,9 @@ class CudaGraphWrapper:
         return out
 
     def _flat_cache_group_ids(self, pool) -> tuple[str, ...]:
-        """Group ids for flat per-group CUDA-graph capture.
-
-        Real tables arrive at replay (absolute pages, 0=hole/dummy-row pad,
-        -1=column pad, no base offsets); at capture the backend only needs the
-        group ids to allocate its persistent per-group buffers, so no
-        data-shaped placeholder tensors are fabricated here.
-        """
+        """Group ids for flat per-group CUDA-graph capture: real tables only
+        arrive at replay, so capture needs just the ids to allocate its
+        persistent per-group buffers."""
         if not getattr(self.attn_backend, "uses_flat_cache_groups", False):
             return ()
         return tuple(str(spec.group_id) for spec in pool.paged_cache_group_specs)
@@ -548,10 +544,9 @@ class CudaGraphWrapper:
             )
 
     def _idle_flat_block_tables(self, padded_bs: int) -> dict | None:
-        """Minimal per-group tables for the bs==0 idle replay of a
-        flat-captured graph: all rows are dummy rows, so a single column of
-        page-0 (the zero-initialized dummy page) entries per group is valid.
-        None when the pool publishes no groups (no flat buffers captured)."""
+        """Minimal per-group tables for the bs==0 idle replay: all rows are
+        dummy rows, so one column of page-0 entries per group is valid.
+        None when the pool publishes no groups."""
         specs = tuple(self.token_to_kv_pool.paged_cache_group_specs)
         if not specs:
             return None
@@ -566,15 +561,10 @@ class CudaGraphWrapper:
         padded_bs: int,
         pad_value: int = -1,
     ) -> dict:
-        """Pad each table with dummy ROWS up to padded_bs.
-
-        Row padding is not column padding: padded columns (beyond a row's
-        cache_seqlens) are never dereferenced and use -1, but padded rows are
-        live batch entries to the captured decode kernel (their seq_lens is 1,
-        see InputBuffers), so their entries ARE dereferenced. The flat path
-        must pass pad_value=0 to land dummy rows on the zero-initialized dummy
-        page 0; the radix/V4 path keeps -1 because it masks dummy tokens out
-        via is_valid_token before any block-table read.
+        """Pad each table with dummy ROWS up to padded_bs. Unlike -1 column
+        tails, padded rows' col-0 entry IS dereferenced (seq_lens=1): the
+        flat path passes pad_value=0 to land on the dummy page 0; radix/V4
+        keeps -1 since it masks dummy tokens before any table read.
         """
         if padded_bs <= actual_bs:
             return block_tables
@@ -612,8 +602,8 @@ class CudaGraphWrapper:
             if rows == padded_bs:
                 out[key] = off
                 continue
-            # Padded rows have no real request. Base 0 is only used before
-            # block-table lookup; the paired padded table row is invalid (-1).
+            # Base 0: padded rows have no real request; the paired padded
+            # table row is invalid (-1).
             out[key] = torch.nn.functional.pad(
                 off,
                 (0, padded_bs - rows),
@@ -676,10 +666,6 @@ class CudaGraphWrapper:
         if flat_block_tables is not None and getattr(
             self.attn_backend, "uses_flat_cache_groups", False
         ):
-            # Backend replay copy_ expects >= padded_bs rows. Dummy rows must
-            # pad with 0, not -1: they replay with seq_lens=1, so the captured
-            # kernel dereferences their col-0 entry — page 0 is the
-            # zero-initialized dummy page while -1 would gather out of bounds.
             flat_table_bs = next(
                 (
                     int(table.shape[0])
@@ -879,8 +865,6 @@ class CudaGraphWrapper:
         spec_info=None,
         paged_cache_block_tables: dict | None = None,
         paged_cache_block_table_base_offsets: dict | None = None,
-        # Threaded into both the eager path and _init_replay_metadata for flat
-        # per-group CUDA-graph capture/replay support (M10).
         flat_block_tables: dict | None = None,
     ):
         """
@@ -944,12 +928,8 @@ class CudaGraphWrapper:
                     padded_bs,
                     self.token_to_kv_pool,
                 )
-            # bs==0 idle graph on the flat path: a flat-captured graph replayed
-            # without tables raises in the backend (stale-table guard), so
-            # synthesize the minimal valid tables — every replay row is a dummy
-            # row (seq_lens=1), so one col-0 entry on the zero-initialized
-            # dummy page 0 per row suffices; the backend fills the column tail
-            # with -1 (never dereferenced past cache_seqlens).
+            # The backend's stale-table guard also covers the bs==0 idle
+            # replay: synthesize minimal valid tables for it.
             if (
                 bs == 0
                 and not flat_block_tables
@@ -995,15 +975,10 @@ class CudaGraphWrapper:
             )
 
         else:
-            # Eager parity with the replay stale-table guard: with >1
-            # published group, the backend's single-table fallback would
-            # build one table from first-group pages — wrong pages for every
-            # other group — so an eager forward (the only prefill path, and
-            # the whole decode path under enforce_eager) must carry flat
-            # tables. Idle/bs==0 forwards carry no requests and are exempt
-            # (idle ranks bypass this wrapper via model_runner.forward, but
-            # keep the exemption explicit). A single published group is a
-            # documented fallback: the single table is that group's table.
+            # Eager parity with the replay stale-table guard: with >1 group
+            # the single-table fallback would serve first-group pages to
+            # every layer. Idle/bs==0 forwards carry no requests (exempt);
+            # a single published group falls back to the single table.
             if (
                 bs > 0
                 and not ctx.forward_mode.is_idle()

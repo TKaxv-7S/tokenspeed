@@ -56,10 +56,8 @@ class PagedAttention(nn.Module):
         self.layer_id = layer_id
         self.logit_cap = logit_cap
         self.sliding_window_size = sliding_window_size or -1
-        # Flat KV-cache group this layer's KV belongs to (e.g. "full_attention" /
-        # "sliding_attention"). "" for non-group-aware layers; the backend falls
-        # back to the single table then. TODO(radix-removal): once flat is the only
-        # path and every KV layer carries a group_id, "" and the fallback go away.
+        # Flat KV-cache group ("" -> single-table fallback in the backend).
+        # TODO(radix-removal): make group_id mandatory once flat is the only path.
         self.group_id = group_id
         self.k_scale = None
         self.v_scale = None
@@ -102,22 +100,9 @@ def validate_paged_cache_group_ids(
     model: nn.Module,
     paged_cache_group_specs: Sequence,
 ) -> None:
-    """Fail fast when a multi-group paged cache meets group-unaware layers.
-
-    A pool publishing more than one paged-cache group delivers per-group flat
-    page tables keyed by group_id, so every PagedAttention layer must carry a
-    group_id from that set — otherwise the first forward dies with a KeyError
-    deep inside the backend's _select_page_table, possibly during CUDA-graph
-    capture. Single-group pools keep the documented empty-group_id fallback.
-
-    Args:
-        model: The loaded model whose PagedAttention layers to check.
-        paged_cache_group_specs: The KV pool's published group specs
-            (objects with a ``group_id`` attribute).
-
-    Raises:
-        ValueError: naming the model class and the offending layer when a
-            layer's group_id is empty or not among the published groups.
+    """Fail fast (ValueError) when a pool publishing more than one paged-cache
+    group meets a PagedAttention layer whose group_id is empty or unknown --
+    instead of a KeyError deep in the backend, possibly during graph capture.
     """
     group_ids = {str(spec.group_id) for spec in paged_cache_group_specs}
     if len(group_ids) <= 1:

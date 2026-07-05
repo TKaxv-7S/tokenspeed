@@ -287,18 +287,14 @@ def _block_tables_from_forward_op(
         key = str(key_obj)
         rows = list(table)
         if num_reqs is not None and len(rows) != num_reqs:
-            # Empty row lists get no exemption: on a live batch (num_reqs>0)
-            # a group present on the op must carry exactly num_reqs rows —
-            # silently dropping it here would hand downstream consumers (e.g.
-            # the flat CUDA-graph replay) a non-empty dict with a per-group
-            # hole over stale pages. num_reqs == 0 accepts only empty rows.
+            # No exemption for empty row lists: a silently dropped group
+            # would hand the flat CUDA-graph replay a per-group hole.
             raise ValueError(
                 f"{attr}[{key}] has {len(rows)} rows but forward op reported "
                 f"num_reqs={num_reqs}"
             )
         if not rows:
-            # Zero-request table (num_reqs None or 0, e.g. an idle/empty op):
-            # drop the group; callers treat the resulting {} as "no tables".
+            # Idle/empty op: callers treat the resulting {} as "no tables".
             continue
         max_pages = max((len(row) for row in rows), default=0)
         if max_pages == 0:
@@ -339,13 +335,9 @@ def flat_block_tables_from_forward_op(
     *,
     num_reqs: int | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Bridge the flat KV-cache per-group block tables to GPU int32 tensors.
-
-    Mirrors ``paged_cache_block_tables_from_forward_op`` but reads the flat op's
-    ``flat_block_tables`` (absolute page indices, null hole = 0, no compaction).
-    The underlying converter is value-transparent, so a 0 hole is preserved and
-    only ragged-row padding uses -1 -- there is NO base-offset companion (the
-    flat path never compacts).
+    """Bridge the flat per-group block tables to GPU int32 tensors: absolute
+    page indices, null hole = 0 preserved, ragged-row padding -1. No
+    base-offset companion -- the flat path never compacts.
     """
     return _block_tables_from_forward_op(
         forward_op,

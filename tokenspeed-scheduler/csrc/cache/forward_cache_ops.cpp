@@ -27,17 +27,17 @@ namespace tokenspeed {
 
 bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                        const CoordinatorMatch& hit, std::int32_t num_new_tokens) {
-    coordinator.ClaimCommonPrefix(tables, hit);          // pure claim, never fails
-    return coordinator.Acquire(tables, num_new_tokens);  // check-then-act
+    coordinator.ClaimCommonPrefix(tables, hit);
+    return coordinator.Acquire(tables, num_new_tokens);
 }
 
 bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                   std::span<const std::string> content_hashes, std::int32_t num_tokens,
                   std::int32_t num_full_blocks, std::int32_t num_computed_tokens) {
-    // Order is load-bearing (see forward_cache_ops.h): register the prior
-    // chunks' completed pages BEFORE punching window holes (CacheFullBlocks
-    // skips holes), and slide BEFORE Acquire so the freed pages fund this
-    // chunk (schedulePrefill's gate credits the slide in lockstep).
+    // CacheFullBlocks before AdvanceWindow: registration skips null holes, so
+    // the reverse order would lose the punched pages' hashes forever.
+    // AdvanceWindow before Acquire: the slide's freed pages fund this chunk
+    // (admission gates credit them via BlocksFreedByAdvance in lockstep).
     coordinator.CacheFullBlocks(tables, content_hashes, num_full_blocks);
     coordinator.AdvanceWindow(tables, num_computed_tokens);
     return coordinator.Acquire(tables, num_tokens);
@@ -45,10 +45,9 @@ bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tabl
 
 bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                 std::int32_t num_tokens, std::int32_t num_computed_tokens) {
-    // Slide BEFORE acquire (see forward_cache_ops.h): the pages the slide frees
-    // fund this request's own Acquire, so pool pressure cannot starve every
-    // decoding request at once. The scheduler's decode gate mirrors this order
-    // via BlocksFreedByAdvance.
+    // Slide before Acquire so a decoding request funds its own step from the
+    // pages its slide frees; the reverse order can starve every decoding
+    // request at once under pool pressure.
     coordinator.AdvanceWindow(tables, num_computed_tokens);
     return coordinator.Acquire(tables, num_tokens);
 }
@@ -56,7 +55,6 @@ bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables
 bool FinalizePrefillAndReserveDecode(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                                      std::span<const std::string> content_hashes, std::int32_t reserve_tokens,
                                      std::int32_t num_computed_tokens) {
-    // Same register -> slide -> acquire ordering as PrefillChunk (see header).
     coordinator.CacheFullBlocks(tables, content_hashes, static_cast<std::int32_t>(content_hashes.size()));
     coordinator.AdvanceWindow(tables, num_computed_tokens);
     return coordinator.Acquire(tables, reserve_tokens);
@@ -78,7 +76,7 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
 
 void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables) {
     if (tables.empty()) {
-        return;  // nothing was ever allocated, or a failure path already released the pages
+        return;  // request never got tables, or a failure path already released them
     }
     coordinator.Free(tables);
 }
