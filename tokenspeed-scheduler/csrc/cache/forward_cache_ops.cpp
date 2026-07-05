@@ -33,14 +33,12 @@ bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>&
 
 bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                   std::span<const std::string> content_hashes, std::int32_t num_tokens,
-                  std::int32_t num_full_blocks, std::int32_t num_computed_tokens) {
+                  std::int32_t num_computed_tokens) {
     // CacheFullBlocks before AdvanceWindow: registration skips null holes, so
     // the reverse order would lose the punched pages' hashes forever.
     // AdvanceWindow before Acquire: the slide's freed pages fund this chunk
     // (admission gates credit them via BlocksFreedByAdvance in lockstep).
-    _assert(num_full_blocks >= 0 && num_full_blocks <= static_cast<std::int32_t>(content_hashes.size()),
-            "num_full_blocks out of range");
-    coordinator.CacheFullBlocks(tables, content_hashes.first(static_cast<std::size_t>(num_full_blocks)));
+    coordinator.CacheFullBlocks(tables, content_hashes);
     coordinator.AdvanceWindow(tables, num_computed_tokens);
     return coordinator.Acquire(tables, num_tokens);
 }

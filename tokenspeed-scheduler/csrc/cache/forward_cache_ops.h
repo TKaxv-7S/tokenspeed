@@ -54,7 +54,7 @@ bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>&
 // allocated.
 bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                   std::span<const std::string> content_hashes, std::int32_t num_tokens,
-                  std::int32_t num_full_blocks, std::int32_t num_computed_tokens);
+                  std::int32_t num_computed_tokens);
 
 // One decode step, same register->slide->acquire shape as PrefillChunk: hash j
 // registers under slot first_page_slot + j. False = pool short, nothing allocated.

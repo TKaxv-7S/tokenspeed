@@ -169,6 +169,9 @@ void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables,
                                          std::span<const std::string> content_hashes,
                                          std::int32_t first_slot) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
+    if (content_hashes.empty()) {
+        return;  // hot decode rounds usually fill no page
+    }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         std::vector<std::string> keys = keysForGroup(content_hashes, groups_[i].GroupId());
         groups_[i].Manager().CacheFullBlocks(tables[i], keys, first_slot);

@@ -110,7 +110,8 @@ public:
     void CacheFullBlocks(BlockTable& table, std::span<const std::string> block_hashes,
                          std::int32_t first_slot = 0) {
         _assert(first_slot >= 0, "first_slot must be >= 0");
-        _assert(first_slot + static_cast<std::int32_t>(block_hashes.size()) <= table.NumBlocks(),
+        _assert(static_cast<std::int64_t>(first_slot) + static_cast<std::int64_t>(block_hashes.size()) <=
+                    table.NumBlocks(),
                 "hash range exceeds table size");
         for (std::size_t j = 0; j < block_hashes.size(); ++j) {
             CacheBlock* block = table.blocks_[static_cast<std::size_t>(first_slot) + j];

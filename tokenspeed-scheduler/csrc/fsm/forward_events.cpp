@@ -292,14 +292,13 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
     const std::vector<std::string> hashes =
         FlatWindowPageHashes(state.GetFullPagedTokens(false), state.GetPageSize(), state.window.begin,
                              state.window.size);
-    const std::int32_t num_full_blocks = static_cast<std::int32_t>(hashes.size());
     // Tokens of the prior chunks 0..k-1 (state.window is the PREVIOUS chunk);
     // the admission gate credited the pending slide with this same value.
     const std::int32_t num_computed_tokens = state.window.begin + state.window.size;
 
     auto tables = std::move(state).TakeBlockTables();
     BlockTablesGuard tables_guard{*coordinator_, tables};
-    if (!PrefillChunk(*coordinator_, tables, hashes, tokens_this_round_, num_full_blocks, num_computed_tokens)) {
+    if (!PrefillChunk(*coordinator_, tables, hashes, tokens_this_round_, num_computed_tokens)) {
         _assert(false, "flat path: allocation failure unsupported in C slice");
     }
     tables_guard.Disarm();

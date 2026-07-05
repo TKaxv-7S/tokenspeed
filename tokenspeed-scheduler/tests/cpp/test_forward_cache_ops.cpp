@@ -150,8 +150,7 @@ TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
     // num_computed = 4 (chunk 0's tokens) -> skipped = 4-4+1 = 1 -> 1/2 = 0
     // fully-slid-out pages: the slide punches nothing yet.
     std::vector<std::string> hashes2{std::string(64, 'a'), std::string(64, 'b')};
-    ASSERT_TRUE(PrefillChunk(coordinator, tables, hashes2, /*num_tokens=*/4, /*num_full_blocks=*/2,
-                             /*num_computed_tokens=*/4));
+    ASSERT_TRUE(PrefillChunk(coordinator, tables, hashes2, /*num_tokens=*/4, /*num_computed_tokens=*/4));
     EXPECT_EQ(tables[0].NumBlocks(), 4);
     EXPECT_EQ(tables[1].NumBlocks(), 4);
     for (CacheBlock* b : tables[1].Blocks()) {
@@ -177,8 +176,7 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
     // out of window: SWA slots 0,1 punched, then 2 fresh pages acquired.
     std::vector<std::string> hashes{std::string(64, 'a'), std::string(64, 'b'), std::string(64, 'c'),
                                     std::string(64, 'd')};
-    ASSERT_TRUE(PrefillChunk(coordinator, tables, hashes, /*num_tokens=*/4, /*num_full_blocks=*/4,
-                             /*num_computed_tokens=*/8));
+    ASSERT_TRUE(PrefillChunk(coordinator, tables, hashes, /*num_tokens=*/4, /*num_computed_tokens=*/8));
 
     // Full group keeps history; SWA group has holes exactly at slots 0,1.
     EXPECT_EQ(tables[0].NumBlocks(), 6);

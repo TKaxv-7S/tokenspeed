@@ -1925,6 +1925,16 @@ protected:
         tokens.insert(tokens.end(), fresh.begin(), fresh.end());
         return tokens;
     }
+
+    // Turn-3 prompt: turn 2's full 13-token stream + 3 new tokens = 16.
+    token_vec_t MakeTurnThreePrompt() {
+        token_vec_t tokens = MakeTurnTwoPrompt();
+        const token_vec_t r2_response = MakeTokens(/*count=*/3, /*start=*/201);
+        tokens.insert(tokens.end(), r2_response.begin(), r2_response.end());
+        const token_vec_t fresh = MakeTokens(/*count=*/3, /*start=*/951);
+        tokens.insert(tokens.end(), fresh.begin(), fresh.end());
+        return tokens;
+    }
 };
 
 // Test 1: the motivating hit. r2's 10-token prompt shares r1's full 8-token
@@ -2011,12 +2021,7 @@ TEST_F(FlatDecodeCachingSuite, MultiTurnConversationReusesResponsePages) {
     // full inside any request -> full group matches 6; swa (needed 16 > 6)
     // keeps its run of 6 -> fixpoint 6 common blocks = 12 hit tokens, past
     // turn 2's own 10-token prompt boundary and into r2's response (page 5).
-    token_vec_t r3_tokens = MakeTurnTwoPrompt();
-    const token_vec_t r2_response = MakeTokens(/*count=*/3, /*start=*/201);
-    r3_tokens.insert(r3_tokens.end(), r2_response.begin(), r2_response.end());
-    const token_vec_t fresh = MakeTokens(/*count=*/3, /*start=*/951);
-    r3_tokens.insert(r3_tokens.end(), fresh.begin(), fresh.end());
-    Submit(MakeSpecWithTokens("r3", r3_tokens));
+    Submit(MakeSpecWithTokens("r3", MakeTurnThreePrompt()));
 
     ExecutionPlan turn3 = PlanOnce();
     const FlatForwardOperation* op3 = FindFlatOp(turn3);
@@ -2165,12 +2170,7 @@ TEST_F(FlatDecodeCachingSuite, PoolBalanceAcrossDecodeCaching) {
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "turn 2: claimed and fresh pages all return";
 
     // Turn 3: hits 6 pages (12 tokens, test 2's derivation), one decode round.
-    token_vec_t r3_tokens = MakeTurnTwoPrompt();
-    const token_vec_t r2_response = MakeTokens(/*count=*/3, /*start=*/201);
-    r3_tokens.insert(r3_tokens.end(), r2_response.begin(), r2_response.end());
-    const token_vec_t fresh = MakeTokens(/*count=*/3, /*start=*/951);
-    r3_tokens.insert(r3_tokens.end(), fresh.begin(), fresh.end());
-    Submit(MakeSpecWithTokens("r3", r3_tokens));
+    Submit(MakeSpecWithTokens("r3", MakeTurnThreePrompt()));
     ExecutionPlan turn3 = PlanOnce();
     const FlatForwardOperation* op3 = FindFlatOp(turn3);
     ASSERT_NE(op3, nullptr);
