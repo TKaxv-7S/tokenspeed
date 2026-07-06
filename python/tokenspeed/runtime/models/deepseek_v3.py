@@ -31,6 +31,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.attention import attn_merge_state
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.embedding import apply_rope_mla
 from tokenspeed_kernel.ops.gemm.cute_dsl import (
@@ -41,7 +42,6 @@ from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm, moe_finalize_fuse_shared
-from tokenspeed_kernel.thirdparty.cuda.merge_state import merge_state
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -1003,7 +1003,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         # Causal self-attention over the new chunk tokens. q_lens == kv_lens ==
         # extend_seq_lens, so cum_seq_lens_q and cum_seq_lens_kv alias the same
         # cum_extend_seq_lens. Causal pass writes directly into output; each
-        # chunk's merge accumulates in place via merge_state(inplace=True).
+        # chunk's merge accumulates in place via attn_merge_state(inplace=True).
         num_extends = chunk_meta.extend_seq_lens.size(0)
         output_view = output.view(-1, self.num_local_heads, self.v_head_dim)
         _, accum_lse = attn_backend.forward_extend_chunked(
@@ -1070,7 +1070,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 causal=False,
             )
 
-            merge_state(
+            attn_merge_state(
                 output_view,
                 accum_lse,
                 chunk_output,

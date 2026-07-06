@@ -36,11 +36,15 @@ if platform.is_nvidia and platform.is_hopper_plus:
         out_b: torch.Tensor,
         lse_b: torch.Tensor,
         lse_scale_log2: float,
+        inplace: bool = False,
+        enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return merge_state(
             out_a,
             lse_a,
             out_b,
             lse_b,
+            inplace=inplace,
             lse_scale_log2=lse_scale_log2,
+            enable_pdl=enable_pdl,
         )
