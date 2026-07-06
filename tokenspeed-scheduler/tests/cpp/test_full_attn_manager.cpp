@@ -33,8 +33,7 @@ namespace {
 
 using token_span = std::span<const std::int32_t>;
 
-// A real BlockHashWithGroupId key for a single page, so the manager is exercised
-// with the exact string page_hasher.h emits (matches test_block_pool.cpp style).
+// A real key from page_hasher.h, not a synthetic placeholder.
 std::string RealKey(const std::vector<std::int32_t>& tokens, uint32_t group_id) {
     std::vector<token_span> pages = {token_span(tokens.data(), tokens.size())};
     std::vector<std::string> keys = ComputePagedHashesWithGroup(pages, "", group_id);
@@ -75,7 +74,6 @@ TEST(FullAttnManagerTest, MatchStopsAtFirstMiss) {
     const std::string k1 = RealKey({5, 6, 7, 8}, 0);
     const std::string k2 = RealKey({9, 9, 9, 9}, 0);
 
-    // Cache page 0 and page 1 directly through the pool.
     auto a = pool.AllocateBlocks(1);
     pool.CacheFullBlocks(a.front(), k0);
     auto b = pool.AllocateBlocks(1);
@@ -83,7 +81,6 @@ TEST(FullAttnManagerTest, MatchStopsAtFirstMiss) {
     pool.FreeBlocks(a);
     pool.FreeBlocks(b);
 
-    // k2 is never cached -> match must stop after the two hits.
     PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0, k1, k2});
     EXPECT_EQ(m.num_hit_blocks, 2);
     ASSERT_EQ(m.blocks.size(), 2u);
@@ -141,7 +138,6 @@ TEST(FullAttnManagerTest, AcquireFillsTailBeforeAllocating) {
     FullAttnManager mgr(pool, 4);
     BlockTable table;
 
-    // First acquire of 4 tokens with page_size 4 -> exactly 1 page, tail full.
     ASSERT_TRUE(mgr.Acquire(table, 4));
     EXPECT_EQ(table.NumBlocks(), 1);
     EXPECT_EQ(table.TailAvailableTokens(), 0);
@@ -153,7 +149,6 @@ TEST(FullAttnManagerTest, AcquirePartialPageLeavesTailRoom) {
     FullAttnManager mgr(pool, 4);
     BlockTable table;
 
-    // 3 tokens -> 1 page, 1 token of tail room left.
     ASSERT_TRUE(mgr.Acquire(table, 3));
     EXPECT_EQ(table.NumBlocks(), 1);
     EXPECT_EQ(table.TailAvailableTokens(), 1);
@@ -211,13 +206,11 @@ TEST(FullAttnManagerTest, CacheFullBlocksMakesPagesPrefixHittable) {
     const std::string k0 = RealKey({1, 2, 3, 4}, 0);
     const std::string k1 = RealKey({5, 6, 7, 8}, 0);
 
-    // Request A: allocate 2 full pages worth of tokens, then cache them.
     BlockTable a;
     ASSERT_TRUE(mgr.Acquire(a, 8));
     ASSERT_EQ(a.NumBlocks(), 2);
     mgr.CacheFullBlocks(a, std::vector<std::string>{k0, k1});
 
-    // Request B sees both as a prefix hit.
     PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0, k1});
     EXPECT_EQ(m.num_hit_blocks, 2);
     EXPECT_EQ(m.blocks[0]->BlockId(), a.Blocks()[0]->BlockId());
@@ -233,7 +226,6 @@ TEST(FullAttnManagerTest, CacheFullBlocksSkipsTailPage) {
     BlockTable a;
     ASSERT_TRUE(mgr.Acquire(a, 6));
     ASSERT_EQ(a.NumBlocks(), 2);
-    // Only the first (full) page is cached; one hash, slot 0.
     mgr.CacheFullBlocks(a, std::vector<std::string>{k0});
 
     PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0});
@@ -284,7 +276,6 @@ TEST(FullAttnManagerTest, FreedCachedPageStaysPrefixReusable) {
     mgr.CacheFullBlocks(a, std::vector<std::string>{k0});
     mgr.Free(a);
 
-    // Content survives free -> still prefix-hittable.
     PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0});
     EXPECT_EQ(m.num_hit_blocks, 1);
 }
@@ -295,7 +286,7 @@ TEST(FullAttnManagerTest, EndToEndTwoRequestsSharePrefix) {
     const std::string k0 = RealKey({1, 2, 3, 4}, 0);
     const std::string k1 = RealKey({5, 6, 7, 8}, 0);
 
-    // Request A: cold. No hit, allocate 2 pages, cache them, then free.
+    // Request A: cold.
     {
         PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0, k1});
         EXPECT_EQ(m.num_hit_blocks, 0);
@@ -306,7 +297,7 @@ TEST(FullAttnManagerTest, EndToEndTwoRequestsSharePrefix) {
         mgr.Free(a);
     }
 
-    // Request B: shares the [k0, k1] prefix -> 2 hits, claim them, no new alloc.
+    // Request B: shares the prefix.
     {
         PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0, k1});
         EXPECT_EQ(m.num_hit_blocks, 2);
@@ -335,9 +326,8 @@ TEST(FullAttnManagerTest, GroupIdIsolatesContent) {
     EXPECT_EQ(mgr.MatchPrefix(std::vector<std::string>{g1}).num_hit_blocks, 0);  // group 1 not cached
 }
 
-// After claiming full hit pages, tail_avail_ is 0, so the next Acquire(N>0) must
-// start a FRESH page rather than consuming phantom tail room. This is the core
-// claim->acquire interaction the prefill path depends on.
+// Claimed full pages carry tail_avail_ 0: the next Acquire must start a fresh
+// page, not consume phantom tail room.
 TEST(FullAttnManagerTest, ClaimThenAcquireStartsFreshPage) {
     BlockPool pool(8);
     FullAttnManager mgr(pool, 4);
@@ -352,7 +342,6 @@ TEST(FullAttnManagerTest, ClaimThenAcquireStartsFreshPage) {
     ASSERT_EQ(table.NumBlocks(), 1);
     ASSERT_EQ(table.TailAvailableTokens(), 0);
 
-    // 3 fresh tokens -> one NEW page (not packed into the full hit page).
     ASSERT_TRUE(mgr.Acquire(table, 3));
     EXPECT_EQ(table.NumBlocks(), 2);
     EXPECT_EQ(table.TailAvailableTokens(), 1);
@@ -377,11 +366,8 @@ TEST(FullAttnManagerTest, ClaimHitBlocksOnNonEmptyTableAsserts) {
     EXPECT_THROW(mgr.ClaimHitBlocks(table, empty), std::runtime_error);
 }
 
-// The page-hash chain links each page's key to the prior page's hash. Two
-// prefixes that share an identical SECOND page but differ in the first must
-// therefore produce different second-page keys -- a request with a different
-// page 1 cannot prefix-hit a cached page 2. This guards against a cross-prefix
-// cache collision the single-page RealKey tests cannot reach.
+// The chain links each page's key to the prior page's hash: an identical second
+// page after a different first page yields a different key.
 TEST(FullAttnManagerTest, ChainedPriorPreventsSecondPageCollision) {
     BlockPool pool(8);
     FullAttnManager mgr(pool, 4);
@@ -396,20 +382,15 @@ TEST(FullAttnManagerTest, ChainedPriorPreventsSecondPageCollision) {
     std::vector<std::string> keys_b = ComputePagedHashesWithGroup(pages_b, "", 0);
     ASSERT_EQ(keys_a.size(), 2u);
     ASSERT_EQ(keys_b.size(), 2u);
-    // Same second-page tokens, different prior -> different chained key.
     EXPECT_NE(keys_a[1], keys_b[1]);
 
-    // Request A caches both of its pages.
     BlockTable a;
     ASSERT_TRUE(mgr.Acquire(a, 8));
     mgr.CacheFullBlocks(a, keys_a);
 
-    // Request B shares the second page's tokens but has a different first page;
-    // page 1 misses, so the walk stops at zero -- it must not reach page 2.
     PrefixMatch miss = mgr.MatchPrefix(keys_b);
     EXPECT_EQ(miss.num_hit_blocks, 0);
 
-    // Sanity: the identical prefix still hits both pages.
     PrefixMatch hit = mgr.MatchPrefix(keys_a);
     EXPECT_EQ(hit.num_hit_blocks, 2);
 }

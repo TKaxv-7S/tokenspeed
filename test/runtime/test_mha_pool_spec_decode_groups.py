@@ -1,19 +1,13 @@
 """MHA pool paged-cache group publication vs ext build flavor + spec decode.
 
-Rule under test (kv_cache/mha.py): the pool publishes paged_cache_group_specs
-iff the tokenspeed_scheduler ext is flat-built (TOKENSPEED_FLAT_KVCACHE) AND
-speculative decoding is off. A radix-built (default) ext never populates
-flat_block_tables, so publication must stay off for it — otherwise CUDA-graph
-capture binds flat per-group buffers to tables that never arrive. Spec decode
-must publish NOTHING either (no flat capture kwarg, overlap schedule
-unaffected). With a flat ext and no spec decode, hybrid models keep their two
-groups and plain models keep the single full-history group the flat scheduler
-build allocates from.
+Rule under test (kv_cache/mha.py): the pool publishes
+paged_cache_group_specs iff the tokenspeed_scheduler ext is flat-built
+(TOKENSPEED_FLAT_KVCACHE) AND speculative decoding is off; radix builds and
+spec decode publish nothing.
 
 The installed ext's real build flavor must not decide these tests, so the
 scheduler_ext_flat_kvcache probe is patched per case; the probe's own
-default-False behavior (older ext without the attribute, missing package) is
-covered separately.
+default-False behavior is covered separately.
 """
 
 from __future__ import annotations
@@ -72,16 +66,14 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
             enable_alt_stream=False,
         )
         kwargs.update(overrides)
-        # The pool resolves the probe lazily at construction time, so patching
-        # the module attribute pins the ext flavor regardless of what is
-        # actually installed (the container ships a radix-built ext).
+        # The pool resolves the probe lazily at construction time; patching
+        # the module attribute pins the ext flavor regardless of the install.
         with mock.patch(_FLAT_PROBE, return_value=flat_ext):
             return self.MHATokenToKVPool(**kwargs)
 
     def test_plain_no_spec_publishes_single_full_group(self):
-        # llama/qwen shape: empty layer_types. The flat scheduler build
-        # allocates pages only through configured groups, so the single
-        # full-history group must stay published.
+        # The flat scheduler allocates pages only through configured groups,
+        # so plain models must keep the single full-history group published.
         pool = self._pool()
         self.assertEqual(len(pool.paged_cache_group_specs), 1)
         spec = pool.paged_cache_group_specs[0]
@@ -91,8 +83,7 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
 
     def test_hybrid_no_spec_publishes_two_groups(self):
         # layer_num must match len(layer_types): the M12 slab layout's
-        # pairing-completeness assert cross-checks them (the old fixture's
-        # 4-types/2-layers mismatch was silently tolerated pre-M12).
+        # pairing-completeness assert cross-checks them.
         pool = self._pool(
             layer_types=GPT_OSS_LAYER_TYPES,
             sliding_window_tokens=128,
@@ -108,10 +99,8 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
         )
 
     def test_spec_decode_plain_publishes_no_groups(self):
-        # eagle3 on llama/qwen: publishing a group would (a) hand the CUDA
-        # graph wrapper flat capture group ids — the backend asserts on the
-        # flat_cache_group_ids capture kwarg with spec_num_tokens > 1, (b)
-        # silently disable overlap scheduling via should_use_overlap_schedule.
+        # Publishing under spec decode would trip the backend's capture
+        # assert and silently disable overlap scheduling.
         pool = self._pool(speculative_enabled=True)
         self.assertEqual(pool.paged_cache_group_specs, ())
         self.assertEqual(pool.paged_cache_group_page_counts, {})
@@ -126,11 +115,8 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
         self.assertEqual(pool.paged_cache_group_page_counts, {})
 
     def test_radix_ext_plain_publishes_no_groups(self):
-        # Radix-built ext: the scheduler never fills flat_block_tables
-        # (MaybeFillFlatBlockTables is a no-op), so publication must stay off
-        # or CUDA-graph capture would bind flat buffers that never get fresh
-        # tables and the backend replay guard would raise on the first graph
-        # decode.
+        # A radix scheduler never fills flat_block_tables, so publication
+        # must stay off or graph capture binds buffers that never refresh.
         pool = self._pool(flat_ext=False)
         self.assertEqual(pool.paged_cache_group_specs, ())
         self.assertEqual(pool.paged_cache_group_page_counts, {})
@@ -179,9 +165,7 @@ class SchedulerExtFlatKvcacheProbeTest(unittest.TestCase):
             self.assertFalse(self.probe())
 
     def test_older_ext_without_attribute_defaults_false(self):
-        # Pre-FLAT_KVCACHE extensions (e.g. an already-installed radix build)
-        # lack the attribute entirely; the getattr default keeps them on the
-        # radix-safe no-publication path.
+        # Pre-FLAT_KVCACHE extensions lack the attribute entirely.
         fake = types.ModuleType("tokenspeed_scheduler")
         with mock.patch.dict(sys.modules, {"tokenspeed_scheduler": fake}):
             self.assertFalse(self.probe())

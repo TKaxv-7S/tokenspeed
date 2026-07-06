@@ -1,15 +1,10 @@
-"""M11 Task 1: flat per-group KV write-location derivation tests (eager).
+"""M11: flat per-group KV write-location derivation tests.
 
-CPU-only (plain tensors): covers the pure loc-computation helpers (decode
-gather at position seq_len-1, extend positions [prefix, seq) flattened in
-request order), the TOKENSPEED_FLAT_DEBUG write-invariant checker, and the
-eager init_forward_metadata assembly that hangs out_cache_locs off both
-metadata dataclasses. M11 Task 2 adds the write-routing seams here too:
-_select_out_cache_loc (mirror of _select_page_table), the public
-select_out_cache_loc for out-of-backend prewriters, and the base-backend
-identity hook. M11 Task 3 adds the CUDA-graph seam: persistent per-group
-loc buffers allocated at capture (metadata holds views) and recomputed
-from the persistent page tables at replay.
+CPU-only (plain tensors): the pure loc-computation helpers, the
+TOKENSPEED_FLAT_DEBUG write-invariant checker, the eager
+init_forward_metadata assembly, the _select_out_cache_loc /
+select_out_cache_loc routing seams, and the CUDA-graph persistent
+per-group loc buffers (capture views, replay recompute).
 """
 
 from __future__ import annotations
@@ -282,8 +277,8 @@ class InitForwardMetadataAssemblyTest(_MHACase):
 
 
 class SelectOutCacheLocTest(_MHACase):
-    """Task 2 routing: _select_out_cache_loc mirrors _select_page_table's
-    fallback ladder, and the public select_out_cache_loc serves prewrite."""
+    """_select_out_cache_loc mirrors _select_page_table's fallback ladder;
+    the public select_out_cache_loc serves prewrite."""
 
     def setUp(self):
         super().setUp()
@@ -365,13 +360,9 @@ _GROUP_IDS = ("sliding_attention", "full_attention")
 
 
 class GraphLocBuffersTest(_MHACase):
-    """M11 Task 3: persistent per-group write-loc buffers for CUDA graphs.
-
-    Real capture/replay methods on a __init__-bypassed backend, mirroring
-    _BackendCase in test_flat_cudagraph_per_group.py. Pointer-fixing
-    contract: capture hands metadata VIEWS of persistent loc buffers;
-    replay only copy_'s recomputed locs into them.
-    """
+    """Persistent per-group write-loc buffers for CUDA graphs: capture hands
+    metadata VIEWS of persistent buffers; replay only copy_'s recomputed
+    locs into them."""
 
     def setUp(self):
         super().setUp()
@@ -380,17 +371,14 @@ class GraphLocBuffersTest(_MHACase):
         backend.spec_num_tokens = 1
         backend.is_draft = False
         backend.max_num_pages = MAX_NUM_PAGES
-        # Replay recomputes locs from the persistent tables using the
-        # backend's page_size.
         backend.page_size = PAGE
         backend.device = "cpu"
         backend.cuda_graph_decode_metadata = {}
         backend.cuda_graph_page_table = torch.zeros(
             (MAX_BS, MAX_NUM_PAGES), dtype=torch.int32
         )
-        # Stands in for the controller's seq_lens_buf that the backend
-        # aliases in init_cuda_graph_state; tests pre-write it before
-        # replay exactly like the wrapper's input prep does.
+        # Stand-in for the controller's seq_lens_buf; tests pre-write it
+        # before replay exactly like the wrapper's input prep does.
         backend.cuda_graph_seq_lens = torch.ones(MAX_BS, dtype=torch.int32)
         backend.cuda_graph_flat_page_tables = {}
         backend.cuda_graph_flat_out_cache_locs = {}
@@ -411,8 +399,8 @@ class GraphLocBuffersTest(_MHACase):
     def _replay(self, bs, flat_block_tables=None, seq_lens=None):
         torch = self.torch
         if seq_lens is not None:
-            # Wrapper contract: input prep writes the current step's lens
-            # (dummy tail = 1) into seq_lens_buf BEFORE replay runs.
+            # Wrapper contract: input prep writes the step's lens (dummy
+            # tail = 1) into seq_lens_buf BEFORE replay runs.
             self.backend.cuda_graph_seq_lens[: len(seq_lens)] = torch.tensor(
                 seq_lens, dtype=torch.int32
             )

@@ -143,8 +143,7 @@ class WrapperReplayFlatTest(_TorchCase):
                 init_forward_metadata_replay_cuda_graph=record,
             ),
             draft_attn_backend=None,
-            # Real helper: the test pins the call site's pad_value, so the
-            # padding itself must be the production implementation.
+            # Production helper, so the pinned pad_value is the real one.
             _pad_block_tables_to_padded_bs=(
                 CudaGraphWrapper._pad_block_tables_to_padded_bs
             ),
@@ -391,8 +390,7 @@ class _BackendCase(_TorchCase):
             (MAX_BS, MAX_NUM_PAGES), dtype=torch.int32
         )
         # seq_lens 1 (never 0): flat replay recomputes write locs from these
-        # (M11), and seq_len 0 would gather at position -1. 1 matches the
-        # dummy-row pad contract.
+        # (M11), and seq_len 0 would gather at position -1.
         backend.cuda_graph_seq_lens = torch.ones(MAX_BS, dtype=torch.int32)
         backend.cuda_graph_flat_page_tables = {}
         backend.cuda_graph_flat_out_cache_locs = {}
@@ -499,9 +497,8 @@ class BackendReplayFlatTest(_BackendCase):
             self.assertTrue((buf[2:] == 0).all())
 
     def test_padded_replay_dummy_rows_land_on_page_zero(self):
-        # Wrapper row-pads flat tables with 0 before a padded replay; after
-        # the backend's column-tail fill_(-1), a dummy row is [0, ..., -1s].
-        # Only col 0 is read for dummy rows (seq_lens=1) -> dummy page 0.
+        # After the wrapper's 0-row-pad and the backend's column fill_(-1),
+        # a dummy row reads only col 0 (seq_lens=1) -> dummy page 0.
         torch = self.torch
         from tokenspeed.runtime.execution.cuda_graph_wrapper import (
             CudaGraphWrapper,

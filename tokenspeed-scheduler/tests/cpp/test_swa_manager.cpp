@@ -34,16 +34,13 @@ namespace {
 
 using token_span = std::span<const std::int32_t>;
 
-// A real BlockHashWithGroupId key for a single page (matches test_block_pool /
-// test_full_attn_manager style).
 std::string RealKey(const std::vector<std::int32_t>& tokens, uint32_t group_id) {
     std::vector<token_span> pages = {token_span(tokens.data(), tokens.size())};
     std::vector<std::string> keys = ComputePagedHashesWithGroup(pages, "", group_id);
     return keys.front();
 }
 
-// Cache one full page directly through the pool and return to the free list so a
-// later MatchPrefix can prefix-hit it. Returns the physical block.
+// Cache then free, so the page is prefix-hittable via MatchPrefix.
 CacheBlock* CacheOnePage(BlockPool& pool, const std::string& key) {
     std::vector<CacheBlock*> got = pool.AllocateBlocks(1);
     pool.CacheFullBlocks(got.front(), key);
@@ -93,11 +90,8 @@ TEST(SwaManagerTest, MatchStopsAfterContiguousNeededFromRight) {
 }
 
 TEST(SwaManagerTest, BoundedMatchEnforcesRunAgainstBoundedEnd) {
-    // page_size 4, window 10 -> contiguous_needed 3. Cached: h2,h3,h4 (a tail
-    // 3-run). Unbounded: keep 5 = [NULL,NULL,b2,b3,b4]. Bounded to 4 the run
-    // {2,3} is too short and pages 0,1 are holes -> NO valid match of length
-    // <= 4 exists, so the bounded overload returns empty (it must re-run the
-    // scan on the first 4 hashes, never chop the unbounded result).
+    // Tail 3-run {2,3,4}. Bounded to 4 the run {2,3} < contiguous_needed 3 with
+    // holes at 0,1 -> the bounded overload re-scans and returns empty.
     BlockPool pool(16);
     SwaManager mgr(pool, 4, 10);
     std::string h0 = RealKey({0, 0, 0, 0}, 0);
@@ -129,8 +123,7 @@ TEST(SwaManagerTest, MatchTrimsTailAfterWindow) {
     CacheBlock* b0 = CacheOnePage(pool, h0);
     CacheBlock* b2 = CacheOnePage(pool, h2);  // h1 left uncached
 
-    // Right->left: h2 hits first, run reaches 1 (>=1), stop at run_end = 2.
-    // keep [0..2]: blocks[0]=NULL, blocks[1]=NULL(h1 miss), blocks[2]=b2.
+    // Right->left: h2 hits, run 1 >= contiguous_needed -> keep [0..2].
     PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{h0, h1, h2});
     ASSERT_EQ(m.blocks.size(), 3u);
     EXPECT_TRUE(m.blocks[0]->IsNull());
@@ -149,8 +142,7 @@ TEST(SwaManagerTest, MatchAcceptsRunShorterThanContiguousNeeded) {
     CacheBlock* b0 = CacheOnePage(pool, h0);
     CacheBlock* b1 = CacheOnePage(pool, h1);
 
-    // Right->left: h1 hit (run 1), h0 hit (run 2), reach left end without hitting 3.
-    // run > 0 -> accept. run_end = 1, keep [0..1] = [b0, b1].
+    // Run reaches the left end at 2 < 3; run > 0 -> accept, keep [b0, b1].
     PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{h0, h1});
     ASSERT_EQ(m.blocks.size(), 2u);
     EXPECT_EQ(m.blocks[0]->BlockId(), b0->BlockId());
@@ -159,10 +151,8 @@ TEST(SwaManagerTest, MatchAcceptsRunShorterThanContiguousNeeded) {
 }
 
 TEST(SwaManagerTest, MatchRequiresContiguityNotAnyHit) {
-    // contiguous_needed 3 (window 10, ps 4). Layout: h0,h1 cached, h2 miss,
-    // h3,h4 cached. Right->left: h4(run1),h3(run2),h2 miss-> reset; h1(run1),
-    // h0(run2), end. No run reaches 3, so the surviving run is the LEFT one
-    // (h0,h1): run_end = 1, keep [0..1] = [b0, b1], num_hit_blocks = 2.
+    // h2 miss splits runs {h3,h4} and {h0,h1}; neither reaches 3, so the
+    // surviving run is the LEFT one: keep [0..1] = [b0, b1].
     BlockPool pool(16);
     SwaManager mgr(pool, 4, 10);
     std::string h0 = RealKey({0, 0, 0, 0}, 0);
@@ -196,7 +186,6 @@ TEST(SwaManagerTest, MatchDoesNotChangeRefCount) {
 }
 
 TEST(SwaManagerTest, ClaimHitBlocksSkipsNullHoles) {
-    // Build an SWA hit [NULL, b1, b2, b3] and claim it.
     BlockPool pool(16);
     SwaManager mgr(pool, 4, 10);  // contiguous_needed = 3
     std::string h0 = RealKey({0, 0, 0, 0}, 0);
@@ -216,14 +205,12 @@ TEST(SwaManagerTest, ClaimHitBlocksSkipsNullHoles) {
     BlockTable table;
     mgr.ClaimHitBlocks(table, m);
 
-    // Table keeps all 4 slots (hole preserved for logical-page alignment).
+    // The null hole is preserved to keep logical-page slot alignment.
     EXPECT_EQ(table.NumBlocks(), 4);
     EXPECT_TRUE(table.Blocks()[0]->IsNull());
-    // Only the 3 real blocks were claimed.
     EXPECT_EQ(b1->RefCount(), 1);
     EXPECT_EQ(b2->RefCount(), 1);
     EXPECT_EQ(b3->RefCount(), 1);
-    // Free count dropped by exactly the 3 real hits, not the hole.
     EXPECT_EQ(pool.NumFreeBlocks(), free_before - 3);
 }
 
@@ -282,9 +269,8 @@ TEST(BlockTableTest, EvictToNullIsIdempotentOnNullSlot) {
 }
 
 TEST(SwaManagerTest, AdvanceWindowMirrorsVllmBoundarySequence) {
-    // Mirrors vLLM test_sliding_window_remove_skipped_blocks: block_size=2,
-    // sliding_window=4. skipped = max(0, n - 4 + 1) = max(0, n - 3);
-    // skipped_blocks = skipped / 2.
+    // Mirrors vLLM test_sliding_window_remove_skipped_blocks.
+    // skipped = max(0, n - 4 + 1); skipped_blocks = skipped / 2.
     BlockPool pool(32);
     SwaManager mgr(pool, /*page_size=*/2, /*sliding_window=*/4);
     BlockTable table;
@@ -311,8 +297,7 @@ TEST(SwaManagerTest, AdvanceWindowMirrorsVllmBoundarySequence) {
     EXPECT_FALSE(table.Blocks()[1]->IsNull());
     EXPECT_EQ(pool.NumFreeBlocks(), free_before5 + 1);  // p0 returned
 
-    // n=6: skipped 3, blocks 1 -> page 1 still has an in-window token; page 0
-    // already null -> no change.
+    // n=6: skipped 3, blocks 1 -> page 1 still in window; no change.
     mgr.AdvanceWindow(table, 6);
     EXPECT_TRUE(table.Blocks()[0]->IsNull());
     EXPECT_FALSE(table.Blocks()[1]->IsNull());
@@ -352,8 +337,7 @@ TEST(SwaManagerTest, AdvanceWindowCapsToAllocatedBlocks) {
     SwaManager mgr(pool, 4, 4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(table, 8));  // 2 pages
-    // Huge num_computed_tokens -> skipped_blocks would exceed NumBlocks(); must
-    // cap and not go out of bounds.
+    // skipped_blocks would exceed NumBlocks(); must cap, not go out of bounds.
     mgr.AdvanceWindow(table, 1000);
     EXPECT_TRUE(table.Blocks()[0]->IsNull());
     EXPECT_TRUE(table.Blocks()[1]->IsNull());
@@ -361,14 +345,8 @@ TEST(SwaManagerTest, AdvanceWindowCapsToAllocatedBlocks) {
 }
 
 TEST(SwaManagerTest, AdvanceWindowEvictsFirstSlidOutFirst) {
-    // page_size 2, window 4. Free pages 0 and 1, then the next allocation should
-    // reuse page 0 (the first slid out) before page 1.
-    // Pool is sized to exactly fit the 4 acquired pages (+1 null block) so the
-    // free list is empty after Acquire; the only blocks the next AllocateBlocks
-    // can hand back are the just-freed pages. This exposes the FIFO order *among*
-    // the freed batch -- with a larger pool, pre-existing free blocks at the LRU
-    // head would be handed out first and the FIFO-among-freed property would be
-    // unobservable (freed blocks return to the free-list tail, reused last).
+    // Pool sized to exactly the 4 acquired pages (+1 null): the free list is empty
+    // after Acquire, so the next allocation must expose FIFO order among the freed batch.
     BlockPool pool(5);
     SwaManager mgr(pool, 2, 4);
     BlockTable table;
@@ -379,7 +357,6 @@ TEST(SwaManagerTest, AdvanceWindowEvictsFirstSlidOutFirst) {
     ASSERT_TRUE(table.Blocks()[0]->IsNull());
     ASSERT_TRUE(table.Blocks()[1]->IsNull());
 
-    // Next single allocation reuses the first-slid-out page (p0).
     std::vector<CacheBlock*> reused = pool.AllocateBlocks(1);
     ASSERT_EQ(reused.size(), 1u);
     EXPECT_EQ(reused.front()->BlockId(), p0->BlockId());
@@ -392,14 +369,12 @@ TEST(SwaManagerTest, AdvanceWindowFreedCachedPageStaysPrefixReusable) {
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(table, 8));  // 4 pages
     const std::string h0 = RealKey({1, 1}, 0);
-    // Register page 0's content so it carries a hash.
     mgr.CacheFullBlocks(table, std::vector<std::string>{h0});
     CacheBlock* p0 = table.Blocks()[0];
     EXPECT_TRUE(p0->IsCached());
 
     mgr.AdvanceWindow(table, 8);  // frees pages 0,1; p0 returns with hash intact
     EXPECT_TRUE(table.Blocks()[0]->IsNull());
-    // The freed-but-cached page is still prefix-hittable.
     EXPECT_EQ(pool.GetCachedBlock(h0), p0);
 }
 
@@ -415,9 +390,7 @@ TEST(SwaManagerTest, AdvanceWindowLeavesTailAvailUnchanged) {
 }
 
 TEST(SwaManagerTest, AcquireAdvancePairingKeepsPhysicalPagesBounded) {
-    // Steady state: repeatedly Acquire one page worth of tokens then AdvanceWindow.
-    // page_size 2, window 4 -> active physical pages should stay bounded around
-    // ceil(window/page_size)=2, not grow without limit.
+    // Steady state: active pages stay bounded near ceil(window/page_size) = 2.
     BlockPool pool(64);
     SwaManager mgr(pool, 2, 4);
     BlockTable table;
@@ -428,8 +401,6 @@ TEST(SwaManagerTest, AcquireAdvancePairingKeepsPhysicalPagesBounded) {
         ASSERT_TRUE(mgr.Acquire(table, 2));
         mgr.AdvanceWindow(table, n);
     }
-    // Active (non-free) physical pages = baseline_free - current_free. With a
-    // 4-token window over page_size 2, at most ~2-3 pages are ever live.
     std::int32_t active = baseline_free - pool.NumFreeBlocks();
     EXPECT_LE(active, 3);
     // The table itself grows (holes accumulate), but physical pages are bounded.

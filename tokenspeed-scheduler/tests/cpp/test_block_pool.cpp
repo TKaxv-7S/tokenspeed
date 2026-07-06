@@ -32,8 +32,7 @@ namespace {
 
 using token_span = std::span<const std::int32_t>;
 
-// A real BlockHashWithGroupId key, so the pool is exercised with the exact
-// string page_hasher.h emits (not a synthetic placeholder).
+// A real key from page_hasher.h, not a synthetic placeholder.
 std::string RealKey(const std::vector<std::int32_t>& tokens, uint32_t group_id) {
     std::vector<token_span> pages = {token_span(tokens.data(), tokens.size())};
     std::vector<std::string> keys = ComputePagedHashesWithGroup(pages, "", group_id);
@@ -108,17 +107,15 @@ TEST(BlockPoolTest, CachedFreeBlockSurvivesAndIsReusable) {
     pool.CacheFullBlocks(b, key);
     EXPECT_TRUE(b->IsCached());
 
-    // Free it: ref_cnt -> 0 but content is retained (the middle state).
     pool.FreeBlocks({b});
     EXPECT_EQ(b->RefCount(), 0);
     EXPECT_TRUE(b->IsCached());
     EXPECT_EQ(pool.NumCachedFreeBlocks(), 1);
 
-    // A prefix lookup on the same key still finds it.
     CacheBlock* hit = pool.GetCachedBlock(key);
     ASSERT_EQ(hit, b);
 
-    // Touching revives it out of the free queue at zero KV recompute cost.
+    // TouchBlock revives it out of the free queue.
     pool.TouchBlock(hit);
     EXPECT_EQ(hit->RefCount(), 1);
     EXPECT_EQ(pool.NumFreeBlocks(), 6);
@@ -153,8 +150,7 @@ TEST(BlockPoolTest, GroupIdDistinguishesSameContent) {
 }
 
 TEST(BlockPoolTest, EvictionDropsCachedContentWhenReused) {
-    // 2 blocks total -> 1 free after null reservation. Forcing reuse of that
-    // single block must evict its old cached content from the lookup map.
+    // 1 usable block: reusing it must evict its old cached content from the map.
     BlockPool pool(2);
     const std::string key = RealKey({1, 2, 3, 4}, 0);
 
@@ -164,7 +160,6 @@ TEST(BlockPoolTest, EvictionDropsCachedContentWhenReused) {
     pool.FreeBlocks({b});                       // cached + free
     EXPECT_EQ(pool.GetCachedBlock(key), b);
 
-    // Re-allocate the only block: it gets reused, old content evicted.
     auto second = pool.AllocateBlocks(1);
     EXPECT_EQ(second.front(), b);               // same physical block reused
     EXPECT_FALSE(b->IsCached());
@@ -180,12 +175,10 @@ TEST(BlockPoolTest, EvictionPrefersLeastRecentlyFreed) {
     CacheBlock* b1 = blocks[1];
     CacheBlock* b2 = blocks[2];
 
-    // Free in order b0, b1, b2 -> b0 is least-recently-freed (eviction head).
     pool.FreeBlocks({b0});
     pool.FreeBlocks({b1});
     pool.FreeBlocks({b2});
 
-    // Next single allocation should reuse b0 (the LRU head).
     auto next = pool.AllocateBlocks(1);
     EXPECT_EQ(next.front(), b0);
 }

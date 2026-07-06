@@ -1,19 +1,12 @@
 """hybrid_slab_group_size: the single activation predicate for the unified
-KV slab pool (M12).
+KV slab pool (M12), and its two consumers (registry sizing divisor and
+MHATokenToKVPool buffer layout).
 
-Rule under test (configs/paged_cache_spec.py): the predicate returns the
-common layers-per-group count exactly when the hybrid slab layout may
-activate — flat scheduler ext, no spec decode, >= 2 known groups of EQUAL
-size — and None for every other input, which keeps the legacy per-layer
-buffer layout. Both the sizing divisor (registry profile) and the buffer
-layout (_create_buffers) consume this one function, so its gating IS the
-activation contract.
-
-The installed ext's real build flavor must not decide these tests, so the
-scheduler_ext_flat_kvcache probe is patched per case. The predicate looks
-the probe up as a module global at call time, so the patch targets the name
-inside the path-loaded module's own namespace (patching the import source
-package would miss it).
+The predicate returns the common layers-per-group count exactly when the
+slab layout may activate (flat ext, no spec decode, >= 2 equal-size known
+groups) and None otherwise (legacy per-layer layout). The installed ext's
+real build flavor must not decide these tests, so the
+scheduler_ext_flat_kvcache probe is patched per case.
 """
 
 from __future__ import annotations
@@ -67,9 +60,8 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
 
     @contextlib.contextmanager
     def _flat_ext(self, value: bool):
-        # The predicate resolves scheduler_ext_flat_kvcache as a module
-        # global at call time; patch it in the loaded module's namespace so
-        # the interception actually lands.
+        # The predicate resolves the probe from its own module globals at
+        # call time, so the patch must target the path-loaded module.
         with mock.patch.object(
             _pcs, "scheduler_ext_flat_kvcache", return_value=value
         ):
@@ -86,8 +78,6 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             )
 
     def test_none_when_radix_ext(self):
-        # Radix/older ext: no flat BlockPool single-ownership guarantee, so
-        # paired layers' live rows could overlap -> keep legacy layout.
         with self._flat_ext(False):
             self.assertIsNone(
                 hybrid_slab_group_size(
@@ -96,8 +86,6 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             )
 
     def test_none_when_speculative(self):
-        # Spec decode gates paged-cache group publication off entirely; the
-        # slab layout depends on the flat group machinery being live.
         with self._flat_ext(True):
             self.assertIsNone(
                 hybrid_slab_group_size(
@@ -106,7 +94,6 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             )
 
     def test_none_when_single_group(self):
-        # All-full (llama/qwen shape): one group, nothing to pair, no win.
         with self._flat_ext(True):
             self.assertIsNone(
                 hybrid_slab_group_size(
@@ -115,7 +102,6 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             )
 
     def test_none_when_unequal_groups(self):
-        # 8 sliding + 16 full: unequal fan-out, no clean layer pairing.
         lt = ("sliding_attention",) * 8 + ("full_attention",) * 16
         with self._flat_ext(True):
             self.assertIsNone(
@@ -123,11 +109,8 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             )
 
     def test_none_when_unknown_label(self):
-        # Unknown label -> None, NOT a raise. Asymmetry with
-        # group_specs_from_layer_types (which raises ValueError) is
-        # deliberate: the predicate gates an OPTIMIZATION, so unknown input
-        # degrades to the safe legacy layout, while spec publication must
-        # fail loudly.
+        # Unknown input degrades to None (safe legacy layout), never raises;
+        # loud rejection is group_specs_from_layer_types' job.
         lt = GPT_OSS_LAYER_TYPES + ("banana_attention",)
         with self._flat_ext(True):
             self.assertIsNone(
@@ -135,8 +118,7 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             )
 
     def test_none_when_empty(self):
-        # Plain models pass empty/None layer_types; both mean "no hybrid
-        # grouping" and must keep the legacy layout.
+        # Plain models pass empty or None layer_types.
         with self._flat_ext(True):
             self.assertIsNone(
                 hybrid_slab_group_size((), speculative_enabled=False)
@@ -146,8 +128,7 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             )
 
     def test_none_when_multi_window_sequence(self):
-        # 多种 sliding window:slab 的 1:1 配对布局未按 (retention, window)
-        # 组划分,保守退 legacy(M14 spec §2.3)。
+        # 多种 sliding window:保守退 legacy(M14 spec §2.3)。
         with self._flat_ext(True):
             it = itertools.cycle((4, 512))
             windows = [
@@ -178,7 +159,6 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             )
 
     def test_scalar_window_stays_active(self):
-        # 今日两个消费点传的都是标量/None:行为逐字节不变。
         with self._flat_ext(True):
             self.assertEqual(
                 hybrid_slab_group_size(
@@ -190,8 +170,7 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             )
 
     def test_none_when_window_sequence_length_mismatch(self):
-        # 谓词永不 raise(门控优化);畸形输入按 None 降级,守卫由
-        # group_specs_from_layer_types 在发布点响亮报错。
+        # 谓词永不 raise;畸形输入按 None 降级。
         with self._flat_ext(True):
             self.assertIsNone(
                 hybrid_slab_group_size(
@@ -202,8 +181,7 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             )
 
     def test_garbage_elements_ignored_not_raised(self):
-        # 非 int 元素被忽略(发布点守卫才响亮报错);谓词只看
-        # 有效 window 的 distinct 数,且永不 raise。
+        # 谓词只看有效 window 的 distinct 数,非 int 元素被忽略。
         with self._flat_ext(True):
             self.assertEqual(
                 hybrid_slab_group_size(
@@ -216,19 +194,11 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
 
 
 class KvProfileLayerDivisorTest(unittest.TestCase):
-    """Registry-side sizing consumer (M12 Task 2): _kv_profile_layer_divisor
-    must charge layers-per-group exactly when the predicate activates, and
-    all layers otherwise. The helper is thin glue; the valuable pin is that
-    the REAL registry module routes its KV profile through the predicate.
-
-    Imports the real package registry (torch/triton/tokenspeed_kernel
-    stack), so these cases skip on a bare interpreter and exercise in the
-    container CI. Patch target: the scheduler_ext_flat_kvcache probe in the
-    PACKAGE paged_cache_spec module -- registry's imported
-    hybrid_slab_group_size is bound to that module object and resolves the
-    probe from its own globals at call time, so patching there intercepts
-    the real call chain (patching the path-loaded _pcs copy above would
-    miss it: that is a distinct module object the registry never sees).
+    """Registry sizing consumer: _kv_profile_layer_divisor charges
+    layers-per-group exactly when the predicate activates, all layers
+    otherwise. Imports the real registry, so skips on a bare interpreter.
+    Patch target is the PACKAGE paged_cache_spec probe -- the path-loaded
+    _pcs copy above is a distinct module object the registry never sees.
     """
 
     @classmethod
@@ -251,8 +221,7 @@ class KvProfileLayerDivisorTest(unittest.TestCase):
             yield
 
     def test_gpt_oss_flat_ext_charges_group_size(self):
-        # 24 layers, 12+12 alternating -> charge 12: per-token bytes halve,
-        # so the profiled max_num_tokens/pages double under the slab layout.
+        # 24 layers, 12+12 alternating -> charge 12 (per-token bytes halve).
         with self._pkg_flat_ext(True):
             self.assertEqual(
                 self._registry._kv_profile_layer_divisor(
@@ -280,9 +249,7 @@ class KvProfileLayerDivisorTest(unittest.TestCase):
             )
 
     def test_all_layers_when_no_layer_types(self):
-        # Plain models: MHAConfig defaults to (); MLA configs have no
-        # layer_types attribute at all, which the registry call site turns
-        # into None via getattr. Both keep the all-layers divisor.
+        # () from MHAConfig's default, None from MLA configs via getattr.
         with self._pkg_flat_ext(True):
             self.assertEqual(
                 self._registry._kv_profile_layer_divisor(
@@ -298,10 +265,8 @@ class KvProfileLayerDivisorTest(unittest.TestCase):
             )
 
     def test_all_layers_when_multi_window_sequence(self):
-        # M14: the registry must FORWARD sliding_window_tokens into the
-        # predicate -- multi-window sequences degrade sizing to all layers,
-        # matching the pool's layout decision (sizing/layout divergence is
-        # the hazard this pins).
+        # M14: the registry must forward sliding_window_tokens so sizing
+        # matches the pool's layout decision (divergence is the hazard).
         with self._pkg_flat_ext(True):
             it = itertools.cycle((4, 512))
             windows = [
@@ -341,19 +306,11 @@ _PKG_FLAT_PROBE = (
 
 
 class MHAPoolSlabLayoutTest(unittest.TestCase):
-    """Layout half of M12 (kv_cache/mha.py _create_buffers): when the
-    predicate activates, the pool allocates group_size K/V slab pairs and
-    binds paired layers (sliding-i <-> full-i, first-appearance group
-    order, in-group index alignment) to the SAME tensor objects; every
-    other configuration keeps the legacy per-layer layout, and the slab
-    guards (kvstore / PD-disagg) never fire there.
-
+    """Layout consumer (kv_cache/mha.py _create_buffers): when the predicate
+    activates, paired layers bind to the SAME slab tensors; otherwise the
+    legacy per-layer layout holds and the kvstore/PD guards never fire.
     Constructs a real (tiny, CPU) MHATokenToKVPool; skips without deps.
-    Patch target is the PACKAGE paged_cache_spec probe: the pool's
-    hybrid_slab_group_size is bound to that module object and resolves
-    scheduler_ext_flat_kvcache from its own globals at call time, so
-    patching there intercepts the real call chain (the path-loaded _pcs
-    copy above is a distinct module object the pool never sees).
+    Patch target is the PACKAGE paged_cache_spec probe (see above).
     """
 
     def setUp(self):
@@ -391,15 +348,12 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
 
     def test_slab_pairing_binds_same_tensor(self):
         pool = self._pool()
-        # gpt-oss shape: 24 layer entries alias 12 slabs, so accessors
-        # (get_key_buffer etc.) stay layer-indexed with zero changes.
+        # 24 layer entries alias 12 slabs: accessors stay layer-indexed.
         self.assertEqual(len(pool.k_buffer), 24)
         self.assertEqual(len({id(t) for t in pool.k_buffer}), 12)
         self.assertEqual(len({id(t) for t in pool.v_buffer}), 12)
-        # In-group index alignment: groups form in first-appearance order
-        # of layer_types (sliding first here), and the i-th sliding layer
-        # (layer 2i) pairs the i-th full layer (layer 2i+1) on the SAME
-        # tensor object -- shared storage, not a copy or a view.
+        # The i-th sliding layer (2i) pairs the i-th full layer (2i+1) on
+        # the SAME tensor object -- shared storage, not a copy or a view.
         for i in range(12):
             self.assertIs(pool.k_buffer[2 * i], pool.k_buffer[2 * i + 1])
             self.assertIs(pool.v_buffer[2 * i], pool.v_buffer[2 * i + 1])
@@ -407,8 +361,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
                 pool.k_buffer[2 * i].data_ptr(),
                 pool.k_buffer[2 * i + 1].data_ptr(),
             )
-        # Pairing completeness: every slab is referenced by exactly one
-        # layer of EACH group (sliding layers sit at even ids here).
+        # Every slab is referenced by exactly one layer of EACH group.
         for buffers in (pool.k_buffer, pool.v_buffer):
             slab_to_layers: dict[int, list[int]] = {}
             for layer_id, tensor in enumerate(buffers):
@@ -423,9 +376,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         self.assertEqual(len({t.data_ptr() for t in pool.k_buffer}), 12)
         self.assertEqual(len({t.data_ptr() for t in pool.v_buffer}), 12)
         # Per-layer host (L2) copies would alias shared slabs, so the slab
-        # pool opts out of the hierarchical cache surface (event_loop
-        # builds a MemoryExecutor for retraction offload even with the
-        # kvstore flag off; this is the switch that gates it).
+        # pool opts out of the hierarchical cache surface.
         self.assertFalse(pool.supports_hierarchical_kv_cache)
 
     def test_fallback_matrix_keeps_24_buffers(self):
@@ -465,8 +416,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             self._pool(pd_disaggregation_enabled=True)
 
     def test_no_guard_when_fallback(self):
-        # The flags only conflict with the slab layout; the legacy layout
-        # keeps serving them, so a radix build must construct fine.
+        # The flags only conflict with the slab layout, not the legacy one.
         pool = self._pool(
             flat_ext=False,
             kvstore_enabled=True,

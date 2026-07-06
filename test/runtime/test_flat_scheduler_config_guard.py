@@ -1,23 +1,12 @@
-"""Flat-scheduler config guard at scheduler-config assembly (R2-4).
+"""Flat-scheduler config guard (validate_flat_scheduler_config, called from
+engine/event_loop before the C++ Scheduler ctor).
 
-Rule under test (configs/paged_cache_spec.validate_flat_scheduler_config,
-called from engine/event_loop before the C++ Scheduler ctor): on a flat-built
-(TOKENSPEED_FLAT_KVCACHE) scheduler ext,
-
-* a backend that consumes paged-cache groups through the radix populate path
-  but is not flat-group capable (uses_paged_cache_groups without
-  uses_flat_cache_groups, i.e. DeepSeek V4/MLA-style) must be rejected loudly
-  — the flat build compiles that path out, so the run would otherwise replay
-  CUDA graphs against stale capture placeholders and produce silent garbage;
-* zero published groups must be rejected with the actual knob named (spec
-  decode gates MHA publication off; state-only pools like mamba publish none)
-  instead of the cryptic MakeCoordinator abort inside the C++ ctor;
-* a flat-capable backend with >=1 published group passes;
-* a radix-built ext makes the guard a no-op regardless of backend/groups.
-
-The validator is pure and torch-free; paged_cache_spec is loaded by file path
-when the full runtime deps (torch/transformers, pulled in by the configs
-package __init__) are unavailable, so this file runs on a bare interpreter.
+On a flat-built ext: a radix-populate-only backend (uses_paged_cache_groups
+without uses_flat_cache_groups, DeepSeek V4/MLA-style) is rejected loudly;
+zero published groups is rejected with the actual cause named; a
+flat-capable backend with >=1 group passes. On a radix-built ext the guard
+is a no-op. The validator is pure and torch-free, so this file runs on a
+bare interpreter (loaded by file path when runtime deps are unavailable).
 """
 
 from __future__ import annotations
@@ -114,9 +103,8 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
         self.assertIn("radix-built", msg)
 
     def test_flat_ext_zero_groups_spec_decode_names_the_knob(self):
-        # MHA publication correctly gated off under spec decode -> empty
-        # groups. The error must say spec decode is the cause, not surface
-        # the C++ MakeCoordinator abort.
+        # The error must name spec decode as the cause, not surface the
+        # cryptic C++ MakeCoordinator abort.
         with self.assertRaises(RuntimeError) as ctx:
             _pcs.validate_flat_scheduler_config(
                 flat_kvcache_ext=True,
@@ -156,8 +144,7 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
         )
 
     def test_radix_ext_is_a_noop_regardless(self):
-        # Radix build: groups are transport-only; every combination that the
-        # flat arms reject must pass untouched.
+        # Every combination the flat arms reject must pass untouched.
         for backend, pool, groups, spec in (
             (FakeV4StyleBackend(), FakeV4Pool(), [FakeGroup()], False),
             (FakeFlatMHABackend(), FakeMHAPool(), [], True),

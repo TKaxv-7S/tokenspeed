@@ -29,8 +29,7 @@ class SelectPageTableTest(unittest.TestCase):
         import torch
 
         self.torch = torch
-        # _select_page_table only reads metadata.page_table(s) + layer.group_id;
-        # bypass __init__ to avoid constructing a full backend.
+        # Bypass __init__: _select_page_table only reads metadata + group_id.
         self.backend = self.MHAAttnBackend.__new__(self.MHAAttnBackend)
 
     def _layer(self, group_id):
@@ -81,16 +80,15 @@ class SelectPageTableTest(unittest.TestCase):
         )
 
     def test_unknown_group_id_multi_group_raises(self):
-        # §F(ii): non-empty group_id absent from the dict -> clear error
-        # naming the group and the available keys.
+        # Clear error naming the group and the available keys.
         with self.assertRaisesRegex(KeyError, "'nope'.*full_attention"):
             self.backend._select_page_table(
                 self._layer("nope"), self._multi_group_meta()
             )
 
     def test_empty_group_id_multi_group_raises(self):
-        # §F(i): a group-unaware layer (group_id="") cannot pick between
-        # multiple published groups -> clear error, no silent fallback.
+        # A group-unaware layer cannot pick between multiple groups:
+        # clear error, no silent fallback.
         with self.assertRaisesRegex(KeyError, "group_id=''"):
             self.backend._select_page_table(
                 self._layer(""), self._multi_group_meta()

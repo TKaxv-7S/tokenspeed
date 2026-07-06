@@ -18,13 +18,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// End-to-end lifecycle test for the flat KV-cache FSM path
-// (TOKENSPEED_FLAT_KVCACHE=ON). The whole file compiles to nothing when the
-// flag is off. Models a minimal GPT-OSS-shaped config: two paged-cache groups
-// (one full-attention, one sliding-window), no L2/L3 cache. Drives
-// Submit -> prefill -> decode -> finish and asserts the flat per-group block
-// tables (full-history keeps all pages; sliding-window develops a null hole)
-// plus pool reclamation on finish.
+// End-to-end lifecycle tests for the flat KV-cache FSM path
+// (TOKENSPEED_FLAT_KVCACHE=ON; the whole file compiles to nothing otherwise).
+// Config: two paged-cache groups (full + sliding-window), no L2/L3.
 
 #if TOKENSPEED_FLAT_KVCACHE
 
@@ -35,7 +31,6 @@
 
 namespace tokenspeed::test {
 
-// Minimal GPT-OSS-shaped flat config: full + sliding-window groups, no L2/L3.
 class FlatKvCacheLifecycleTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -78,22 +73,12 @@ protected:
     }
 };
 
-// Smoke: with a GPT-OSS-shaped flat config, the Scheduler constructs (building
-// a two-group KvCacheCoordinator from paged_cache_groups) and accepts a request
-// into the waiting queue. This is the part of the flat path that works today:
-// construction + Submit touch no per-request coordinator state.
 TEST_F(FlatKvCacheLifecycleTestSuite, Construct_AndSubmit_Waiting) {
     Submit(MakeRequestSpec("r1", /*num_pages=*/2));
     EXPECT_EQ(scheduler_->WaitingSize(), 1u);
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
 }
 
-// Full lifecycle: Submit -> prefill -> decode -> finish, with the flat
-// coordinator driving allocation. Each plan emits a single FlatForwardOperation
-// whose flat_block_tables carry one row per request per group. Asserts the
-// retention contract: the full-history group keeps every page (no null holes),
-// while the sliding-window group evicts old pages (a null hole, id 0, appears
-// once decoding crosses the window). Finishing returns all pages to the pool.
 TEST_F(FlatKvCacheLifecycleTestSuite, SingleRequest_PrefillDecodeFinish) {
     const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
 
@@ -110,10 +95,8 @@ TEST_F(FlatKvCacheLifecycleTestSuite, SingleRequest_PrefillDecodeFinish) {
     SendForwardDone("r1", {42});
     EXPECT_EQ(scheduler_->PrefillSize(), 1u);
 
-    // Drive enough decode steps that the sliding-window row is guaranteed to
-    // have evicted past its window. The swa row first shows a null hole (id 0)
-    // at decode step 1 (window=4 tokens=2 pages); 4 steps is comfortably past.
-    // Keep the last plan alive: the FlatForwardOperation is owned by its plan.
+    // Swa null hole first appears at decode step 1 (window=4 tokens = 2 pages).
+    // last_plan must outlive the loop: the FlatForwardOperation is owned by its plan.
     std::optional<ExecutionPlan> last_plan;
     int tok = 43;
     for (int step = 0; step < 4; ++step) {
@@ -125,14 +108,10 @@ TEST_F(FlatKvCacheLifecycleTestSuite, SingleRequest_PrefillDecodeFinish) {
     const FlatForwardOperation* last_decode = FindFlatOp(*last_plan);
     ASSERT_NE(last_decode, nullptr);
 
-    // Full-attention group keeps all history: one request -> one row, no -1
-    // padding and no null holes.
     const auto& full_row = last_decode->flat_block_tables.at("full").at(0);
     for (std::int32_t id : full_row) {
         EXPECT_GT(id, 0) << "full row should keep history with no null/padding hole";
     }
-    // Sliding-window group evicts old pages: the row carries at least one null
-    // hole (id 0) once decoding crosses the window.
     const auto& swa_row = last_decode->flat_block_tables.at("swa").at(0);
     EXPECT_NE(std::find(swa_row.begin(), swa_row.end(), 0), swa_row.end())
         << "swa row should contain a null hole after the sliding window slides";
@@ -143,12 +122,8 @@ TEST_F(FlatKvCacheLifecycleTestSuite, SingleRequest_PrefillDecodeFinish) {
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
 }
 
-// On flat builds the Python-bound available_kv_pages accessor must report the
-// flat shared BlockPool, not the radix device_allocator_ (which the flat path
-// never draws from -- reporting it showed Python monitoring a permanently-full
-// pool). Pins the redirect: AvailableKvPages() tracks FlatPoolFreeBlocks()
-// exactly, idle and under load, and actually decreases after a prefill.
-// TODO(radix-removal): collapses to the only accessor when radix goes.
+// AvailableKvPages() must report the flat shared BlockPool, not the radix
+// device_allocator_. TODO(radix-removal): collapses to the only accessor.
 TEST_F(FlatKvCacheLifecycleTestSuite, AvailableKvPagesReportsFlatPool) {
     const std::size_t idle = scheduler_->AvailableKvPages();
     EXPECT_EQ(idle, static_cast<std::size_t>(scheduler_->FlatPoolFreeBlocks()));
@@ -167,15 +142,9 @@ TEST_F(FlatKvCacheLifecycleTestSuite, AvailableKvPagesReportsFlatPool) {
     EXPECT_EQ(scheduler_->AvailableKvPages(), idle);
 }
 
-// Two requests in one batch: the FlatForwardOperation must aggregate both into
-// one SoA op. Exercises the multi-request path the single-request test cannot:
-// two rows per group, rectangular (-1 padded) tables, and physical pages that
-// never collide across the two requests (they draw from the same shared pool).
 TEST_F(FlatKvCacheLifecycleTestSuite, TwoRequests_BatchedFlatBlockTables) {
     const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
 
-    // Different prompt lengths so the full-history rows differ in page count and
-    // the batch genuinely needs -1 padding to become rectangular.
     Submit(MakeRequestSpec("r1", /*num_pages=*/2));
     Submit(MakeRequestSpec("r2", /*num_pages=*/3, /*start=*/101));
     ExecutionPlan prefill_plan = PlanOnce();
@@ -185,7 +154,6 @@ TEST_F(FlatKvCacheLifecycleTestSuite, TwoRequests_BatchedFlatBlockTables) {
     ASSERT_NE(prefill, nullptr);
     ASSERT_EQ(prefill->request_ids.size(), 2u);
 
-    // Both groups present, one row per request.
     ASSERT_EQ(prefill->flat_block_tables.count("full"), 1u);
     ASSERT_EQ(prefill->flat_block_tables.count("swa"), 1u);
     const auto& full = prefill->flat_block_tables.at("full");
@@ -193,20 +161,14 @@ TEST_F(FlatKvCacheLifecycleTestSuite, TwoRequests_BatchedFlatBlockTables) {
     ASSERT_EQ(full.size(), 2u);
     ASSERT_EQ(swa.size(), 2u);
 
-    // Tables are rectangular: every row in a group shares one column count.
     EXPECT_EQ(full.at(0).size(), full.at(1).size());
     EXPECT_EQ(swa.at(0).size(), swa.at(1).size());
-    // The shorter prompt's full row is -1 padded (real pages are > 0, holes are
-    // 0, padding is -1) -- so the two requests' page counts genuinely differ.
     const bool any_pad = std::any_of(full.at(0).begin(), full.at(0).end(),
                                      [](std::int32_t id) { return id == -1; }) ||
                          std::any_of(full.at(1).begin(), full.at(1).end(),
                                      [](std::int32_t id) { return id == -1; });
     EXPECT_TRUE(any_pad) << "unequal prompt lengths should force -1 padding in one full row";
 
-    // Physical pages must not be shared between the two requests in either group:
-    // collect every real page id (id > 0) across both rows of a group and assert
-    // no duplicates.
     auto assert_no_page_collision = [](const std::vector<std::vector<std::int32_t>>& group) {
         std::vector<std::int32_t> real;
         for (const auto& row : group) {
@@ -222,7 +184,6 @@ TEST_F(FlatKvCacheLifecycleTestSuite, TwoRequests_BatchedFlatBlockTables) {
     assert_no_page_collision(full);
     assert_no_page_collision(swa);
 
-    // Finishing both requests returns every page to the pool.
     SendForwardDone("r1", {42});
     SendForwardDone("r2", {142});
     SendFinish("r1");

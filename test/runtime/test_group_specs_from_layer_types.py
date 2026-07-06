@@ -42,7 +42,6 @@ PagedCacheGroupSpec = _pcs.PagedCacheGroupSpec
 
 class GroupSpecsFromLayerTypesTest(unittest.TestCase):
     def test_gpt_oss_mixed_shape_yields_two_groups(self):
-        # GPT-OSS 交替: full / sliding。归组函数应产两条 spec。
         layer_types = [
             "full_attention",
             "sliding_attention",
@@ -73,8 +72,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
         self.assertEqual(swa.family, "history")
 
     def test_all_full_yields_single_group(self):
-        # 纯 full-attention model (llama/qwen) must yield exactly one spec ->
-        # equivalent to today's single group, no regression.
+        # 等价于现状的单 group,无回归。
         specs = group_specs_from_layer_types(
             layer_types=["full_attention"] * 8,
             sliding_window_tokens=None,
@@ -86,8 +84,6 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
         self.assertIsNone(specs[0].sliding_window_tokens)
 
     def test_group_order_is_first_appearance(self):
-        # sliding appears first -> sliding group is ordered first. Order is
-        # deterministic and stable across runs.
         specs = group_specs_from_layer_types(
             layer_types=["sliding_attention", "full_attention", "full_attention"],
             sliding_window_tokens=64,
@@ -297,10 +293,9 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
 
 
 class PoolToPagedCacheGroupsIntegrationTest(unittest.TestCase):
-    """Integration: specs a pool publishes convert to a multi-group scheduler
-    config via pool_to_paged_cache_groups. Requires torch + the compiled
-    tokenspeed_scheduler C++ extension, so it SKIPS where those are absent
-    (e.g. local dev boxes) and runs for real in the GPU container."""
+    """pool_to_paged_cache_groups converts published specs to a multi-group
+    scheduler config. Needs torch + the tokenspeed_scheduler ext; skips
+    where those are absent."""
 
     def _import_converter(self):
         try:

@@ -1,54 +1,12 @@
 """E2E: the M12 hybrid-slab KV layout's capacity gain shows up as prefix-cache hits.
 
-Mechanism under test: on a hybrid full/sliding model (gpt-oss), the M12 slab
-layout (``hybrid_slab_group_size``) shares one K/V slab between one layer from
-each attention group, so the KV byte budget is divided by layers-per-group
-instead of total layers -- the page pool doubles in tokens versus the legacy
-per-layer-buffer layout. This test boots the SAME commit twice under the same
-byte budget (slab: natural; legacy: predicate nulled via an env-injected
-sitecustomize, see ``_LEGACY_SITECUSTOMIZE``) and asserts the gain twice over:
-
-1. directly: ``scheduler_info["max_total_num_tokens"]`` doubles (measured
-   halving when the predicate is nulled -- e.g. 168832 -> 84416 on b200-77);
-2. behaviorally: K distinct ~2074-token prompts are generated twice in the
-   same order, with K sized so one round's page-allocation footprint is
-   ~0.72x the slab pool (so ~1.44x the legacy pool). Slab: cached prefixes
-   survive round 1; round 2 hits ~99% of prompt tokens (bounded only by the
-   M9 host-match cap, 32 pages = 2048/prompt). Legacy: the round's
-   allocations exceed the pool, so cached prefixes are recycled in insertion
-   order, and the same-order revisit is the worst case -- every prompt is
-   evicted before reuse, hits collapse to ~0.
-
-A prompt's allocation footprint is ~2x its token count, not 1x: the
-full-attention group's ~33 pages are retained as cached prefix, but the
-sliding-window group ALSO allocates ~33 pages during prefill (every position
-is written before the window advances) which return to the pool afterwards.
-The shared BlockPool hands out never-used pages first and then recycles the
-OLDEST freed pages -- which are the earliest prompts' cached prefixes, not
-the just-freed sliding transients. Hence the cliff is at cumulative
-round allocations = pool size (verified on b200-77: K=20 -> 1320 pages of
-2638 -> 97% hits; K=59 -> 3894 of 2638 -> 0% hits on the SAME slab pool).
-
-K is computed from the MEASURED slab capacity, not fixed: the profiled pool
-depends on the GPU's free memory at boot (an overnight run on a busier
-b200-77 got the 97%/0% contrast with K=20 at util 0.165; on an idle GPU the
-same budget yields a pool where K=20 fits both layouts, hiding the
-contrast). Both arms use the same K, and the direct capacity assertion (1)
-keeps the test honest if the slab sizing ever regresses to legacy (the
-workload would then fit both arms and (2) alone could not tell).
-
-``cached_tokens`` provenance (verified, so this metric is valid for FLAT
-hits, not a radix-only counter): ``Engine.generate()`` meta_info
-``cached_tokens`` is accumulated per request in
-``engine/generation_output_processor.py::add_cached_tokens`` as
-``max(0, extend_prefix_len - computed_length)`` from every prefill chunk's
-``forward_op.extend_prefix_lens``. ``extend_prefix_len`` is the C++
-scheduler's ``already_scheduled_len``
-(``tokenspeed-scheduler/csrc/scheduler/operations/forward.cpp``,
-``applyPrefillEvent``), which the prefill-scheduling transition advances past
-the prefix hit on both builds (flat: ``ClaimCommonPrefix``; radix: device
-tree match). It therefore counts exactly the prompt tokens served from cache
-under the flat scheduler.
+The slab layout shares one K/V slab between one layer from each attention
+group, doubling the page pool in tokens at the same byte budget. This test
+boots the SAME commit twice (slab: natural; legacy: predicate nulled via an
+env-injected sitecustomize) and asserts the gain twice over: directly, via
+``scheduler_info["max_total_num_tokens"]`` doubling, and behaviorally, via
+the round-2 prefix-hit-rate contrast (slab keeps the working set cached;
+the legacy arm's halved pool recycles it before reuse).
 
 Requires a flat-built (TOKENSPEED_FLAT_KVCACHE) tokenspeed_scheduler ext;
 skips cleanly on a radix build.
@@ -83,25 +41,19 @@ register_cuda_ci(est_time=900, suite="runtime-prefix-cache-e2e")
 from tokenspeed.runtime.entrypoints.engine import Engine  # noqa: E402
 
 _MODEL = "openai/gpt-oss-20b"
-# 130 numbered sentences tokenize to ~2074 tokens per prompt with the
-# gpt-oss tokenizer (33 pages at page_size 64). Guarded at runtime by the
-# band below so tokenizer drift cannot silently change the regime: staying
-# under 2270 keeps the slab-arm hit-ratio floor above 0.9 despite the M9
-# host-match cap (32 pages = 2048 hit tokens per prompt).
+# 130 numbered sentences tokenize to ~2074 tokens with the gpt-oss tokenizer;
+# the runtime band below guards against tokenizer drift (staying under 2270
+# keeps the slab-arm hit floor above 0.9 despite the M9 32-page match cap).
 _SENTENCES_PER_PROMPT = 130
 _APPROX_PROMPT_TOKENS = 2074
 _PROMPT_TOKENS_MIN = 1900
 _PROMPT_TOKENS_MAX = 2270
 
-# A prompt's page-allocation footprint per round: full-history retention
-# (~prompt tokens) + the sliding group's prefill transient (~prompt tokens
-# again; see module docstring). Small terms (retained sliding tail, decode
-# pages) are absorbed by the fill margins.
+# Per-round footprint is ~2x prompt tokens: full-history retention plus the
+# sliding group's prefill transient (as many pages again, freed afterwards).
 _APPROX_ALLOC_TOKENS = 2 * _APPROX_PROMPT_TOKENS
-# Round allocation footprint as a fraction of the measured slab pool:
-# comfortably under the recycling cliff on the slab arm, and (at the
-# expected 2x gain) ~1.44x the legacy pool -- deep enough past the cliff
-# that the same-order revisit recycles every cached prefix.
+# Round footprint as a fraction of the measured slab pool: under the
+# recycling cliff on the slab arm, ~1.44x the halved legacy pool.
 _TARGET_POOL_FILL = 0.72
 _NUM_PROMPTS_MIN = 8
 _NUM_PROMPTS_MAX = 120
@@ -125,24 +77,9 @@ _WORDS = [
     "nutmeg",
 ]
 
-# Injected into engine subprocesses via PYTHONPATH for the legacy arm only.
-#
-# Why a sitecustomize: the layout decision is made inside the SPAWNED
-# scheduler/executor subprocesses (registry KV-memory profile +
-# MHATokenToKVPool._create_buffers), which a patch in this test process
-# cannot reach; a sitecustomize on PYTHONPATH runs at every child
-# interpreter's startup. ``hybrid_slab_group_size`` is the single activation
-# source for the slab layout (sizing divisor and buffer layout both consume
-# it), and both consumers bind it by from-import, so nulling it in the three
-# namespaces below reproduces the pre-M12 layout exactly -- a same-commit
-# A/B. The patch is lazy (a sys.meta_path find_spec hook fires on every
-# uncached import and patches once the module lands in sys.modules) because
-# sitecustomize runs before any tokenspeed module exists.
-#
-# Chaining: Python imports only the FIRST sitecustomize on sys.path. Test
-# environments may already carry one (e.g. a front-loaded flat scheduler
-# ext); since this tempdir is prepended, ours must locate and exec the next
-# sitecustomize.py on sys.path or that setup would be silently dropped.
+# Injected into engine subprocesses via PYTHONPATH for the legacy arm only:
+# the layout decision is made inside SPAWNED subprocesses, which a patch in
+# this process cannot reach; a sitecustomize runs at every child's startup.
 _LEGACY_SITECUSTOMIZE = '''\
 """Force the legacy (pre-M12) per-layer KV buffer layout in this interpreter.
 
@@ -209,13 +146,8 @@ if os.environ.get("TOKENSPEED_FORCE_LEGACY_KV_LAYOUT") == "1":
 
 
 def _build_prompt(i: int) -> str:
-    """A ~2074-token prompt, distinct per ``i`` from the first sentence on.
-
-    Numbered head plus a varied, non-repetitive body (word cycling + per-
-    sentence numbers). Deliberately NOT a repeated identical filler:
-    pathologically repetitive text produces logit ties that make greedy
-    outputs unstable across layouts.
-    """
+    """A ~2074-token prompt, distinct per ``i`` from the first sentence on;
+    varied text avoids the greedy-logit ties repeated filler produces."""
     parts = [f"Ledger {i} opens with a fresh manifest of arrivals."]
     for j in range(_SENTENCES_PER_PROMPT):
         word = _WORDS[j % len(_WORDS)]
@@ -233,16 +165,13 @@ def _make_engine() -> Engine:
         dtype=get_dtype_str(torch.bfloat16),
         seed=42,
         enable_prefix_caching=True,
-        # The slab layout is incompatible with kvstore L2 host copies
-        # (per-layer copies would alias shared slabs); resolve_cache would
-        # auto-enable kvstore with prefix caching on, tripping the slab
-        # guard in MHATokenToKVPool._check_slab_guards.
+        # resolve_cache would auto-enable kvstore, tripping the slab guard
+        # (per-layer L2 host copies would alias shared slabs).
         disable_kvstore=True,
         max_model_len=8192,
         max_num_seqs=2,
-        # The byte budget both arms share. The profiled pool additionally
-        # depends on free GPU memory at boot, which is why the working set
-        # is sized from the measured capacity instead of hard-coded.
+        # Shared byte budget; the profiled pool also depends on free GPU
+        # memory at boot, hence K is sized from the measured capacity.
         gpu_memory_utilization=0.165,
         moe_backend="flashinfer_mxfp4",
         disable_prefill_graph=True,
@@ -275,12 +204,7 @@ def _run_round(engine: Engine, prompts: list) -> tuple:
 
 
 def _measure_arm(engine: Engine, num_prompts: int, tag: str) -> tuple:
-    """Two sequential rounds over the same prompts; return (r1_ratio, r2_ratio).
-
-    Round 1 is the cold pass that populates the cache; round 2 revisits the
-    prompts in the same order (the LRU worst case when the working set
-    overflows the pool).
-    """
+    """Two sequential rounds over the same prompts; return (r1_ratio, r2_ratio)."""
     prompts = [_build_prompt(i) for i in range(num_prompts)]
     cached1, prompt1 = _run_round(engine, prompts)
     cached2, prompt2 = _run_round(engine, prompts)
@@ -294,10 +218,7 @@ def _measure_arm(engine: Engine, num_prompts: int, tag: str) -> tuple:
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestSlabCapacityPrefixHits(unittest.TestCase):
     """Same commit, same byte budget, same workload: the slab arm keeps the
-    working set cached; the legacy arm's halved pool LRU-cycles it. One
-    self-contained method: the two arms must share K and be compared on
-    measured capacity, which per-arm tests could not do without cross-test
-    state."""
+    working set cached; the legacy arm's halved pool LRU-cycles it."""
 
     def setUp(self):
         try:
@@ -339,9 +260,7 @@ class TestSlabCapacityPrefixHits(unittest.TestCase):
         self.assertEqual(
             r1_slab, 0, f"slab round 1 must be cold, got ratio {r1_slab:.3f}"
         )
-        # The round's allocations are ~0.72x the pool, under the recycling
-        # cliff, so every cached prefix survives; per-prompt hits are bounded
-        # by the M9 cap (2048 of ~2074 tokens -> ~0.99). 0.9 leaves margin
+        # Expected ~0.99 (M9 cap: 2048 of ~2074 tokens); 0.9 leaves margin
         # for tokenizer drift within the guarded band.
         self.assertGreaterEqual(
             r2_slab,
@@ -366,10 +285,8 @@ class TestSlabCapacityPrefixHits(unittest.TestCase):
                 legacy_capacity = int(engine.scheduler_info["max_total_num_tokens"])
                 print(f"[legacy layout] max_total_num_tokens={legacy_capacity}")
                 cap_ratio = slab_capacity / legacy_capacity
-                # The M12 claim measured directly: gpt-oss pairs 12 sliding
-                # with 12 full layers, so the sizing divisor halves and the
-                # token pool exactly doubles. The band tolerates free-memory
-                # drift between the two boots.
+                # gpt-oss pairs 12 sliding with 12 full layers -> exactly 2x;
+                # the band tolerates free-memory drift between the two boots.
                 self.assertTrue(
                     1.9 <= cap_ratio <= 2.1,
                     f"slab/legacy capacity ratio {cap_ratio:.3f} "
@@ -393,10 +310,8 @@ class TestSlabCapacityPrefixHits(unittest.TestCase):
         self.assertEqual(
             r1_leg, 0, f"legacy round 1 must be cold, got ratio {r1_leg:.3f}"
         )
-        # Round allocations ~1.44x the halved pool + same-order revisit =
-        # every cached prefix recycled before reuse; proven 0%. 0.2 is the
-        # collapse bound; with the slab arm's 0.9 floor it guarantees a
-        # >= 4.5x hit-ratio contrast.
+        # ~1.44x the halved pool + same-order revisit recycles every cached
+        # prefix before reuse; 0.2 is the collapse bound (expected ~0).
         self.assertLessEqual(
             r2_leg,
             0.2,

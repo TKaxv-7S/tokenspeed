@@ -33,10 +33,8 @@ namespace {
 using token_span = std::span<const std::int32_t>;
 using key_span = std::span<const std::string>;
 
-// HashPage frames the whole input as [prior_len][prior][token_count][tokens]
-// [extra...]. With no prior, no tokens and no extra_keys that is two zero u32s
-// (8 zero bytes), whose SHA-256 is the vector below -- pins the helpers to real
-// SHA-256 output over the framed stream.
+// HashPage frames the input as [prior_len][prior][token_count][tokens][extra...];
+// all-empty input is two zero u32s (8 zero bytes), whose SHA-256 is below.
 constexpr const char* kEmptyFramedSha256 = "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc";
 
 token_span Tokens(const std::vector<std::int32_t>& v) { return token_span(v.data(), v.size()); }
@@ -116,8 +114,6 @@ TEST(HashPageTest, ExtraKeysChangeOutput) {
     EXPECT_NE(HashPage(Tokens(toks), "p"), HashPage(Tokens(toks), "p", Keys(keys)));
 }
 
-// Length-prefix framing must prevent boundary-shift collisions: the same
-// concatenated bytes split differently must hash differently.
 TEST(HashPageTest, FramingDisambiguatesKeySplits) {
     std::vector<std::int32_t> toks = {1};
     std::vector<std::string> split_a = {"ab", "c"};
@@ -125,7 +121,6 @@ TEST(HashPageTest, FramingDisambiguatesKeySplits) {
     EXPECT_NE(HashPage(Tokens(toks), "", Keys(split_a)), HashPage(Tokens(toks), "", Keys(split_b)));
 }
 
-// A single key must not collide with the same content carried as two keys.
 TEST(HashPageTest, FramingDisambiguatesKeyCount) {
     std::vector<std::int32_t> toks = {1};
     std::vector<std::string> one = {"abc"};
@@ -133,11 +128,8 @@ TEST(HashPageTest, FramingDisambiguatesKeyCount) {
     EXPECT_NE(HashPage(Tokens(toks), "", Keys(one)), HashPage(Tokens(toks), "", Keys(two)));
 }
 
-// Regression -- prior_len framing. Before whole-input framing, an empty prior
-// wrote zero bytes, so a page-0 whose leading tokens LE-encode to a 32-byte
-// digest produced the same stream as a chained page carrying that digest as
-// prior. Reinterpret a 32-byte prior as 8 little-endian tokens and assert the
-// two forms no longer collide.
+// A 32-byte prior reinterpreted as 8 LE tokens in page 0 must not produce the
+// same stream as a chained page carrying that digest as prior.
 TEST(HashPageTest, FramingDisambiguatesEmptyPriorFromChainedPage) {
     const std::string prior = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
     std::vector<uint8_t> pb = HexToBytes(prior);
@@ -151,18 +143,13 @@ TEST(HashPageTest, FramingDisambiguatesEmptyPriorFromChainedPage) {
                                             (static_cast<uint32_t>(pb[4 * i + 3]) << 24));
     }
     std::vector<std::int32_t> none;
-    // page 0: no prior, 8 tokens that reproduce the digest bytes.
     std::string as_page0 = HashPage(Tokens(toks), "");
-    // chained page: that digest as prior, no tokens.
     std::string as_chained = HashPage(Tokens(none), prior);
     EXPECT_NE(as_page0, as_chained);
 }
 
-// Regression -- token_count framing. Before whole-input framing the token block
-// had no count prefix, so it could bleed into the extra_keys frame: a 4-byte key
-// carried as one extra_key produced the same stream as the bytes count(1) +
-// len(4) + key folded back into the token list. The key "wxyz" LE-decodes to the
-// int32 below; assert the two forms no longer collide.
+// A 4-byte extra key must not produce the same stream as count(1) + len(4) +
+// the key's LE int32 folded back into the token list.
 TEST(HashPageTest, FramingDisambiguatesTokensFromExtraKeys) {
     std::vector<std::int32_t> short_toks = {9, 8};
     std::vector<std::string> one_key = {"wxyz"};
@@ -203,7 +190,6 @@ TEST(ComputePagedHashesTest, SamePageDifferentPrefixDiffers) {
 
     std::vector<std::string> ha = ComputePagedHashes(a, "");
     std::vector<std::string> hb = ComputePagedHashes(b, "");
-    // identical first page -> identical hash; differing prefix -> 2nd page differs.
     EXPECT_NE(ha[0], hb[0]);
     EXPECT_NE(ha[1], hb[1]);
 }
@@ -213,7 +199,6 @@ TEST(ComputePagedHashesTest, MissingExtraKeysPerPageTreatedAsEmpty) {
     std::vector<std::int32_t> p1 = {2};
     std::vector<token_span> pages = {Tokens(p0), Tokens(p1)};
 
-    // extra_keys only provided for page 0; page 1 should fall back to empty.
     std::vector<std::string> k0 = {"salt"};
     std::vector<key_span> extra = {Keys(k0)};
 
@@ -225,8 +210,6 @@ TEST(ComputePagedHashesTest, MissingExtraKeysPerPageTreatedAsEmpty) {
     EXPECT_EQ(got[1], h1);
 }
 
-// Incremental-hashing oracle for decode-time block caching: chaining a later
-// batch on the earlier batch's last hash reproduces the one-shot chain exactly.
 TEST(ComputePagedHashesTest, IncrementalChainEqualsOneShot) {
     // 12-token stream, page_size 2 -> 6 pages.
     std::vector<std::int32_t> tokens(12);
@@ -312,7 +295,6 @@ TEST(ComputePagedHashesWithGroupTest, GroupDoesNotLeakIntoPrefixChain) {
     std::vector<std::string> g0 = ComputePagedHashesWithGroup(pages, "r", 0);
     std::vector<std::string> g9 = ComputePagedHashesWithGroup(pages, "r", 9);
 
-    // Same content, different group: only the trailing group_id hex differs.
     for (std::size_t i = 0; i < g0.size(); ++i) {
         EXPECT_EQ(GetBlockHashFromKey(g0[i]), GetBlockHashFromKey(g9[i])) << "page " << i;
     }
