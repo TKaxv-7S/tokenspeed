@@ -66,35 +66,26 @@ if platform.is_nvidia:
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
-        signatures=frozenset(
-            {format_signature(seq_lens=dense_tensor_format(torch.int32))}
-        ),
+        signatures=frozenset({format_signature()}),
         traits={
             "page_size": frozenset({64}),
-            "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
         },
         priority=Priority.PERFORMANT,
     )
     def deep_gemm_dsa_plan(
-        seq_lens: torch.Tensor,
         *,
         page_size: int,
-        q_len_per_req: int = 1,
+        seq_lens_2d: torch.Tensor,
         out: object | None = None,
     ) -> torch.Tensor:
-        q_len_per_req = int(q_len_per_req)
-        seq_lens = seq_lens.to(dtype=torch.int32).contiguous()
-        if seq_lens.dim() == 1:
-            seq_lens = seq_lens.view(-1, q_len_per_req).contiguous()
-        else:
-            seq_lens = seq_lens.contiguous()
         refreshed = deep_gemm.get_paged_mqa_logits_metadata(
-            seq_lens,
-            int(page_size),
+            seq_lens_2d,
+            page_size,
             deep_gemm.get_num_sms(),
         )
         if out is None:
             return refreshed
+
         if (
             not isinstance(out, torch.Tensor)
             or out.shape != refreshed.shape
@@ -152,19 +143,22 @@ if platform.is_nvidia:
         softmax_scale: float,
         q_len_per_req: int = 1,
         index_k_cache: torch.Tensor | None = None,
+        seq_lens_2d: torch.Tensor | None = None,
         plan: object | None = None,
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        q = q.contiguous()
-        weights = weights.float().contiguous()
-        seq_lens = seq_lens.to(device=q.device, dtype=torch.int32).contiguous()
-        block_table = block_table.to(device=q.device, dtype=torch.int32).contiguous()
-        tokens = q.shape[0]
+        assert weights.dtype == torch.float32
+        assert weights.is_contiguous()
+        assert seq_lens.dtype == torch.int32
+        assert seq_lens.is_contiguous()
+        assert block_table.dtype == torch.int32
+        assert block_table.is_contiguous()
+
         out, lens_out = _check_out(
             out,
             lens_out,
-            tokens=tokens,
+            tokens=q.shape[0],
             topk=topk,
             device=q.device,
         )
@@ -177,27 +171,24 @@ if platform.is_nvidia:
             scale_encoding="float32",
         )
         q_fp8 = q_fp8.view_as(q)
-        q_scale = q_scale.view(tokens, q.shape[1], 1)
+        q_scale = q_scale.view(q.shape[0], q.shape[1], 1)
         scaled_weights = (
             weights.unsqueeze(-1) * q_scale * float(softmax_scale)
         ).squeeze(-1)
 
-        q_len_per_req = int(q_len_per_req)
-        seq_lens_2d = seq_lens.view(-1, q_len_per_req).contiguous()
-        request_block_table = block_table[::q_len_per_req].contiguous()
-        max_seq_len = int(request_block_table.shape[1]) * int(page_size)
+        if seq_lens_2d is None or plan is None:
+            raise RuntimeError(
+                "DeepGEMM DSA decode top-k requires precomputed plan and "
+                "seq_lens_2d (built once per forward via dsa_plan)."
+            )
+
+        max_seq_len = block_table.shape[1] * page_size
         if max_seq_len < int(topk):
             raise RuntimeError(
                 "DeepGEMM DSA paged top-k requires block table capacity >= topk; "
                 f"got capacity={max_seq_len}, topk={topk}"
             )
-        schedule_metadata = plan
-        if schedule_metadata is None:
-            schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                seq_lens_2d,
-                int(page_size),
-                deep_gemm.get_num_sms(),
-            )
+
         kv_cache = index_k_cache.view(
             -1,
             int(page_size),
@@ -209,8 +200,8 @@ if platform.is_nvidia:
             kv_cache,
             scaled_weights.contiguous(),
             seq_lens_2d,
-            request_block_table,
-            schedule_metadata,
+            block_table,
+            plan,
             max_seq_len,
             clean_logits=False,
         )
@@ -224,6 +215,7 @@ if platform.is_nvidia:
                 local_topk_offsets,
                 int(topk),
                 lengths=seq_lens,
+                q_len_per_req=q_len_per_req,
                 workspace=torch.empty(
                     (_PERSISTENT_TOPK_WORKSPACE_BYTES,),
                     dtype=torch.uint8,
@@ -232,16 +224,19 @@ if platform.is_nvidia:
                 max_seq_len=max_seq_len,
             )
         else:
+            per_token_len = seq_lens_2d.reshape(-1)
             col_ids = torch.arange(logits.shape[1], dtype=torch.int32, device=q.device)
             logits.masked_fill_(
-                col_ids.view(1, -1) >= seq_lens.view(-1, 1), float("-inf")
+                col_ids.view(1, -1) >= per_token_len.view(-1, 1), float("-inf")
             )
             deterministic_decode_topk(logits, local_topk_offsets, int(topk))
+
         return local_topk_to_global_slots(
             local_topk_offsets=local_topk_offsets,
             block_table=block_table,
             block_size=int(page_size),
             seq_lens=seq_lens,
+            q_len_per_req=q_len_per_req,
             out=out,
             lens_out=lens_out,
         )
