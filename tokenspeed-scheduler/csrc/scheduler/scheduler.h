@@ -51,6 +51,7 @@
 
 #if TOKENSPEED_FLAT_KVCACHE
 #include "cache/block_pool.h"
+#include "cache/host_block_store.h"
 #include "cache/kv_cache_coordinator.h"
 #include "cache/forward_cache_ops.h"
 #endif
@@ -86,6 +87,8 @@ public:
 #if TOKENSPEED_FLAT_KVCACHE
     // Free pages in the flat shared BlockPool; int32 twin of AvailableKvPages() for C++ tests.
     std::int32_t FlatPoolFreeBlocks() const { return block_pool_.NumFreeBlocks(); }
+    std::int32_t FlatHostStoreIndexed() const { return flat_host_store_.NumIndexed(); }
+    std::int32_t FlatHostStoreFreePages() const { return flat_host_store_.NumFreePages(); }
 #endif
 
 private:
@@ -184,6 +187,21 @@ private:
     // The deadlock assert requires TWO starved rounds (an in-flight Finish fakes one); a Finish arriving
     // 2+ rounds late still trips it -- residual risk accepted until TODO(flat-retract).
     std::int32_t flat_starved_rounds_{0};
+    HostBlockStore flat_host_store_;
+
+    struct FlatStoreTicket {
+        std::string key;
+        CacheBlock* block;
+        std::int32_t host_page;
+    };
+    // In-flight D2H stores: op_id -> tickets; WriteBackDone commits/aborts the host index and unpins
+    // the source device blocks.
+    std::unordered_map<cache_op_id, std::vector<FlatStoreTicket>> flat_store_ops_;
+
+    // Single home of the streaming-sink enablement predicate.
+    bool flatStreamingSinkEnabled() const {
+        return !config_.disable_l2_cache && config_.host_allocator.total_pages > 0 && config_.role == Role::kFused;
+    }
 
     // Sum excluding request_id: a request consuming its own reservation must not be gated by it.
     std::int32_t flatReservedPagesExcept(const std::string& request_id) const {

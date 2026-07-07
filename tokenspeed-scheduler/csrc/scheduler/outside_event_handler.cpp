@@ -184,6 +184,20 @@ void Scheduler::handleEvent(const forward::Abort& event) {
 }
 
 void Scheduler::handleEvent(const cache::WriteBackDone& event) {
+#if TOKENSPEED_FLAT_KVCACHE
+    if (auto flat_it = flat_store_ops_.find(event.op_id); flat_it != flat_store_ops_.end()) {
+        for (FlatStoreTicket& t : flat_it->second) {
+            if (event.success) {
+                flat_host_store_.CommitStore(t.key, t.host_page);
+            } else {
+                flat_host_store_.AbortStore(t.key, t.host_page);
+            }
+            block_pool_.FreeBlocks({t.block});
+        }
+        flat_store_ops_.erase(flat_it);
+        return;
+    }
+#endif
     auto it = cache_op_tracker_.find(event.op_id);
     if (it == cache_op_tracker_.end()) {
         return;

@@ -127,7 +127,8 @@ std::optional<std::int32_t> Scheduler::flatAdmitFirstChunk(Request* request, con
 std::optional<std::int32_t> Scheduler::flatAdmitPrefillChunk(Request* request, std::int32_t chunk_tokens,
                                                              std::int32_t decode_reserve_tokens,
                                                              std::int32_t num_computed_tokens) const {
-    // Credit the pending slide (slide-before-acquire); exact because registering hashes never changes refs.
+    // Slide credit is registration-aware: with the streaming sink on, blocks the op will register
+    // get pinned and do not free (count_uncached=false path).
     const std::int32_t slide_credit =
         coordinator_.BlocksFreedByAdvance(request->FlatBlockTablesRef(), num_computed_tokens);
     const std::int32_t blocks_needed =
@@ -165,7 +166,8 @@ std::optional<std::size_t> Scheduler::flatStarvationDeadlockRisk(const std::vect
     }
     // Block 0 is the null placeholder, never allocated.
     const bool pool_pages_held = block_pool_.NumFreeBlocks() < block_pool_.TotalBlocks() - 1;
-    const bool nothing_in_flight = pending_forward_results_.empty() && cache_op_tracker_.empty();
+    const bool nothing_in_flight =
+        pending_forward_results_.empty() && cache_op_tracker_.empty() && flat_store_ops_.empty();
     if (config_.role != Role::kFused || deferred == 0 || !pool_pages_held || !nothing_in_flight) {
         return std::nullopt;
     }

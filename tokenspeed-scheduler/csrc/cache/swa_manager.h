@@ -92,8 +92,8 @@ public:
     }
 
     // Only blocks whose last reference is this table (RefCount()==1) reach the free list, so shared ones don't count.
-    std::int32_t BlocksFreedByAdvanceWindow(const BlockTable& table,
-                                            std::int32_t num_computed_tokens) const override {
+    std::int32_t BlocksFreedByAdvanceWindow(const BlockTable& table, std::int32_t num_computed_tokens,
+                                            bool count_uncached) const override {
         std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
         std::int32_t freed = 0;
         for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
@@ -101,7 +101,7 @@ public:
             if (block->IsNull()) {
                 break;  // already null -> earlier slots are null too
             }
-            if (block->RefCount() == 1) {
+            if (block->RefCount() == 1 && (count_uncached || block->IsCached())) {
                 ++freed;
             }
         }

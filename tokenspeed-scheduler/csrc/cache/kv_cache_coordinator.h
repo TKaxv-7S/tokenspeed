@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cache/block_pool.h"
@@ -67,6 +68,13 @@ public:
                          std::int32_t first_slot = 0);
     void Free(std::span<BlockTable> tables);
 
+    struct StoreCandidate {
+        std::string key;    // group-wrapped (MakeKeyWithGroupId), the host-tier index key
+        CacheBlock* block;  // pinned (TouchBlock) until the consumer unpins
+    };
+    void EnableStoreCandidateCollection() { collect_store_candidates_ = true; }
+    std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
+
     // Managers without a retention window inherit the no-op default.
     void AdvanceWindow(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
 
@@ -78,6 +86,8 @@ private:
                                           std::uint32_t group_id) const;
     std::vector<CacheGroup> groups_;
     BlockPool& pool_;
+    bool collect_store_candidates_ = false;
+    std::vector<StoreCandidate> pending_stores_;
 };
 
 // One CacheGroup per spec (group_id = index); asserts every spec shares the same page_size.

@@ -72,9 +72,15 @@ Scheduler::Scheduler(SchedulerConfig config)
               ids.push_back(g.group_id);
           }
           return ids;
-      }()}
+      }()},
+      flat_host_store_{flatStreamingSinkEnabled() ? config_.host_allocator.total_pages : 0}
 #endif
 {
+#if TOKENSPEED_FLAT_KVCACHE
+    if (flatStreamingSinkEnabled()) {
+        coordinator_.EnableStoreCandidateCollection();
+    }
+#endif
     if (auto* env = std::getenv("SPDLOG_LEVEL")) {
         std::string level_str{env};
         spdlog::level::level_enum level = spdlog::level::from_str(level_str);
@@ -366,6 +372,27 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         write_back_ops.insert(write_back_ops.end(), std::make_move_iterator(wb->begin()),
                               std::make_move_iterator(wb->end()));
     }
+#if TOKENSPEED_FLAT_KVCACHE
+    if (flatStreamingSinkEnabled()) {
+        // Streaming L2 sink: batch this round's newly-registered pages into one D2H op.
+        std::vector<TransferPair> pairs;
+        std::vector<FlatStoreTicket> tickets;
+        for (auto& cand : coordinator_.TakePendingStores()) {
+            std::optional<std::int32_t> host_page = flat_host_store_.BeginStore(cand.key);
+            if (!host_page) {
+                block_pool_.FreeBlocks({cand.block});  // dup or host full: drop + unpin
+                continue;
+            }
+            pairs.push_back(TransferPair{CacheKind::kKV, cand.block->BlockId(), *host_page});
+            tickets.push_back(FlatStoreTicket{std::move(cand.key), cand.block, *host_page});
+        }
+        if (!pairs.empty()) {
+            const cache_op_id id = kv_prefix_cache_.AllocateCacheOpId();
+            flat_store_ops_.emplace(id, std::move(tickets));
+            write_back_ops.push_back(WriteBackOperation{id, std::move(pairs)});
+        }
+    }
+#endif
     if (!write_back_ops.empty()) {
         plan.With(CacheOperation{FlatWriteBackOperation{write_back_ops}});
     }

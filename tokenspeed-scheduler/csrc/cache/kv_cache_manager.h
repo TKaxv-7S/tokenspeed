@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cache/block_pool.h"
@@ -97,17 +98,24 @@ public:
 
     // Pages already carrying a hash are skipped; the partial tail is excluded by the caller.
     void CacheFullBlocks(BlockTable& table, std::span<const std::string> block_hashes,
-                         std::int32_t first_slot = 0) {
+                         std::int32_t first_slot = 0,
+                         std::vector<std::pair<std::string, CacheBlock*>>* newly_cached = nullptr) {
         _assert(first_slot >= 0, "first_slot must be >= 0");
         _assert(static_cast<std::int64_t>(first_slot) + static_cast<std::int64_t>(block_hashes.size()) <=
                     table.NumBlocks(),
                 "hash range exceeds table size");
         for (std::size_t j = 0; j < block_hashes.size(); ++j) {
             CacheBlock* block = table.blocks_[static_cast<std::size_t>(first_slot) + j];
+            if (block->IsNull()) {
+                continue;
+            }
             if (block->IsCached()) {
                 continue;
             }
             pool_.CacheFullBlocks(block, block_hashes[j]);
+            if (newly_cached != nullptr) {
+                newly_cached->emplace_back(block_hashes[j], block);
+            }
         }
     }
 
@@ -116,7 +124,8 @@ public:
 
     // Pure twin of AdvanceWindow (pages a pending slide would free), overridden in lockstep with it.
     virtual std::int32_t BlocksFreedByAdvanceWindow(const BlockTable& /*table*/,
-                                                    std::int32_t /*num_computed_tokens*/) const {
+                                                    std::int32_t /*num_computed_tokens*/,
+                                                    bool /*count_uncached*/ = true) const {
         return 0;
     }
 

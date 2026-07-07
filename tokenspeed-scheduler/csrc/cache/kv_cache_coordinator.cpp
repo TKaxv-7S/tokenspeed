@@ -172,9 +172,15 @@ void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables,
     if (content_hashes.empty()) {
         return;  // hot decode rounds usually fill no page
     }
+    std::vector<std::pair<std::string, CacheBlock*>> newly_cached;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         std::vector<std::string> keys = keysForGroup(content_hashes, groups_[i].GroupId());
-        groups_[i].Manager().CacheFullBlocks(tables[i], keys, first_slot);
+        groups_[i].Manager().CacheFullBlocks(tables[i], keys, first_slot,
+                                             collect_store_candidates_ ? &newly_cached : nullptr);
+    }
+    for (auto& [key, block] : newly_cached) {
+        pool_.TouchBlock(block);  // pinned until WriteBackDone (or drain-time drop)
+        pending_stores_.push_back(StoreCandidate{std::move(key), block});
     }
 }
 
@@ -199,7 +205,8 @@ std::int32_t KvCacheCoordinator::BlocksFreedByAdvance(std::span<const BlockTable
             "BlocksFreedByAdvance: tables size must match group count");
     std::int32_t total_freed = 0;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        total_freed += groups_[i].Manager().BlocksFreedByAdvanceWindow(tables[i], num_computed_tokens);
+        total_freed += groups_[i].Manager().BlocksFreedByAdvanceWindow(tables[i], num_computed_tokens,
+                                                                       /*count_uncached=*/!collect_store_candidates_);
     }
     return total_freed;
 }

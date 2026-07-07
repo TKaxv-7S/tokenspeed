@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <span>
 #include <string>
 #include <vector>
@@ -631,6 +632,89 @@ TEST(CoordinatorMatchTest, ThreeGroupsOneAllMissForcesZeroCommon) {
 
     CoordinatorMatch m = coord.MatchPrefix(ch);
     EXPECT_EQ(m.num_common_blocks, 0) << "one group all-miss -> common 0";
+}
+
+TEST(KvCacheCoordinatorStoreCandidates, CollectsPinnedNewRegistrations) {
+    BlockPool pool(/*total_num_blocks=*/16, /*enable_caching=*/true);
+    std::vector<KvCacheSpec> specs{
+        KvCacheSpec{AttnKind::kFull, /*page_size=*/2, /*sliding_window=*/0},
+        KvCacheSpec{AttnKind::kSlidingWindow, /*page_size=*/2, /*sliding_window=*/4},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
+    coordinator.EnableStoreCandidateCollection();
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(coordinator.Acquire(tables, /*num_tokens=*/4));
+    std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}});
+    const std::int32_t free_before = pool.NumFreeBlocks();
+
+    coordinator.CacheFullBlocks(tables, hashes, /*first_slot=*/0);
+    std::vector<KvCacheCoordinator::StoreCandidate> pending = coordinator.TakePendingStores();
+
+    ASSERT_EQ(pending.size(), 4u);  // 2 pages x 2 groups, group-wrapped keys
+    EXPECT_EQ(pool.NumFreeBlocks(), free_before) << "pinning ref'd blocks must not touch the free list";
+    for (const auto& c : pending) {
+        EXPECT_GE(c.block->RefCount(), 2) << "pinned on top of the table ref";
+    }
+    // Keys are group-wrapped and distinct across groups for the same content hash.
+    std::set<std::string> keys;
+    for (const auto& c : pending) keys.insert(c.key);
+    EXPECT_EQ(keys.size(), 4u);
+
+    // Re-registering the same hashes yields nothing new (IsCached skip).
+    coordinator.CacheFullBlocks(tables, hashes, 0);
+    EXPECT_TRUE(coordinator.TakePendingStores().empty());
+
+    // Unpin restores balance.
+    for (const auto& c : pending) {
+        pool.FreeBlocks({c.block});
+    }
+    coordinator.Free(tables);
+    EXPECT_EQ(pool.NumFreeBlocks(), 15);  // all but null block 0
+}
+
+TEST(KvCacheCoordinatorStoreCandidates, DisabledByDefaultCollectsNothing) {
+    BlockPool pool(16, true);
+    std::vector<KvCacheSpec> specs{
+        KvCacheSpec{AttnKind::kFull, /*page_size=*/2, /*sliding_window=*/0},
+        KvCacheSpec{AttnKind::kSlidingWindow, /*page_size=*/2, /*sliding_window=*/4},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(coordinator.Acquire(tables, 4));
+    std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}});
+    coordinator.CacheFullBlocks(tables, hashes, 0);
+    EXPECT_TRUE(coordinator.TakePendingStores().empty());
+    coordinator.Free(tables);
+}
+
+// The exact slide-credit rule: collection-on credits a slide-out block only when it is CACHED
+// (an uncached one is this op's own registration and gets pinned before the slide); collection-off
+// keeps the RefCount()==1 rule so uncached same-round registrations still free.
+TEST(KvCacheCoordinatorStoreCandidates, SlideCreditExcludesUncachedOnlyWhenCollecting) {
+    BlockPool pool(16, true);
+    std::vector<KvCacheSpec> specs{
+        KvCacheSpec{AttnKind::kSlidingWindow, /*page_size=*/2, /*sliding_window=*/4},
+    };
+    KvCacheCoordinator off = MakeCoordinator(specs, pool);
+    std::vector<BlockTable> tables(off.NumGroups());
+    ASSERT_TRUE(off.Acquire(tables, /*num_tokens=*/8));  // pages 0..3; N=8 slides out pages 0,1
+    EXPECT_EQ(off.BlocksFreedByAdvance(tables, 8), 2) << "collection-off counts uncached ref-1 blocks";
+    off.Free(tables);
+
+    KvCacheCoordinator on = MakeCoordinator(specs, pool);
+    on.EnableStoreCandidateCollection();
+    std::vector<BlockTable> tables2(on.NumGroups());
+    ASSERT_TRUE(on.Acquire(tables2, 8));
+    EXPECT_EQ(on.BlocksFreedByAdvance(tables2, 8), 0) << "collection-on excludes uncached slide-out blocks";
+
+    std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}});
+    on.CacheFullBlocks(tables2, hashes, 0);  // registers + pins pages 0,1
+    EXPECT_EQ(on.BlocksFreedByAdvance(tables2, 8), 0) << "cached but still pinned: ref 2";
+    for (const auto& c : on.TakePendingStores()) {
+        pool.FreeBlocks({c.block});  // unpin, as WriteBackDone would
+    }
+    EXPECT_EQ(on.BlocksFreedByAdvance(tables2, 8), 2) << "cached and unpinned: exact credit restored";
+    on.Free(tables2);
 }
 
 }  // namespace
