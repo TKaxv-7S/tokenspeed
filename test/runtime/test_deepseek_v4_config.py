@@ -100,6 +100,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_indexer_topk_from_logits,
     _deepseek_v4_mega_moe_max_num_tokens,
     _deepseek_v4_reorder_c4_ape_2604,
+    _deepseek_v4_shared_output_scale,
     _DeepseekV4TopKBuffer,
     deepseek_v4_rope_config,
     deepseek_v4_select_experts,
@@ -453,9 +454,11 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         moe = SimpleNamespace(
             use_mega_moe=False,
+            mapping=Mapping(rank=0, world_size=1),
             n_shared_experts=1,
             shared_experts=shared_experts,
             stream_fork=stream_fork,
+            shared_output_scale=1.0,
             routed_scaling_factor=2.0,
             experts=routed_experts,
             _select_experts=select_experts,
@@ -483,6 +486,48 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(
             torch.equal(actual, (hidden_states + 1) * 2 + hidden_states + 3)
         )
+
+    def test_deepseek_v4_normal_ep_scales_replicated_shared_output(self):
+        calls = []
+        hidden_states = torch.ones(2, 3)
+        input_ids = torch.arange(2)
+        moe = self._make_fake_deepseek_v4_moe(
+            hidden_states, input_ids, StreamFork(None), calls
+        )
+        moe.mapping = Mapping(
+            rank=0,
+            world_size=8,
+            attn_tp_size=8,
+            dense_tp_size=1,
+            moe_tp_size=1,
+            moe_ep_size=8,
+        )
+        moe.shared_output_scale = _deepseek_v4_shared_output_scale(moe.mapping)
+
+        actual = DeepseekV4MoE.forward(
+            moe,
+            hidden_states,
+            input_ids,
+            num_global_tokens=2,
+            max_num_tokens_per_gpu=2,
+        )
+
+        routed = (hidden_states + 1) * 2
+        shared = (hidden_states + 3) / 8
+        self.assertTrue(torch.equal(actual, routed + shared))
+
+    def test_deepseek_v4_shared_output_scale_rejects_misaligned_groups(self):
+        mapping = Mapping(
+            rank=0,
+            world_size=8,
+            attn_tp_size=8,
+            dense_tp_size=8,
+            moe_tp_size=1,
+            moe_ep_size=4,
+        )
+
+        with self.assertRaisesRegex(ValueError, "divisible by dense TP size"):
+            _deepseek_v4_shared_output_scale(mapping)
 
     def test_deepseek_v4_shared_mlp_uses_dense_tp(self):
         mapping = Mapping(
@@ -1273,6 +1318,30 @@ class TestDeepseekV4Config(unittest.TestCase):
         finally:
             global_server_args_dict.clear()
             global_server_args_dict.update(snapshot)
+
+    def test_native_trtllm_moe_rejects_nontrivial_expert_placement(self):
+        unsupported = (
+            {"ep_num_redundant_experts": 8},
+            {"enable_eplb": True},
+            {"init_expert_location": '{"logical_count": [1]}'},
+        )
+        for options in unsupported:
+            with self.subTest(options=options), self.assertRaisesRegex(
+                ValueError, "requires trivial expert placement"
+            ):
+                ServerArgs(model="stub", moe_backend="trtllm", **options)
+
+        with self.assertRaisesRegex(ValueError, "requires trivial expert placement"):
+            ServerArgs(
+                model="stub",
+                draft_moe_backend="trtllm",
+                enable_eplb=True,
+            )
+
+        args = ServerArgs(model="stub", moe_backend="trtllm")
+        self.assertEqual(args.init_expert_location, "trivial")
+        self.assertEqual(args.ep_num_redundant_experts, 0)
+        self.assertFalse(args.enable_eplb)
 
     def test_deepseek_v4_indexer_prefill_max_logits_uses_server_arg(self):
         snapshot = dict(global_server_args_dict)
@@ -5155,6 +5224,40 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertTrue(torch.equal(topk_ids, expected_ids.to(torch.int32)))
         self.assertTrue(torch.allclose(topk_weights, expected_weights, atol=1e-6))
+
+    def test_deepseek_v4_moe_select_experts_skips_unused_scores(self):
+        router_logits = torch.randn(2, 4, dtype=torch.float32)
+        topk_weights = torch.tensor([[0.75, 0.25], [0.6, 0.4]])
+        topk_ids = torch.tensor([[0, 2], [1, 3]], dtype=torch.int32)
+        gate = Mock(return_value=router_logits)
+        gate.e_score_correction_bias = torch.zeros(4, dtype=torch.float32)
+        gate.tid2eid = None
+        moe = SimpleNamespace(
+            gate=gate,
+            config=SimpleNamespace(num_experts_per_tok=2, norm_topk_prob=True),
+        )
+
+        with patch.object(
+            deepseek_v4_model,
+            "deepseek_v4_select_experts",
+            return_value=(topk_weights, topk_ids, router_logits),
+        ) as select_experts:
+            result = DeepseekV4MoE._select_experts(
+                moe,
+                torch.randn(2, 8, dtype=torch.bfloat16),
+                input_ids=None,
+            )
+
+        self.assertIs(result[2], router_logits)
+        select_experts.assert_called_once_with(
+            router_logits,
+            2,
+            True,
+            correction_bias=gate.e_score_correction_bias,
+            hash_indices_table=None,
+            input_ids=None,
+            need_scores=False,
+        )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_deepseek_v4_fused_select_experts_returns_scores(self):

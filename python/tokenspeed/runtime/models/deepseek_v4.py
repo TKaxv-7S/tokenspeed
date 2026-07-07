@@ -2313,6 +2313,19 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         return y
 
 
+def _deepseek_v4_shared_output_scale(mapping: Mapping) -> float:
+    """Scale dense-TP shared output before a MoE-group reduction."""
+
+    dense_tp_size = mapping.dense.tp_size
+    moe_group_size = mapping.moe.tp_ep_size
+    if moe_group_size % dense_tp_size != 0:
+        raise ValueError(
+            "DeepSeek V4 normal MoE requires the MoE TP/EP group size to be "
+            "divisible by dense TP size when shared experts are enabled"
+        )
+    return dense_tp_size / moe_group_size
+
+
 class DeepseekV4MoE(nn.Module):
     def __init__(
         self,
@@ -2376,6 +2389,11 @@ class DeepseekV4MoE(nn.Module):
             )
         else:
             self.shared_experts = None
+        self.shared_output_scale = (
+            _deepseek_v4_shared_output_scale(mapping)
+            if self.shared_experts is not None and not self.use_mega_moe
+            else 1.0
+        )
 
         if self.use_mega_moe:
             self.experts = DeepseekV4MegaMoEExperts(
@@ -2430,8 +2448,6 @@ class DeepseekV4MoE(nn.Module):
         input_ids: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = self.gate(hidden_states)
-        fmt = getattr(self.experts, "topk_output_format", None)
-        need_scores = fmt is not None and not fmt.is_bypassed()
         return deepseek_v4_select_experts(
             router_logits,
             self.config.num_experts_per_tok,
@@ -2439,7 +2455,9 @@ class DeepseekV4MoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             hash_indices_table=self.gate.tid2eid,
             input_ids=input_ids,
-            need_scores=need_scores,
+            # MoE backends consume the selected ids and weights, not the full
+            # transformed score tensor.
+            need_scores=False,
         )
 
     def _make_topk_output(
@@ -2549,7 +2567,12 @@ class DeepseekV4MoE(nn.Module):
                     routed *= self.routed_scaling_factor
             with fork.branch():
                 shared = self._forward_shared_experts(hidden_states)
-        return routed + shared if shared is not None else routed
+        if shared is None:
+            return routed
+        # post_moe_comm sums across the MoE TP/EP group. Shared experts are
+        # sharded across dense TP and therefore appear once per dense-TP group;
+        # compensate for those replicas without launching a separate scale op.
+        return torch.add(routed, shared, alpha=self.shared_output_scale)
 
     def forward(
         self,
