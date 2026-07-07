@@ -580,7 +580,9 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
 
         metadata = ctx.attn_backend.forward_decode_metadata
         seq_lens_2d = (
-            metadata._dsa_seq_lens_2d if q_len_per_req > 1 else seq_lens.unsqueeze(1)
+            metadata._dsa_seq_lens_2d[ctx.num_extends :]
+            if q_len_per_req > 1
+            else seq_lens.unsqueeze(1)
         )
         dsa_decode_topk(
             q,

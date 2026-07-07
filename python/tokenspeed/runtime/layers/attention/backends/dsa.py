@@ -140,9 +140,7 @@ class DSABackend(AttentionBackend):
         # Full-length broadcast: the plan and paged-MQA-logits kernels read only
         # the last column, and the per-token causal bound is applied downstream.
         metadata._dsa_seq_lens_2d = (
-            metadata.seq_lens_k.unsqueeze(1)
-            .expand(-1, self.spec_num_tokens)
-            .contiguous()
+            seq_lens.unsqueeze(1).expand(-1, self.spec_num_tokens).contiguous()
         )
         metadata._dsa_plan = dsa_plan(
             seq_lens_2d=metadata._dsa_seq_lens_2d, page_size=self.page_size
@@ -167,7 +165,7 @@ class DSABackend(AttentionBackend):
         )
         metadata = self.forward_decode_metadata
         metadata._dsa_seq_lens_2d.copy_(
-            metadata.seq_lens_k.unsqueeze(1).expand(-1, self.spec_num_tokens)
+            seq_lens.unsqueeze(1).expand(-1, self.spec_num_tokens)
         )
         dsa_plan(
             seq_lens_2d=metadata._dsa_seq_lens_2d,
@@ -223,13 +221,15 @@ class DSABackend(AttentionBackend):
             # Full-length broadcast: the plan and paged-MQA-logits kernels read only
             # the last column, and the per-token causal bound is applied downstream.
             metadata._dsa_seq_lens_2d = (
-                metadata.seq_lens_k[num_extends:]
-                .unsqueeze(1)
-                .expand(-1, self.spec_num_tokens)
-                .contiguous()
+                seq_lens.unsqueeze(1).expand(-1, self.spec_num_tokens).contiguous()
             )
+            if num_extends < bs:
+                seq_lens_2d = metadata._dsa_seq_lens_2d[num_extends:]
+            else:
+                # The dsa_plan is unused, alias to full-batch seq_lens_2d to generate dsa_plan as a placeholder
+                seq_lens_2d = metadata._dsa_seq_lens_2d
             metadata._dsa_plan = dsa_plan(
-                seq_lens_2d=metadata._dsa_seq_lens_2d, page_size=self.page_size
+                seq_lens_2d=seq_lens_2d, page_size=self.page_size
             )
 
         self._prefill_block_tables = None
