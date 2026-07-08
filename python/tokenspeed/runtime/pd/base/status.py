@@ -18,16 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed.runtime.pd.common.conn import (
-    CommonKVBootstrapServer,
-    CommonKVManager,
-    CommonKVReceiver,
-    CommonKVSender,
-)
 
-__all__ = (
-    "CommonKVBootstrapServer",
-    "CommonKVManager",
-    "CommonKVReceiver",
-    "CommonKVSender",
-)
+class TransferPoll:
+    Failed = 0
+    Bootstrapping = 1
+    Bootstrapped = 2
+    WaitingForInput = 3
+    Transferring = 4
+    Success = 5
