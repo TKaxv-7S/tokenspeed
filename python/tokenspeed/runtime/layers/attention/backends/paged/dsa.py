@@ -23,12 +23,12 @@ from __future__ import annotations
 import dataclasses
 
 import torch
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode,
     dsa_plan,
     dsa_prefill,
 )
-from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
+from tokenspeed_kernel.ops.attention.dsa.triton import (
     workspace_topk_to_global_slots,
 )
 from tokenspeed_kernel.platform import current_platform

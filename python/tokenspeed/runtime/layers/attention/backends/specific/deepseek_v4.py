@@ -16,14 +16,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_decode,
     dsv4_padded_heads,
     dsv4_plan,
     dsv4_prefill,
     dsv4_reset_attention_state,
 )
-from tokenspeed_kernel.ops.attention.triton.dsv4 import (
+from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_build_dense_prefill_local_compressed_indices,
     dsv4_combine_dense_swa_indices,
     dsv4_combine_topk_swa_indices,

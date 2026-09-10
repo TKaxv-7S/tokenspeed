@@ -29,22 +29,18 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.attention import (
+from tokenspeed_kernel.ops.attention.gdn import (
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
     gdn_replay_commit,
 )
-from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
+from tokenspeed_kernel.ops.attention.gdn.triton import (
     fused_qkv_split_gdn_prefill,
-)
-from tokenspeed_kernel.ops.attention.triton.linear.index import (
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
 )
-from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
-    verify_state_blocks,
-)
+from tokenspeed_kernel.ops.attention.kda.triton import verify_state_blocks
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     scrub_padding_tail,
